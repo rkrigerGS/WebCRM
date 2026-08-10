@@ -21,7 +21,14 @@
       "Bash(git init *)",
       "Bash(git add *)",
       "Bash(git commit *)",
-      "Bash(git config *)"
+      "Bash(git config *)",
+      "Bash(npm install *)",
+      "Bash(pkill -f \"node server/server.js\")",
+      "Bash(claude config *)",
+      "Skill(update-config)",
+      "Bash(git remote *)",
+      "Bash(git branch *)",
+      "Bash(git push *)"
     ]
   }
 }
