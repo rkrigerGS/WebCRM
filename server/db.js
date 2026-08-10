@@ -92,7 +92,7 @@ function ingestDossier(dossier, filename) {
   store.prospects.push(p);
   save();
   logIngest(filename, uei, 'ingested', null);
-  return { outcome: 'ingested', uei };
+  return { outcome: 'ingested', uei, id: p.id };
 }
 
 function logIngest(filename, uei, outcome, detail) {

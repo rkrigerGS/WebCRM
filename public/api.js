@@ -17,6 +17,11 @@ async function sendJSON(url, method, body) {
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
   return r.json();
 }
+function toQuery(params) {
+  const clean = Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== null && v !== '');
+  const qs = new URLSearchParams(clean).toString();
+  return qs ? '?' + qs : '';
+}
 
 window.api = {
   listProspects:  ()          => getJSON('/api/prospects'),
@@ -64,5 +69,18 @@ window.api = {
   onIngested: (cb) => {
     const es = new EventSource('/api/events');
     es.addEventListener('ingested', (e) => { try { cb(JSON.parse(e.data)); } catch {} });
-  }
+  },
+
+  authStatus: ()                     => getJSON('/api/auth/status'),
+  authLogout: ()                     => sendJSON('/api/auth/logout', 'POST'),
+
+  listUsers:         ()                    => getJSON('/api/admin/users'),
+  createUser:        (u)                   => sendJSON('/api/admin/users', 'POST', u),
+  deactivateUser:    (id)                  => sendJSON(`/api/admin/users/${id}/deactivate`, 'POST'),
+  reactivateUser:    (id)                  => sendJSON(`/api/admin/users/${id}/reactivate`, 'POST'),
+  changeUserRole:    (id, role)            => sendJSON(`/api/admin/users/${id}/role`, 'POST', { role }),
+  resetUserPassword: (id, password)        => sendJSON(`/api/admin/users/${id}/password`, 'POST', { password }),
+
+  listAudit:         (filters)             => getJSON('/api/admin/audit' + toQuery(filters)),
+  listAuditActions:  ()                    => getJSON('/api/admin/audit/actions')
 };

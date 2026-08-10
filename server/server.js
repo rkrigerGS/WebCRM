@@ -17,6 +17,8 @@ const config = require('./config');
 const catalogs = require('./catalogs');
 const emailEngine = require('./emailEngine');
 const auth = require('./auth');
+const users = require('./users');
+const audit = require('./audit');
 
 const APP_DIR = path.join(__dirname, '..');
 const DATA_DIR = path.join(APP_DIR, 'data');
@@ -27,6 +29,8 @@ db.init(DATA_DIR);
 config.init(DATA_DIR);
 catalogs.init(DATA_DIR, APP_DIR);
 auth.init(DATA_DIR);
+users.init(DATA_DIR);
+audit.init(DATA_DIR);
 seedApprovedEmails();
 
 let watcher = null;
@@ -36,28 +40,47 @@ const app = express();
 app.use(express.json({ limit: '5mb' }));
 
 // ---- Auth endpoints (these must be reachable without a token) ----
+// Login/logout are not audited: they don't create, modify, or delete app data (see the
+// AUDIT CONVENTION comment below `mutating()`). /api/auth/setup is the one exception that
+// DOES create data (the first user) — it audits itself manually since there's no session
+// yet to attribute the action to anything other than the account being created.
 
-// Tells the login page whether a password has been set yet (first-run sets one).
-app.get('/api/auth/status', (_q, res) => res.json({ passwordSet: auth.isPasswordSet(), authed: auth.verifyToken(auth.tokenFromReq(_q)) }));
-
-// First run: set the shared password. Only allowed if none is set yet.
-app.post('/api/auth/setup', (q, res) => {
-  if (auth.isPasswordSet()) return res.status(400).json({ error: 'Password already set' });
-  const pw = (q.body && q.body.password) || '';
-  if (pw.length < 4) return res.status(400).json({ error: 'Password too short' });
-  auth.setPassword(pw);
-  const token = auth.issueToken();
-  res.set('Set-Cookie', `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
-  res.json({ ok: true });
+// Tells the login page whether any account exists yet (first-run creates the admin), and
+// who (if anyone) the current request is authenticated as.
+app.get('/api/auth/status', (req, res) => {
+  const payload = auth.verifyToken(auth.tokenFromReq(req));
+  const user = payload && users.findById(payload.uid);
+  const authed = !!(user && user.active);
+  res.json({
+    usersExist: users.hasAnyUser(),
+    authed,
+    user: authed ? { id: user.id, username: user.username, role: user.role } : null
+  });
 });
 
-// Log in with the shared password.
-app.post('/api/auth/login', (q, res) => {
-  const pw = (q.body && q.body.password) || '';
-  if (!auth.checkPassword(pw)) return res.status(401).json({ error: 'Wrong password' });
-  const token = auth.issueToken();
+// First run: create the initial account. It is always the admin. Only allowed once.
+app.post('/api/auth/setup', (q, res) => {
+  if (users.hasAnyUser()) return res.status(400).json({ error: 'Setup already completed' });
+  let user;
+  try {
+    user = users.createUser({ username: q.body && q.body.username, password: q.body && q.body.password, role: 'admin' });
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message });
+  }
+  audit.log({ userId: user.id, username: user.username, action: 'user.create', detail: 'Initial admin account created on first run' });
+  const token = auth.issueToken(user.id);
   res.set('Set-Cookie', `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
-  res.json({ ok: true });
+  res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
+});
+
+// Log in with a username and password.
+app.post('/api/auth/login', (q, res) => {
+  const { username, password } = q.body || {};
+  const user = users.checkLogin(username || '', password || '');
+  if (!user) return res.status(401).json({ error: 'Invalid username or password' });
+  const token = auth.issueToken(user.id);
+  res.set('Set-Cookie', `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
+  res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
 });
 
 app.post('/api/auth/logout', (_q, res) => {
@@ -68,10 +91,66 @@ app.post('/api/auth/logout', (_q, res) => {
 // ---- Gate: every /api/* route below this line requires a valid session ----
 // (Static files like the login page and CSS are served after and are public, but they
 // contain no data; the data only flows through /api, which is protected.)
+// The user record is looked up fresh on every request (not cached in the token), so a
+// role change or deactivation takes effect on the user's very next request rather than
+// waiting for their token to expire or for them to log in again.
 app.use('/api', (req, res, next) => {
-  if (auth.verifyToken(auth.tokenFromReq(req))) return next();
-  return res.status(401).json({ error: 'Not authenticated' });
+  const payload = auth.verifyToken(auth.tokenFromReq(req));
+  const user = payload && users.findById(payload.uid);
+  if (!user || !user.active) return res.status(401).json({ error: 'Not authenticated' });
+  req.user = user;
+  next();
 });
+
+function requireAdmin(req, res, next) {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+  next();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────
+// AUDIT CONVENTION — READ BEFORE ADDING AN ENDPOINT
+//
+// Any endpoint that creates, modifies, or deletes app data (a prospect, a user, config,
+// a catalog) MUST be registered with mutating() below, not app.get/post/patch/delete
+// directly. mutating() requires an action label and writes an audit-log entry (who did
+// it, what they did, which prospect if applicable, and when) after the handler succeeds.
+// Skipping this for a state-changing route is a bug — a startup check further down warns
+// on the console if a route is ever added without it. Read-only endpoints (GET) keep
+// using app.get() directly; they are not audited by design.
+//
+// Handler contract: `handler(req, res)` does the work and returns the value to send as
+// JSON (mutating() calls res.json(value) and then logs the audit entry). To attach a
+// prospectId or a human-readable detail string, set `res.locals.audit = { prospectId, detail }`
+// before returning. If the handler already sent its own response (e.g. a 404) and/or the
+// call didn't actually change anything, set `res.locals.skipAudit = true` — the audit
+// entry is skipped but any value the handler returned is still ignored (the handler must
+// have called res.json/res.status itself in that case).
+//
+// Documented exceptions (do not follow this pattern, and why):
+//   - POST /api/auth/setup   — pre-session; creates the first user; audits itself inline.
+//   - POST /api/auth/login   — not a data mutation.
+//   - POST /api/auth/logout  — not a data mutation.
+//   - POST /api/prospects/upload — one call can ingest many prospects; it logs one audit
+//     entry per ingested item in its own loop, not one entry per request.
+//   - tryIngestFile() (folder watcher, below) — not an HTTP route; there is no logged-in
+//     user, so it calls audit.log() directly with a "system" actor.
+// ─────────────────────────────────────────────────────────────────────────────────────
+function mutating(action, handler) {
+  const fn = async (req, res) => {
+    try {
+      const value = await handler(req, res);
+      if (res.locals.skipAudit) return;
+      const a = res.locals.audit || {};
+      audit.log({ userId: req.user.id, username: req.user.username, action, prospectId: a.prospectId ?? null, detail: a.detail || '' });
+      if (!res.headersSent) res.json(value);
+    } catch (e) {
+      if (e.status) return res.status(e.status).json({ error: e.message });
+      fail(res, e);
+    }
+  };
+  fn.__audited = true;
+  return fn;
+}
 
 app.use(express.static(path.join(APP_DIR, 'public')));
 
@@ -96,6 +175,10 @@ function watchedDir() {
   if (configured && fs.existsSync(configured)) return configured;
   return path.join(DATA_DIR, 'watched-dossiers');
 }
+// Dossiers dropped into the watched folder are ingested without an HTTP request (no
+// logged-in user), so this is the one mutation path in the app not reachable via
+// mutating(). Attributed to a synthetic "system (folder watch)" actor — see the AUDIT
+// CONVENTION comment above.
 function tryIngestFile(filePath, attempt = 0) {
   fs.readFile(filePath, 'utf8', (err, text) => {
     if (err) return;
@@ -103,6 +186,9 @@ function tryIngestFile(filePath, attempt = 0) {
     try { dossier = JSON.parse(text); }
     catch { if (attempt < 5) return setTimeout(() => tryIngestFile(filePath, attempt + 1), 400); return; }
     const result = db.ingestDossier(dossier, path.basename(filePath));
+    if (result.outcome === 'ingested') {
+      audit.log({ userId: null, username: 'system (folder watch)', action: 'prospect.ingest', prospectId: result.id, detail: path.basename(filePath) });
+    }
     broadcast('ingested', result);
   });
 }
@@ -134,17 +220,51 @@ const fail = (res, e) => res.status(500).json({ error: String(e && e.message || 
 
 app.get('/api/prospects', (_q, res) => { try { ok(res, db.listProspects()); } catch (e) { fail(res, e); } });
 app.get('/api/prospects/:id', (q, res) => { try { const p = db.getProspect(+q.params.id); p ? ok(res, p) : res.status(404).json({ error: 'not found' }); } catch (e) { fail(res, e); } });
-app.patch('/api/prospects/:id', (q, res) => { try { ok(res, db.updateProspect(+q.params.id, q.body || {})); } catch (e) { fail(res, e); } });
-app.delete('/api/prospects/:id', (q, res) => { try { ok(res, db.deleteProspect(+q.params.id)); } catch (e) { fail(res, e); } });
+
+app.patch('/api/prospects/:id', mutating('prospect.update', (q, res) => {
+  const id = +q.params.id;
+  const result = db.updateProspect(id, q.body || {});
+  res.locals.audit = { prospectId: id, detail: JSON.stringify(q.body || {}) };
+  return result;
+}));
+
+app.delete('/api/prospects/:id', mutating('prospect.delete', (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  const result = db.deleteProspect(id);
+  res.locals.audit = { prospectId: id, detail: p ? `Deleted "${p.company_name}"` : '' };
+  return result;
+}));
+
 app.get('/api/stats', (_q, res) => { try { ok(res, db.stats()); } catch (e) { fail(res, e); } });
 
-app.post('/api/prospects/:id/note', (q, res) => { try { ok(res, db.addNote(+q.params.id, q.body.text)); } catch (e) { fail(res, e); } });
-app.post('/api/prospects/:id/external', (q, res) => { try { ok(res, db.logExternal(+q.params.id, q.body)); } catch (e) { fail(res, e); } });
-app.post('/api/prospects/:id/contact', (q, res) => { try { ok(res, db.editContact(+q.params.id, q.body)); } catch (e) { fail(res, e); } });
+app.post('/api/prospects/:id/note', mutating('prospect.note.add', (q, res) => {
+  const id = +q.params.id;
+  const result = db.addNote(id, q.body.text);
+  res.locals.audit = { prospectId: id, detail: (q.body.text || '').slice(0, 140) };
+  return result;
+}));
+
+app.post('/api/prospects/:id/external', mutating('prospect.outreach.log', (q, res) => {
+  const id = +q.params.id;
+  const result = db.logExternal(id, q.body);
+  res.locals.audit = { prospectId: id, detail: `${q.body.channel}: ${(q.body.text || '').slice(0, 140)}` };
+  return result;
+}));
+
+app.post('/api/prospects/:id/contact', mutating('prospect.contact.edit', (q, res) => {
+  const id = +q.params.id;
+  const result = db.editContact(id, q.body);
+  res.locals.audit = { prospectId: id, detail: JSON.stringify(q.body || {}) };
+  return result;
+}));
 
 // Upload dossiers directly through the browser (from any device). Accepts an array of
 // parsed dossier objects; runs each through the same ingest path as the watched folder,
 // so de-dup, exclusions, and fit-score handling are identical.
+// NOTE: bypasses mutating() deliberately — one call can ingest many prospects, each
+// needing its own audit entry (below), whereas mutating() logs exactly one entry per
+// request. See the AUDIT CONVENTION comment above.
 app.post('/api/prospects/upload', (q, res) => {
   try {
     const items = Array.isArray(q.body && q.body.dossiers) ? q.body.dossiers : [];
@@ -153,7 +273,11 @@ app.post('/api/prospects/upload', (q, res) => {
     for (const item of items) {
       try {
         const r = db.ingestDossier(item.dossier, item.filename || 'upload.json');
-        if (r.outcome === 'ingested') { results.ingested++; broadcast('ingested', r); }
+        if (r.outcome === 'ingested') {
+          results.ingested++;
+          broadcast('ingested', r);
+          audit.log({ userId: q.user.id, username: q.user.username, action: 'prospect.upload', prospectId: r.id, detail: item.filename || 'upload.json' });
+        }
         else if (r.outcome === 'duplicate') results.duplicate++;
         else if (r.outcome === 'excluded') results.excluded++;
       } catch (e) {
@@ -172,57 +296,189 @@ app.get('/api/prospects/:id/questions', (q, res) => {
     ok(res, emailEngine.buildQuestions(p.dossier));
   } catch (e) { fail(res, e); }
 });
-app.post('/api/prospects/:id/generate', async (q, res) => {
+
+// Every successful generation is audited — including regenerates and follow-up drafts —
+// since each call spends Claude API tokens even when nothing is persisted to the prospect
+// record yet (that only happens on the very first draft; see `persisted` below).
+app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', async (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  const a = q.body || {};
+  let chosenIssue = null;
+  if (a.issueId && a.issueId !== 'general') {
+    const idx = parseInt(String(a.issueId).replace('issue_', ''), 10);
+    chosenIssue = (p.dossier.issue_spotting || [])[idx] || null;
+  }
   try {
-    const p = db.getProspect(+q.params.id);
-    if (!p) return res.status(404).json({ error: 'not found' });
-    const a = q.body || {};
-    let chosenIssue = null;
-    if (a.issueId && a.issueId !== 'general') {
-      const idx = parseInt(String(a.issueId).replace('issue_', ''), 10);
-      chosenIssue = (p.dossier.issue_spotting || [])[idx] || null;
-    }
     const { draft, usage } = await emailEngine.generateDraft({
       dossier: p.dossier, chosenIssue, chosenServices: a.services || [],
       personalNote: a.personalNote || null, isFollowup: !!a.isFollowup,
       priorEmailText: a.priorEmailText || p.final_sent || p.first_draft || ''
     });
-    if (!a.isFollowup && !p.first_draft) db.updateProspect(+q.params.id, { first_draft: draft });
-    ok(res, { ok: true, draft, usage });
-  } catch (e) { ok(res, { ok: false, error: String(e && e.message || e) }); }
-});
-app.post('/api/prospects/:id/saveFinal', (q, res) => {
-  try {
-    const p = db.getProspect(+q.params.id);
-    if (!p) return res.status(404).json({ error: 'not found' });
-    const { finalText, meta } = q.body;
-    const patch = { final_sent: finalText, status: 'sent', channel: (meta && meta.channel) || 'email', date_sent: new Date().toISOString().slice(0, 10) };
-    if (meta && meta.isFollowup) patch.followup_count = (p.followup_count || 0) + 1;
-    db.updateProspect(+q.params.id, patch);
-    catalogs.saveApprovedEmail({
-      company_name: p.company_name, recipient: (meta && meta.recipient) || '',
-      services: (meta && meta.services) || [], first_draft: p.first_draft || '',
-      final_text: finalText, is_followup: !!(meta && meta.isFollowup), saved_at: new Date().toISOString()
-    });
-    ok(res, { ok: true });
-  } catch (e) { fail(res, e); }
-});
+    let persisted = false;
+    if (!a.isFollowup && !p.first_draft) { db.updateProspect(id, { first_draft: draft }); persisted = true; }
+    const kind = a.isFollowup ? 'Follow-up draft' : (persisted ? 'First draft (saved)' : 'Draft regenerated');
+    res.locals.audit = { prospectId: id, detail: `${kind} — tokens in ${(usage && usage.input_tokens) || 0} / out ${(usage && usage.output_tokens) || 0}` };
+    return { ok: true, draft, usage };
+  } catch (e) {
+    res.locals.skipAudit = true;
+    return res.json({ ok: false, error: String(e && e.message || e) });
+  }
+}));
+
+app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  const { finalText, meta } = q.body;
+  const patch = { final_sent: finalText, status: 'sent', channel: (meta && meta.channel) || 'email', date_sent: new Date().toISOString().slice(0, 10) };
+  if (meta && meta.isFollowup) patch.followup_count = (p.followup_count || 0) + 1;
+  db.updateProspect(id, patch);
+  catalogs.saveApprovedEmail({
+    company_name: p.company_name, recipient: (meta && meta.recipient) || '',
+    services: (meta && meta.services) || [], first_draft: p.first_draft || '',
+    final_text: finalText, is_followup: !!(meta && meta.isFollowup), saved_at: new Date().toISOString()
+  });
+  res.locals.audit = { prospectId: id, detail: `${(meta && meta.channel) || 'email'}${meta && meta.isFollowup ? ' (follow-up)' : ''}` };
+  return { ok: true };
+}));
 
 // Config
 app.get('/api/config', (_q, res) => {
   const c = config.get();
   ok(res, { hasApiKey: config.hasApiKey(), keyTail: c.anthropicApiKey ? c.anthropicApiKey.slice(-4) : '', draftModel: c.draftModel, defaultFollowupDays: c.defaultFollowupDays, watchFolder: watchedDir() });
 });
-app.post('/api/config/key', (q, res) => { config.update({ anthropicApiKey: q.body.key }); ok(res, { ok: true, hasApiKey: config.hasApiKey() }); });
-app.post('/api/config', (q, res) => { config.update(q.body || {}); if ('watchFolder' in (q.body || {})) restartWatching(); ok(res, { ok: true, watchFolder: watchedDir() }); });
+
+app.post('/api/config/key', mutating('config.apiKey.update', (q, res) => {
+  config.update({ anthropicApiKey: q.body.key });
+  res.locals.audit = { detail: 'API key updated' }; // never log the key itself
+  return { ok: true, hasApiKey: config.hasApiKey() };
+}));
+
+app.post('/api/config', mutating('config.update', (q, res) => {
+  config.update(q.body || {});
+  if ('watchFolder' in (q.body || {})) restartWatching();
+  const safeBody = { ...(q.body || {}) };
+  delete safeBody.anthropicApiKey; // defensive: this route isn't meant to carry the key, but never log it if it does
+  res.locals.audit = { detail: JSON.stringify(safeBody) };
+  return { ok: true, watchFolder: watchedDir() };
+}));
+
 app.get('/api/watched/path', (_q, res) => ok(res, { path: watchedDir() }));
 
 // Catalogs
 app.get('/api/catalog/:which', (q, res) => ok(res, { text: q.params.which === 'services' ? catalogs.readServices() : catalogs.readFirmFacts() }));
-app.post('/api/catalog/:which', (q, res) => { q.params.which === 'services' ? catalogs.writeServices(q.body.text) : catalogs.writeFirmFacts(q.body.text); ok(res, { ok: true }); });
+
+app.post('/api/catalog/:which', mutating('catalog.update', (q, res) => {
+  const which = q.params.which;
+  which === 'services' ? catalogs.writeServices(q.body.text) : catalogs.writeFirmFacts(q.body.text);
+  res.locals.audit = { detail: `${which} catalog updated (${(q.body.text || '').length} chars)` };
+  return { ok: true };
+}));
+
+// ---- Admin: user management ----
+// Self-lockout protection: an admin may not deactivate their own account, or demote
+// themselves away from admin, unless another active admin exists. This is the enforced
+// version of "appoint another admin before removing your own access."
+function otherActiveAdminExists(excludeId) {
+  return users.listUsers().some(u => u.role === 'admin' && u.active && u.id !== excludeId);
+}
+function blockSelfLockout(req, targetId, wouldLoseAdminAccess) {
+  if (targetId === req.user.id && wouldLoseAdminAccess && !otherActiveAdminExists(targetId)) {
+    const e = new Error('You are the only admin. Appoint another admin before removing your own access.');
+    e.status = 403;
+    throw e;
+  }
+}
+
+app.get('/api/admin/users', requireAdmin, (_q, res) => { try { ok(res, users.listUsers()); } catch (e) { fail(res, e); } });
+
+app.post('/api/admin/users', requireAdmin, mutating('user.create', (q, res) => {
+  const u = users.createUser(q.body || {});
+  res.locals.audit = { detail: `Created user "${u.username}" (${u.role})` };
+  return u;
+}));
+
+app.post('/api/admin/users/:id/deactivate', requireAdmin, mutating('user.deactivate', (q, res) => {
+  const id = +q.params.id;
+  blockSelfLockout(q, id, true);
+  const u = users.setActive(id, false);
+  res.locals.audit = { detail: `Deactivated user "${u.username}"` };
+  return u;
+}));
+
+app.post('/api/admin/users/:id/reactivate', requireAdmin, mutating('user.reactivate', (q, res) => {
+  const u = users.setActive(+q.params.id, true);
+  res.locals.audit = { detail: `Reactivated user "${u.username}"` };
+  return u;
+}));
+
+app.post('/api/admin/users/:id/role', requireAdmin, mutating('user.role.change', (q, res) => {
+  const id = +q.params.id;
+  const newRole = (q.body || {}).role;
+  blockSelfLockout(q, id, newRole !== 'admin');
+  const before = users.findById(id);
+  const beforeRole = before ? before.role : '?';
+  const u = users.setRole(id, newRole);
+  res.locals.audit = { detail: `Changed role of "${u.username}" from ${beforeRole} to ${u.role}` };
+  return u;
+}));
+
+app.post('/api/admin/users/:id/password', requireAdmin, mutating('user.password.reset', (q, res) => {
+  const u = users.resetPassword(+q.params.id, (q.body || {}).password);
+  res.locals.audit = { detail: `Reset password for "${u.username}"` }; // never log the password itself
+  return { ok: true };
+}));
+
+// ---- Admin: audit log ----
+// Supports three views admins need: (1) who did a given action — filter by action, read
+// the username per row; (2) everything one user did, with timestamps — filter by user;
+// (3) everything anyone did in a recent window — the range filter, independent of the
+// other two.
+function rangeCutoff(range) {
+  const day = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  if (range === 'day') return new Date(now - day).toISOString();
+  if (range === 'week') return new Date(now - 7 * day).toISOString();
+  if (range === 'month') return new Date(now - 30 * day).toISOString();
+  return null;
+}
+app.get('/api/admin/audit', requireAdmin, (q, res) => {
+  try { ok(res, audit.list({ userId: q.query.userId, action: q.query.action, since: rangeCutoff(q.query.range) })); }
+  catch (e) { fail(res, e); }
+});
+app.get('/api/admin/audit/actions', requireAdmin, (_q, res) => { try { ok(res, audit.distinctActions()); } catch (e) { fail(res, e); } });
 
 // Fallback to the UI for any other route.
 app.get('*', (_q, res) => res.sendFile(path.join(APP_DIR, 'public', 'index.html')));
+
+// ---- Startup self-check: warn if a state-changing route isn't audited ----
+// Walks the registered routes and flags any POST/PATCH/PUT/DELETE /api/* route that
+// wasn't wired through mutating(). The four routes documented as exceptions in the AUDIT
+// CONVENTION comment above are expected to fail this check and are excluded on purpose.
+const AUDIT_EXEMPT_ROUTES = new Set(['/api/auth/setup', '/api/auth/login', '/api/auth/logout', '/api/prospects/upload']);
+function checkAuditCoverage() {
+  try {
+    const offenders = [];
+    for (const layer of app._router.stack) {
+      if (!layer.route) continue;
+      const routePath = layer.route.path;
+      const methods = Object.keys(layer.route.methods).filter(m => ['post', 'patch', 'put', 'delete'].includes(m));
+      if (!methods.length || !routePath.startsWith('/api/') || AUDIT_EXEMPT_ROUTES.has(routePath)) continue;
+      const audited = layer.route.stack.some(s => s.handle && s.handle.__audited);
+      if (!audited) offenders.push(`${methods.join('/').toUpperCase()} ${routePath}`);
+    }
+    if (offenders.length) {
+      console.warn('\n⚠️  AUDIT COVERAGE WARNING — these state-changing routes are not wired through mutating():');
+      offenders.forEach(o => console.warn('   ' + o));
+      console.warn('   Every route that creates/modifies/deletes data must call mutating(), or be added to AUDIT_EXEMPT_ROUTES with a reason.\n');
+    }
+  } catch (e) {
+    console.warn('Audit coverage self-check could not run:', e.message);
+  }
+}
+checkAuditCoverage();
 
 // Bind to 0.0.0.0 so the app is reachable both locally (localhost) and over your private
 // Tailscale network from your other devices. It is NOT on the public internet: Tailscale is

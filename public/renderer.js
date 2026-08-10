@@ -410,6 +410,161 @@ async function openSettings(){
 }
 document.getElementById('settingsBtn').addEventListener('click',openSettings);
 document.getElementById('settingsClose').addEventListener('click',()=>settingsModal.hidden=true);
+document.getElementById('logoutBtn').addEventListener('click',async()=>{ await window.api.authLogout(); location.reload(); });
+
+// ---- Admin: role-gated nav ----
+function applyRoleUI(){
+  const isAdmin = window.__currentUser && window.__currentUser.role==='admin';
+  const sec = document.getElementById('adminSection');
+  if (sec) sec.hidden = !isAdmin;
+}
+
+// ---- Admin: Users ----
+const usersModal=document.getElementById('usersModal');
+const usersBody=document.getElementById('usersBody');
+async function openUsers(){
+  usersModal.hidden=false;
+  usersBody.innerHTML='<div class="gen-status">Loading…</div>';
+  const list=await window.api.listUsers();
+  renderUsers(list);
+}
+function renderUsers(list){
+  const me=window.__currentUser;
+  const rows=list.map(u=>{
+    const isSelf=u.id===me.id;
+    return `<tr data-id="${u.id}">
+      <td><strong>${esc(u.username)}</strong>${isSelf?' <span class="field-key">(you)</span>':''}</td>
+      <td><select class="tb-select roleSelect" data-id="${u.id}">
+        <option value="user" ${u.role==='user'?'selected':''}>User</option>
+        <option value="admin" ${u.role==='admin'?'selected':''}>Admin</option>
+      </select></td>
+      <td><span class="status-pill ${u.active?'badge-active':'badge-inactive'}">${u.active?'active':'inactive'}</span></td>
+      <td>
+        ${u.active
+          ?`<button class="btn btn-ghost btn-sm deactivateBtn" data-id="${u.id}">Deactivate</button>`
+          :`<button class="btn btn-ghost btn-sm reactivateBtn" data-id="${u.id}">Reactivate</button>`}
+        <button class="btn btn-ghost btn-sm resetPwBtn" data-id="${u.id}">Reset password</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  usersBody.innerHTML=`
+    <div class="settings-field">
+      <label>Create user</label>
+      <div class="hint">Password must be at least 8 characters.</div>
+      <input class="field-input" id="newUserName" placeholder="Username" style="margin-bottom:8px;">
+      <input class="field-input" id="newUserPw" type="password" placeholder="Password" style="margin-bottom:8px;">
+      <select class="tb-select" id="newUserRole" style="margin-bottom:8px;">
+        <option value="user">User</option>
+        <option value="admin">Admin</option>
+      </select>
+      <div><button class="btn btn-sm" id="createUserBtn">Create</button></div>
+      <div id="createUserErr" class="error-note" hidden style="margin-top:8px;"></div>
+    </div>
+    <div class="table-wrap" style="max-height:340px;">
+      <table class="users-table">
+        <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+
+  document.getElementById('createUserBtn').addEventListener('click',async()=>{
+    const username=document.getElementById('newUserName').value.trim();
+    const password=document.getElementById('newUserPw').value;
+    const role=document.getElementById('newUserRole').value;
+    const errEl=document.getElementById('createUserErr');
+    errEl.hidden=true;
+    try{
+      await window.api.createUser({username,password,role});
+      openUsers();
+    }catch(e){ errEl.textContent=e.message; errEl.hidden=false; }
+  });
+
+  usersBody.querySelectorAll('.roleSelect').forEach(sel=>sel.addEventListener('change',async(e)=>{
+    const id=parseInt(e.target.dataset.id,10);
+    try{ await window.api.changeUserRole(id,e.target.value); }
+    catch(err){ alert(err.message); }
+    openUsers();
+  }));
+  usersBody.querySelectorAll('.deactivateBtn').forEach(b=>b.addEventListener('click',async()=>{
+    const id=parseInt(b.dataset.id,10);
+    try{ await window.api.deactivateUser(id); }
+    catch(err){ alert(err.message); }
+    openUsers();
+  }));
+  usersBody.querySelectorAll('.reactivateBtn').forEach(b=>b.addEventListener('click',async()=>{
+    await window.api.reactivateUser(parseInt(b.dataset.id,10));
+    openUsers();
+  }));
+  usersBody.querySelectorAll('.resetPwBtn').forEach(b=>b.addEventListener('click',async()=>{
+    const id=parseInt(b.dataset.id,10);
+    const pw=window.prompt('New password (minimum 8 characters):');
+    if(!pw)return;
+    try{ await window.api.resetUserPassword(id,pw); alert('Password reset.'); }
+    catch(err){ alert(err.message); }
+  }));
+}
+document.getElementById('usersBtn').addEventListener('click',openUsers);
+document.getElementById('usersClose').addEventListener('click',()=>usersModal.hidden=true);
+
+// ---- Admin: Audit log ----
+const auditModal=document.getElementById('auditModal');
+const auditBody=document.getElementById('auditBody');
+async function openAuditLog(){
+  auditModal.hidden=false;
+  auditBody.innerHTML='<div class="gen-status">Loading…</div>';
+  const [userList,actionList]=await Promise.all([window.api.listUsers(),window.api.listAuditActions()]);
+  auditBody.innerHTML=`
+    <div class="toolbar" style="padding:0 0 14px;background:transparent;border:none;">
+      <div class="toolbar-group"><label class="tb-label">User</label>
+        <select id="auditFilterUser" class="tb-select"><option value="">Any</option>
+          ${userList.map(u=>`<option value="${u.id}">${esc(u.username)}</option>`).join('')}</select></div>
+      <div class="toolbar-group"><label class="tb-label">Action</label>
+        <select id="auditFilterAction" class="tb-select"><option value="">Any</option>
+          ${actionList.map(a=>`<option value="${esc(a)}">${esc(a)}</option>`).join('')}</select></div>
+      <div class="toolbar-group"><label class="tb-label">When</label>
+        <select id="auditFilterRange" class="tb-select">
+          <option value="">All time</option>
+          <option value="day">Past day</option>
+          <option value="week">Past week</option>
+          <option value="month">Past month</option>
+        </select></div>
+    </div>
+    <div class="table-wrap" style="max-height:420px;">
+      <table class="audit-table">
+        <thead><tr><th>When</th><th>User</th><th>Action</th><th>Prospect</th><th>Detail</th></tr></thead>
+        <tbody id="auditRows"></tbody>
+      </table>
+    </div>`;
+  const refresh=async()=>{
+    const filters={
+      userId:document.getElementById('auditFilterUser').value,
+      action:document.getElementById('auditFilterAction').value,
+      range:document.getElementById('auditFilterRange').value
+    };
+    const entries=await window.api.listAudit(filters);
+    renderAuditRows(entries);
+  };
+  ['auditFilterUser','auditFilterAction','auditFilterRange'].forEach(id=>document.getElementById(id).addEventListener('change',refresh));
+  refresh();
+}
+function renderAuditRows(entries){
+  const rows=document.getElementById('auditRows');
+  if(!entries.length){ rows.innerHTML=`<tr><td colspan="5" class="fu-cell">No matching audit entries.</td></tr>`; return; }
+  rows.innerHTML=entries.map(e=>{
+    const p=allProspects.find(x=>x.id===e.prospectId);
+    const when=new Date(e.at).toLocaleString();
+    return `<tr>
+      <td class="fu-cell">${esc(when)}</td>
+      <td>${esc(e.username)}</td>
+      <td class="fu-cell">${esc(e.action)}</td>
+      <td>${p?esc(p.company_name):'—'}</td>
+      <td class="fu-cell">${esc(e.detail)}</td>
+    </tr>`;
+  }).join('');
+}
+document.getElementById('auditBtn').addEventListener('click',openAuditLog);
+document.getElementById('auditClose').addEventListener('click',()=>auditModal.hidden=true);
 
 // ---- Add prospects (upload dossier JSONs from any device) ----
 document.getElementById('addProspectsBtn').addEventListener('click',openUpload);
@@ -487,5 +642,5 @@ window.api.onIngested((r)=>{ if(r.outcome==='ingested'){loadProspects();toast('N
 function toast(msg){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:100;opacity:0;transition:opacity .2s;';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},2200);}
 
 // Wait for the login gate to authenticate before loading any data (API calls need the session).
-if (window.__authed) { loadProspects(); }
-else { document.addEventListener('authed', () => loadProspects(), { once: true }); }
+if (window.__authed) { applyRoleUI(); loadProspects(); }
+else { document.addEventListener('authed', () => { applyRoleUI(); loadProspects(); }, { once: true }); }

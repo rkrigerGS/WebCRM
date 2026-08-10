@@ -118,14 +118,14 @@ body { background: var(--paper); color: var(--text); font-family: var(--sans); f
 }
 #bulkCount { font-size: 13px; font-weight: 600; margin-right: 4px; }
 .table-wrap { flex: 1; overflow-y: auto; position: relative; }
-table.prospects { width: 100%; border-collapse: collapse; }
-.prospects thead th {
+table.prospects, table.audit-table, table.users-table { width: 100%; border-collapse: collapse; }
+.prospects thead th, .audit-table thead th, .users-table thead th {
   position: sticky; top: 0; background: var(--paper); z-index: 1;
   text-align: left; font-size: 10.5px; font-weight: 600; text-transform: uppercase;
   letter-spacing: 0.06em; color: var(--text-faint);
   padding: 9px 14px; border-bottom: 1px solid var(--line);
 }
-.prospects tbody td { padding: 10px 14px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
+.prospects tbody td, .audit-table tbody td, .users-table tbody td { padding: 10px 14px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
 .prospects tbody tr { cursor: pointer; }
 .prospects tbody tr:hover { background: var(--line-soft); }
 .prospects tbody tr.selected { background: var(--gold-soft); }
@@ -209,6 +209,7 @@ table.prospects { width: 100%; border-collapse: collapse; }
 /* ---- Modals ---- */
 .modal-backdrop { position: fixed; inset: 0; background: rgba(27,31,40,0.42); display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal { background: var(--card); border-radius: 12px; width: 640px; max-width: 92vw; max-height: 88vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 14px 44px rgba(0,0,0,0.24); }
+.modal-wide { width: 900px; }
 .modal-head { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid var(--line); }
 .modal-head h3 { margin: 0; font-family: var(--serif); font-size: 18px; }
 .modal-body { padding: 18px 20px; overflow-y: auto; }
@@ -239,6 +240,8 @@ table.prospects { width: 100%; border-collapse: collapse; }
 .key-status { font-size: 12.5px; margin-top: 6px; }
 .key-set { color: var(--green); }
 .key-unset { color: var(--red); }
+.badge-active { background: var(--green-bg); color: var(--green); }
+.badge-inactive { background: var(--line-soft); color: var(--text-faint); }
 
 /* ---- Login gate ---- */
 .login-gate { position: fixed; inset: 0; background: var(--ink); display: flex; align-items: center; justify-content: center; z-index: 200; }

@@ -36,10 +36,14 @@ In that same command window, type:
       npm start
 You should see:  "GovSpring Prospecting is running."
 
-### Step 5. Open it
+### Step 5. Open it and create the admin account
 Open a browser (Chrome, Edge, whatever) ON THIS COMPUTER and go to:
       http://localhost:3000
-The app appears. That is it - it is running.
+The first time anyone opens the app, it asks you to create an account instead of just a
+password. This first account is automatically the admin. Pick a username and a password
+(at least 8 characters) and click Enter. The admin can later create accounts for other
+people from the "Users" panel in the sidebar (admin-only), and can see a full log of who
+did what and when from "Audit log" (also admin-only).
 
 ### Step 6. Add your Anthropic API key
 1. In the app, click "Settings" (left sidebar).
@@ -88,6 +92,8 @@ background. You just open http://localhost:3000 in the browser whenever you want
 Everything is in the  data  folder inside the app folder:
   data\govspring.json      - all prospects and their tracking
   data\config.json         - the API key and settings
+  data\users.json          - user accounts (usernames, roles, password hashes)
+  data\audit-log.json      - the full history of who did what and when
   data\approved-emails\    - the learning library
   data\catalogs\ (or the catalogs folder) - firm facts and services
 Back up the  data  folder to keep everything safe. Copying it to another machine's app

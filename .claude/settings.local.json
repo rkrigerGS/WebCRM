@@ -39,7 +39,13 @@
       "Bash(mkdir -p ~/.local/bin)",
       "Bash(cp ./gh_2.97.0_macOS_arm64/bin/gh ~/.local/bin/gh)",
       "Bash(chmod +x ~/.local/bin/gh)",
-      "Bash(~/.local/bin/gh --version)"
+      "Bash(~/.local/bin/gh --version)",
+      "Bash(nohup node server/server.js)",
+      "Bash(echo \"PID: $!\")",
+      "Read(//tmp/**)",
+      "Bash(node *)",
+      "Bash(rm -f /tmp/admin.jar /tmp/jane.jar /tmp/jane2.jar /tmp/test_generate_audit.js /tmp/govspring_test.log)",
+      "Bash(rm -rf data)"
     ]
   }
 }

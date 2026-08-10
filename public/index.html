@@ -12,6 +12,7 @@
       <img src="assets/logo.svg" alt="GovSpring Legal" class="login-logo" />
       <div class="login-tag">Prospecting</div>
       <div id="loginMsg" class="login-msg"></div>
+      <input type="text" id="loginUser" class="login-input" placeholder="Username" autocomplete="username" />
       <input type="password" id="loginPw" class="login-input" placeholder="Password" autocomplete="current-password" />
       <button class="btn" id="loginBtn">Enter</button>
     </div>
@@ -39,6 +40,13 @@
         <button class="view-item" id="addProspectsBtn"><span class="view-label">Add prospects</span></button>
         <button class="view-item" id="revealBtn"><span class="view-label">Research folder</span></button>
         <button class="view-item" id="settingsBtn"><span class="view-label">Settings</span></button>
+        <button class="view-item" id="logoutBtn"><span class="view-label">Log out</span></button>
+      </div>
+
+      <div class="sidebar-section" id="adminSection" hidden>
+        <div class="sidebar-heading">Admin</div>
+        <button class="view-item" id="usersBtn"><span class="view-label">Users</span></button>
+        <button class="view-item" id="auditBtn"><span class="view-label">Audit log</span></button>
       </div>
 
       <div class="sidebar-foot">
@@ -149,6 +157,18 @@
     <div class="modal">
       <div class="modal-head"><h3>Settings</h3><button class="btn btn-ghost btn-sm" id="settingsClose">Close</button></div>
       <div class="modal-body" id="settingsBody"></div>
+    </div>
+  </div>
+  <div class="modal-backdrop" id="usersModal" hidden>
+    <div class="modal">
+      <div class="modal-head"><h3>Users</h3><button class="btn btn-ghost btn-sm" id="usersClose">Close</button></div>
+      <div class="modal-body" id="usersBody"></div>
+    </div>
+  </div>
+  <div class="modal-backdrop" id="auditModal" hidden>
+    <div class="modal modal-wide">
+      <div class="modal-head"><h3>Audit log</h3><button class="btn btn-ghost btn-sm" id="auditClose">Close</button></div>
+      <div class="modal-body" id="auditBody"></div>
     </div>
   </div>
 

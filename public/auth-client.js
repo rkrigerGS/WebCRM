@@ -1,16 +1,19 @@
 // auth-client.js — runs before the app. Shows a login gate until authenticated,
-// then reveals the app. Handles first-run (set a password) and normal login.
+// then reveals the app. Handles first-run (create the admin account) and normal login.
+// Uses raw fetch() rather than window.api, since this script loads before api.js.
 
 (async function () {
   const gate = document.getElementById('loginGate');
   const appRoot = document.getElementById('appRoot');
   const msg = document.getElementById('loginMsg');
+  const user = document.getElementById('loginUser');
   const pw = document.getElementById('loginPw');
   const btn = document.getElementById('loginBtn');
 
   let firstRun = false;
 
-  function showApp() {
+  function showApp(currentUser) {
+    window.__currentUser = currentUser || null;
     gate.hidden = true;
     appRoot.hidden = false;
     // Signal the main app to start (renderer.js waits for this).
@@ -22,14 +25,13 @@
     try {
       const r = await fetch('/api/auth/status');
       const s = await r.json();
-      if (s.authed) return showApp();
-      firstRun = !s.passwordSet;
+      if (s.authed) return showApp(s.user);
+      firstRun = !s.usersExist;
       gate.hidden = false;
       msg.textContent = firstRun
-        ? 'First time here. Choose a password for this app.'
-        : 'Enter the password to continue.';
-      pw.placeholder = firstRun ? 'Choose a password' : 'Password';
-      pw.focus();
+        ? 'First time here. Create the admin account (password: 8+ characters).'
+        : 'Enter your username and password to continue.';
+      user.focus();
     } catch {
       msg.textContent = 'Cannot reach the server.';
       msg.classList.add('error');
@@ -38,19 +40,20 @@
   }
 
   async function submit() {
+    const username = user.value.trim();
     const password = pw.value;
-    if (!password) return;
+    if (!username || !password) return;
     msg.classList.remove('error');
     const endpoint = firstRun ? '/api/auth/setup' : '/api/auth/login';
     try {
       const r = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password })
+        body: JSON.stringify({ username, password })
       });
-      if (r.ok) { showApp(); return; }
-      const e = await r.json().catch(() => ({}));
-      msg.textContent = e.error || 'Login failed.';
+      const body = await r.json().catch(() => ({}));
+      if (r.ok) { showApp(body.user); return; }
+      msg.textContent = body.error || 'Login failed.';
       msg.classList.add('error');
       pw.value = '';
       pw.focus();
@@ -61,6 +64,7 @@
   }
 
   btn.addEventListener('click', submit);
+  user.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
   pw.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
 
   checkStatus();
