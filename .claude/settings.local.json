@@ -28,7 +28,18 @@
       "Skill(update-config)",
       "Bash(git remote *)",
       "Bash(git branch *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(command -v gh)",
+      "Bash(gh auth *)",
+      "Bash(brew install *)",
+      "Read(//private/tmp/gh-install/**)",
+      "Bash(curl -sSI \"https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_macOS_arm64.zip\")",
+      "Bash(curl -sSL \"https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_macOS_arm64.zip\" -o /tmp/gh-install/gh.zip)",
+      "Bash(unzip -q gh.zip)",
+      "Bash(mkdir -p ~/.local/bin)",
+      "Bash(cp ./gh_2.97.0_macOS_arm64/bin/gh ~/.local/bin/gh)",
+      "Bash(chmod +x ~/.local/bin/gh)",
+      "Bash(~/.local/bin/gh --version)"
     ]
   }
 }
