@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(curl -sS \"https://raw.githubusercontent.com/daniel3303/ClaudeCodeStatusLine/main/INSTALL.md\" -o /private/tmp/claude-501/-Users-rafaelkriger-Downloads-govspring-web/e5cebcda-62f0-4007-ae83-bcc063537491/scratchpad/INSTALL.md)",
+      "Bash(curl -sS \"https://raw.githubusercontent.com/daniel3303/ClaudeCodeStatusLine/main/statusline.sh\" -o /private/tmp/claude-501/-Users-rafaelkriger-Downloads-govspring-web/e5cebcda-62f0-4007-ae83-bcc063537491/scratchpad/statusline.sh)",
+      "Bash(mkdir -p /private/tmp/claude-501/-Users-rafaelkriger-Downloads-govspring-web/e5cebcda-62f0-4007-ae83-bcc063537491/scratchpad)",
+      "Bash(curl -sS https://raw.githubusercontent.com/daniel3303/ClaudeCodeStatusLine/main/INSTALL.md -o /private/tmp/claude-501/-Users-rafaelkriger-Downloads-govspring-web/e5cebcda-62f0-4007-ae83-bcc063537491/scratchpad/INSTALL.md)",
+      "Bash(curl -sS https://raw.githubusercontent.com/daniel3303/ClaudeCodeStatusLine/main/statusline.sh -o /private/tmp/claude-501/-Users-rafaelkriger-Downloads-govspring-web/e5cebcda-62f0-4007-ae83-bcc063537491/scratchpad/statusline.sh)",
+      "Bash(command -v jq)",
+      "Bash(command -v curl)",
+      "Bash(command -v git)",
+      "Bash(git clone *)",
+      "Bash(chmod +x ~/.claude/statusline/statusline.sh)",
+      "Bash(git -C ~/.claude/statusline log -1 --format='%H %ci %s')",
+      "Bash(STATUSLINE_CHECK_UPDATES=false timeout 20 ~/.claude/statusline/statusline.sh)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(STATUSLINE_CHECK_UPDATES=false ~/.claude/statusline/statusline.sh)",
+      "Skill(claude-api)",
+      "Bash(grep -iA3 -- \"--model\")",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git config *)"
+    ]
+  }
+}

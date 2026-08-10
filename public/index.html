@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GovSpring Prospecting</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="loginGate" class="login-gate" hidden>
+    <div class="login-card">
+      <img src="assets/logo.svg" alt="GovSpring Legal" class="login-logo" />
+      <div class="login-tag">Prospecting</div>
+      <div id="loginMsg" class="login-msg"></div>
+      <input type="password" id="loginPw" class="login-input" placeholder="Password" autocomplete="current-password" />
+      <button class="btn" id="loginBtn">Enter</button>
+    </div>
+  </div>
+
+  <div class="app" id="appRoot" hidden>
+    <nav class="sidebar">
+      <div class="sidebar-brand">
+        <img src="assets/logo.svg" alt="GovSpring Legal" class="logo" />
+        <div class="brand-tag">Prospecting</div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-heading">Views</div>
+        <button class="view-item active" data-view="all"><span class="view-label">All prospects</span><span class="view-count" id="count-all">0</span></button>
+        <button class="view-item" data-view="new"><span class="view-label">Not contacted</span><span class="view-count" id="count-new">0</span></button>
+        <button class="view-item" data-view="due"><span class="view-label">Due for follow-up</span><span class="view-count" id="count-due">0</span></button>
+        <button class="view-item" data-view="awaiting"><span class="view-label">Awaiting reply</span><span class="view-count" id="count-awaiting">0</span></button>
+        <button class="view-item" data-view="replied"><span class="view-label">Replied</span><span class="view-count" id="count-replied">0</span></button>
+        <button class="view-item" data-view="signed"><span class="view-label">Signed</span><span class="view-count" id="count-signed">0</span></button>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-heading">Data</div>
+        <button class="view-item" id="addProspectsBtn"><span class="view-label">Add prospects</span></button>
+        <button class="view-item" id="revealBtn"><span class="view-label">Research folder</span></button>
+        <button class="view-item" id="settingsBtn"><span class="view-label">Settings</span></button>
+      </div>
+
+      <div class="sidebar-foot">
+        <div class="pipeline-strip" id="pipelineStrip"></div>
+      </div>
+    </nav>
+
+    <main class="main">
+      <header class="main-head">
+        <div class="tabs">
+          <button class="tab active" data-tab="prospects">Prospects</button>
+          <button class="tab" data-tab="candidates" title="Basic finding-stage info, before research">Candidates</button>
+        </div>
+        <div class="head-right">
+          <input type="search" id="searchBox" placeholder="Search company, contact, state, industry" />
+        </div>
+      </header>
+
+      <div class="toolbar">
+        <div class="toolbar-group">
+          <label class="tb-label">Fit</label>
+          <select id="filterFit" class="tb-select">
+            <option value="">Any</option>
+            <option value="1-3">1 to 3 (best)</option>
+            <option value="4-6">4 to 6</option>
+            <option value="7-10">7 to 10</option>
+          </select>
+        </div>
+        <div class="toolbar-group">
+          <label class="tb-label">State</label>
+          <select id="filterState" class="tb-select"><option value="">Any</option></select>
+        </div>
+        <div class="toolbar-group">
+          <label class="tb-label">Agency</label>
+          <select id="filterAgency" class="tb-select"><option value="">Any</option></select>
+        </div>
+        <div class="toolbar-group">
+          <label class="tb-label">Designation</label>
+          <select id="filterDesignation" class="tb-select"><option value="">Any</option></select>
+        </div>
+        <div class="toolbar-spacer"></div>
+        <div class="toolbar-group">
+          <label class="tb-label">Sort</label>
+          <select id="sortBy" class="tb-select">
+            <option value="fit">Fit score</option>
+            <option value="followup">Oldest follow-up due</option>
+            <option value="stale">Least recently contacted</option>
+            <option value="added">Newest added</option>
+            <option value="name">Company A to Z</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="content">
+        <section class="list-pane">
+          <div class="bulk-bar" id="bulkBar" hidden>
+            <span id="bulkCount">0 selected</span>
+            <button class="btn btn-sm" data-bulk="replied">Mark replied</button>
+            <button class="btn btn-sm" data-bulk="signed">Mark signed</button>
+            <button class="btn btn-sm" data-bulk="dead">Mark dead</button>
+            <button class="btn btn-sm btn-danger" data-bulk="delete">Delete</button>
+          </div>
+          <div class="table-wrap">
+            <table class="prospects">
+              <thead>
+                <tr>
+                  <th class="col-check"><input type="checkbox" id="selectAll" /></th>
+                  <th class="col-score">Fit</th>
+                  <th>Company</th>
+                  <th>Location</th>
+                  <th>Status</th>
+                  <th>Flags</th>
+                  <th class="col-fu">Follow-up</th>
+                </tr>
+              </thead>
+              <tbody id="rows"></tbody>
+            </table>
+            <div class="empty" id="emptyState">
+              <p class="empty-title">No prospects in this view</p>
+              <p class="empty-body">Research dossiers written to your research folder appear here automatically, sorted with the most landable prospects on top.</p>
+              <button class="btn" id="emptyReveal">Open research folder</button>
+            </div>
+          </div>
+        </section>
+
+        <aside class="detail-pane" id="detailPane" hidden>
+          <div class="detail-head">
+            <div>
+              <div class="detail-score" id="dScore"></div>
+              <h2 class="detail-name" id="dName"></h2>
+              <div class="detail-sub" id="dSub"></div>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="closeDetail" aria-label="Close">Close</button>
+          </div>
+          <div class="detail-body" id="detailBody"></div>
+        </aside>
+      </div>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="emailModal" hidden>
+    <div class="modal">
+      <div class="modal-head"><h3 id="emailModalTitle">Generate email</h3><button class="btn btn-ghost btn-sm" id="emailModalClose">Close</button></div>
+      <div class="modal-body" id="emailModalBody"></div>
+    </div>
+  </div>
+  <div class="modal-backdrop" id="settingsModal" hidden>
+    <div class="modal">
+      <div class="modal-head"><h3>Settings</h3><button class="btn btn-ghost btn-sm" id="settingsClose">Close</button></div>
+      <div class="modal-body" id="settingsBody"></div>
+    </div>
+  </div>
+
+  <script src="auth-client.js"></script>
+  <script src="api.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

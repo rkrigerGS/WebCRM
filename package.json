@@ -1,0 +1,15 @@
+{
+  "name": "govspring-prospecting",
+  "version": "1.0.0",
+  "description": "GovSpring prospecting CRM, run as a local web server on an always-on host machine.",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "author": "",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "express": "^4.21.0",
+    "chokidar": "^3.6.0"
+  }
+}
