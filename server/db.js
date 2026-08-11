@@ -140,6 +140,7 @@ function listProspects() {
       last_reply_from: p.last_reply_from, last_reply_snippet: p.last_reply_snippet,
       dormant_until: p.dormant_until, dormant_returned: p.dormant_returned,
       gmail_thread_id: p.gmail_thread_id, gmail_message_ids: p.gmail_message_ids,
+      created_at: p.created_at,
       dossier: safeParse(p.dossier_json, {})
     }))
     .sort((a, b) => ((a.fit_score == null) - (b.fit_score == null))

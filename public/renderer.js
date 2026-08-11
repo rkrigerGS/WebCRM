@@ -645,7 +645,11 @@ async function openSettings(){
   const cfg=await window.api.getConfig();
   const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
   let gmailStatus={connected:false,email:'',hasCreds:false};
-  if(isAdmin){ try{ gmailStatus=await window.api.getGmailAdminStatus(); }catch{} }
+  let digestCandidates=[];
+  if(isAdmin){
+    try{ gmailStatus=await window.api.getGmailAdminStatus(); }catch{}
+    try{ digestCandidates=(await window.api.listUsers()).filter(u=>u.active&&u.email); }catch{}
+  }
 
   settingsModal.hidden=false;
   settingsBody.innerHTML=`
@@ -692,6 +696,15 @@ async function openSettings(){
         <option value="weekly" ${cfg.backupFrequency==='weekly'?'selected':''}>Weekly</option>
       </select>
       ${cfg.lastBackupAt?`<div class="key-status key-set">Last automatic backup: ${esc(new Date(cfg.lastBackupAt).toLocaleString())}</div>`:''}</div>
+    <div class="settings-field"><label>Weekly digest</label>
+      <div class="hint">${gmailStatus.connected?'Sends every Monday at 6am ET to marcos@govspringlegal.com and anyone checked below.':'Connect Gmail above to enable the weekly digest.'}</div>
+      <div class="key-status">Always sent to: marcos@govspringlegal.com</div>
+      ${digestCandidates.length?digestCandidates.map(u=>`<label style="display:flex;align-items:center;gap:6px;margin:4px 0;font-weight:400;"><input type="checkbox" class="digestRecipCheck" value="${u.id}" ${(cfg.digestRecipientIds||[]).includes(u.id)?'checked':''}> ${esc(u.username)} (${esc(u.email)})</label>`).join(''):'<div class="hint">No other active users have an email on file.</div>'}
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+        <button class="btn btn-ghost btn-sm" id="saveDigestRecipBtn">Save recipients</button>
+        <button class="btn btn-sm" id="sendDigestNowBtn" ${gmailStatus.connected?'':'disabled title="Connect Gmail first"'}>Send digest now</button>
+      </div>
+      ${cfg.lastDigestWeekKey?`<div class="key-status key-set" style="margin-top:6px;">Last digest week: ${esc(cfg.lastDigestWeekKey)}</div>`:''}</div>
     `:''}
     <div class="modal-actions"><button class="btn" id="saveSettingsBtn">Save</button></div>`;
   wirePeekToggle(document.getElementById('apiKeyPeek'),document.getElementById('apiKeyInput'));
@@ -722,6 +735,18 @@ async function openSettings(){
       try{ await window.api.saveBackupSchedule(e.target.value); }
       catch(err){ alert(err.message); }
       openSettings();
+    });
+    document.getElementById('saveDigestRecipBtn').addEventListener('click',async()=>{
+      const ids=[...settingsBody.querySelectorAll('.digestRecipCheck:checked')].map(el=>parseInt(el.value,10));
+      try{ await window.api.saveDigestRecipients(ids); toast('Digest recipients saved.'); }
+      catch(err){ alert(err.message); }
+    });
+    document.getElementById('sendDigestNowBtn').addEventListener('click',async()=>{
+      const btn=document.getElementById('sendDigestNowBtn');
+      const orig=btn.textContent; btn.disabled=true; btn.textContent='Sending…';
+      try{ const r=await window.api.sendDigestNow(); toast(`Digest sent to ${r.to}`); }
+      catch(err){ alert(err.message); }
+      btn.disabled=false; btn.textContent=orig;
     });
   }
 }

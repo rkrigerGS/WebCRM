@@ -377,5 +377,5 @@ async function getMessageBody(messageId) {
 
 module.exports = {
   init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail,
-  sendAttachmentEmail, sendInviteEmail, getThreadReplies, getMessageBody
+  sendAttachmentEmail, sendInviteEmail, sendStandaloneEmail, getThreadReplies, getMessageBody
 };

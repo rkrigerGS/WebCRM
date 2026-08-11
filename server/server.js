@@ -21,6 +21,7 @@ const users = require('./users');
 const audit = require('./audit');
 const gmail = require('./gmail');
 const backup = require('./backup');
+const digest = require('./digest');
 
 const APP_DIR = path.join(__dirname, '..');
 const DATA_DIR = path.join(APP_DIR, 'data');
@@ -677,7 +678,8 @@ app.get('/api/config', (_q, res) => {
   ok(res, {
     hasApiKey: config.hasApiKey(), keyTail: c.anthropicApiKey ? c.anthropicApiKey.slice(-4) : '',
     draftModel: c.draftModel, defaultFollowupDays: c.defaultFollowupDays, watchFolder: watchedDir(),
-    backupFrequency: c.backupFrequency, lastBackupAt: c.lastBackupAt
+    backupFrequency: c.backupFrequency, lastBackupAt: c.lastBackupAt,
+    digestRecipientIds: c.digestRecipientIds || [], lastDigestWeekKey: c.lastDigestWeekKey
   });
 });
 
@@ -954,6 +956,66 @@ app.post('/api/admin/exclusions/remove', requireAdmin, mutating('exclusion.remov
   res.locals.audit = { detail: `Removed exclusion ${match_type}="${value}"` };
   return result;
 }));
+
+// ---- Weekly digest ----
+// Compiled entirely from db.js/audit.js data (see digest.js) — no Claude calls. Shared by
+// the Monday scheduler and the manual "send now" endpoint below.
+async function sendDigest() {
+  const cfg = config.get();
+  const recipientEmails = (cfg.digestRecipientIds || [])
+    .map(id => users.findById(id))
+    .filter(u => u && u.active && u.email)
+    .map(u => u.email);
+  const to = [...new Set(['marcos@govspringlegal.com', ...recipientEmails])].join(', ');
+  const { subject, bodyText } = digest.buildDigest({ prospects: db.listProspects(), auditEntries: audit.list({}) });
+  await gmail.sendStandaloneEmail({ to, subject, bodyText });
+  return { to, subject };
+}
+
+app.post('/api/config/digest-recipients', requireAdmin, mutating('config.digest.update', (q, res) => {
+  const ids = Array.isArray((q.body || {}).recipientIds) ? q.body.recipientIds.map(Number).filter(Number.isInteger) : [];
+  config.update({ digestRecipientIds: ids });
+  res.locals.audit = { detail: `Digest recipients set to [${ids.join(', ')}] (plus marcos@govspringlegal.com, always included)` };
+  return { ok: true, digestRecipientIds: ids };
+}));
+
+// Immediate, clear feedback to the admin if Gmail isn't connected — unlike the scheduled
+// path below, someone is actually waiting on this response.
+app.post('/api/admin/digest/send-now', requireAdmin, mutating('digest.sent', async (q, res) => {
+  if (!gmail.isConnected()) { const e = new Error('Gmail is not connected. Connect it in Settings first.'); e.status = 409; throw e; }
+  const { to, subject } = await sendDigest();
+  config.update({ lastDigestWeekKey: digest.nyWeekKey(new Date()) });
+  res.locals.audit = { detail: `Sent to ${to} — ${subject} (manual)` };
+  return { ok: true, to };
+}));
+
+// Checked every 15 minutes (coarser than the reply-poll's 3 minutes — this only needs to
+// fire once a week) rather than one long-lived timer, so a restart mid-window just picks
+// up on the next check. "6am EST" is resolved as actual America/New_York wall-clock time
+// (via Node's built-in Intl, no new dependency), not a fixed UTC-5 offset that would drift
+// during daylight saving. lastDigestWeekKey persists in config.json, so neither a restart
+// nor a missed week can cause a double-send; a week where Gmail was disconnected the whole
+// time is logged once as missed and not retried into the following week.
+async function checkDigestSchedule() {
+  const now = new Date();
+  const ny = digest.nyParts(now);
+  if (ny.weekday !== 'Mon' || ny.hour < 6) return;
+  const weekKey = digest.nyWeekKey(now);
+  if (config.get().lastDigestWeekKey === weekKey) return;
+  if (!gmail.isConnected()) {
+    audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: 'Gmail is not connected; the Monday digest could not be sent.' });
+  } else {
+    try {
+      const { to, subject } = await sendDigest();
+      audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.sent', detail: `Sent to ${to} — ${subject}` });
+    } catch (e) {
+      audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: `Send failed: ${e.message}` });
+    }
+  }
+  config.update({ lastDigestWeekKey: weekKey });
+}
+setInterval(checkDigestSchedule, 15 * 60 * 1000);
+checkDigestSchedule();
 
 // ---- Admin: audit log ----
 // Supports three views admins need: (1) who did a given action — filter by action, read

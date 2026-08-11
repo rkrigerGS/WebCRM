@@ -113,5 +113,8 @@ window.api = {
   sendReply:           (id, body)          => sendJSON('/api/prospects/' + id + '/reply/send', 'POST', body),
   setDormant:          (id, returnDate)    => sendJSON('/api/prospects/' + id + '/dormant', 'POST', { returnDate }),
   resendInvite:        (id)                => sendJSON('/api/admin/users/' + id + '/resend-invite', 'POST'),
-  removeExclusion:     (match_type, value) => sendJSON('/api/admin/exclusions/remove', 'POST', { match_type, value })
+  removeExclusion:     (match_type, value) => sendJSON('/api/admin/exclusions/remove', 'POST', { match_type, value }),
+
+  saveDigestRecipients: (recipientIds)     => sendJSON('/api/config/digest-recipients', 'POST', { recipientIds }),
+  sendDigestNow:        ()                 => sendJSON('/api/admin/digest/send-now', 'POST')
 };

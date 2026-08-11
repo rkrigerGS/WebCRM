@@ -18,7 +18,9 @@ const DEFAULTS = {
   googleClientId: '',            // Google Cloud OAuth client, pasted by an admin in Settings
   googleClientSecret: '',        // (Gmail sending — see server/gmail.js)
   backupFrequency: 'off',        // 'off' | 'daily' | '3days' | 'weekly' (see server/backup.js)
-  lastBackupAt: ''               // ISO timestamp of the last scheduled backup sent, or '' if never
+  lastBackupAt: '',              // ISO timestamp of the last scheduled backup sent, or '' if never
+  digestRecipientIds: [],        // additional user ids to CC on the Monday digest, beyond Marcos (always included) — see server/digest.js
+  lastDigestWeekKey: ''          // NY-local date (YYYY-MM-DD) of the Monday last sent or logged-as-missed, so a restart never double-sends or loses the week
 };
 
 function init(userDataDir) {
