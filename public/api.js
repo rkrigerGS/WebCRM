@@ -82,5 +82,13 @@ window.api = {
   resetUserPassword: (id, password)        => sendJSON(`/api/admin/users/${id}/password`, 'POST', { password }),
 
   listAudit:         (filters)             => getJSON('/api/admin/audit' + toQuery(filters)),
-  listAuditActions:  ()                    => getJSON('/api/admin/audit/actions')
+  listAuditActions:  ()                    => getJSON('/api/admin/audit/actions'),
+
+  getGmailStatus:      ()                  => getJSON('/api/gmail/status'),
+  listCcableUsers:     ()                  => getJSON('/api/users/ccable'),
+  setUserEmail:        (id, email)         => sendJSON(`/api/admin/users/${id}/email`, 'POST', { email }),
+
+  getGmailAdminStatus: ()                  => getJSON('/api/admin/gmail/status'),
+  disconnectGmail:     ()                  => sendJSON('/api/admin/gmail/disconnect', 'POST'),
+  saveGoogleCreds:     (clientId, clientSecret) => sendJSON('/api/config/google', 'POST', { clientId, clientSecret })
 };

@@ -56,6 +56,34 @@ did what and when from "Audit log" (also admin-only).
    (for example  C:\Users\Marcos\Desktop\prospect-research\outputs ).
 3. Existing dossiers load immediately; new ones appear automatically as research finishes.
 
+### Step 8. Connect Gmail (admin only, one-time)
+Outreach emails send from marcos@govspringlegal.com through this connection, no matter
+who is logged in when the "Save as sent" button is clicked. This needs a one-time setup
+in Google Cloud Console, done by whoever administers the GovSpring Legal Workspace:
+
+1. In Google Cloud Console (console.cloud.google.com), create a project under the
+   GovSpring Legal Workspace org (or use an existing one) and enable the Gmail API
+   (APIs & Services -> Library -> search "Gmail API" -> Enable).
+2. APIs & Services -> OAuth consent screen -> User Type "Internal" (only shows up when
+   the project belongs to the Workspace org). Fill in the app name and contact emails,
+   and add the scope  https://www.googleapis.com/auth/gmail.modify .
+   "Internal" apps skip Google's verification review entirely.
+3. APIs & Services -> Credentials -> Create Credentials -> OAuth client ID -> Web
+   application. Add these as Authorized redirect URIs:
+      http://localhost:3000/api/admin/gmail/callback   (local testing)
+      https://<your-production-domain>/api/admin/gmail/callback   (once deployed)
+   Save, and copy the Client ID and Client Secret it gives you.
+4. Back in the app: Settings -> "Google OAuth client" -> paste the Client ID and Client
+   Secret -> "Save Google credentials".
+5. Click "Connect Gmail". You'll be sent to a Google sign-in/consent screen -- sign in as
+   marcos@govspringlegal.com and approve. You're returned to the app, and Settings now
+   shows "Connected as marcos@govspringlegal.com."
+
+The connection refreshes itself automatically from then on. If it's ever disconnected
+(or access is revoked from myaccount.google.com/permissions), reconnect the same way --
+no need to touch Google Cloud Console again unless the Client ID/Secret themselves need
+to change.
+
 --------------------------------------------------------------------
 ## PART 2 - Make it start automatically on boot (recommended)
 --------------------------------------------------------------------

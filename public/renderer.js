@@ -366,19 +366,57 @@ async function runGeneration(){
   renderDraft(res.draft,res.usage);
 }
 
-function renderDraft(draft,usage){
+// Best-guess recipient: the first contact with an email, else the general contact email.
+function guessRecipientEmail(d){
+  const contacts=Array.isArray(d.contacts)?d.contacts:[];
+  const withEmail=contacts.find(c=>c.email);
+  if(withEmail)return withEmail.email;
+  return (d.contact_general&&d.contact_general.email)||'';
+}
+
+async function renderDraft(draft,usage){
   const tokens=usage&&usage.output_tokens?`${usage.input_tokens||0} in / ${usage.output_tokens} out`:'';
+  const [gmailStatus,ccable]=await Promise.all([
+    window.api.getGmailStatus().catch(()=>({connected:false})),
+    window.api.listCcableUsers().catch(()=>[])
+  ]);
+  const company=flowState.dossier.company_name||'';
+  const defaultSubject=flowState.isFollowup?`Re: ${company}`:company;
+  const defaultTo=guessRecipientEmail(flowState.dossier);
+  const ccOptions=ccable.length
+    ?ccable.map(u=>`<label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;font-weight:400;"><input type="checkbox" class="ccCheck" value="${esc(u.email)}"> ${esc(u.username)} (${esc(u.email)})</label>`).join('')
+    :`<div class="hint">No other users have an email on file to CC.</div>`;
+
   emailModalBody.innerHTML=`
     <div class="q-hint">Review and edit. Paste the version you actually send back here and save so the app learns from your changes.</div>
     <textarea class="draft-area" id="draftArea">${esc(draft)}</textarea>
     <div class="modal-actions"><button class="btn" id="copyBtn">Copy to clipboard</button><button class="btn btn-ghost" id="regenBtn">Regenerate</button><div class="spacer"></div><span class="usage-note">${tokens}</span></div>
-    <div class="modal-actions"><button class="btn" id="saveFinalBtn">${flowState.isFollowup?'Save follow-up as sent':'Save as sent'}</button><span class="usage-note">Marks sent and adds to the learning library.</span></div>`;
+    <div class="settings-field"><label>To</label><input class="field-input" id="sendTo" value="${esc(defaultTo)}" placeholder="recipient@example.com"></div>
+    <div class="settings-field"><label>Subject</label><input class="field-input" id="sendSubject" value="${esc(defaultSubject)}"></div>
+    <div class="settings-field"><label>CC (optional)</label>${ccOptions}</div>
+    ${gmailStatus.connected?'':'<div class="error-note">Gmail is not connected. Ask an admin to connect it in Settings before sending.</div>'}
+    <div id="sendErr" class="error-note" hidden></div>
+    <div class="modal-actions"><button class="btn" id="saveFinalBtn" ${gmailStatus.connected?'':'disabled'}>${flowState.isFollowup?'Send follow-up':'Send email'}</button><span class="usage-note">Sends via Gmail, marks sent, and adds to the learning library.</span></div>`;
   document.getElementById('copyBtn').addEventListener('click',()=>{navigator.clipboard.writeText(document.getElementById('draftArea').value);const b=document.getElementById('copyBtn');b.textContent='Copied';setTimeout(()=>{if(b)b.textContent='Copy to clipboard';},1500);});
   document.getElementById('regenBtn').addEventListener('click',()=>{ if(flowState.isFollowup)runGeneration(); else openEmailFlow(flowState.prospectId,flowState.dossier,false); });
   document.getElementById('saveFinalBtn').addEventListener('click',async()=>{
     const finalText=document.getElementById('draftArea').value;
-    await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup});
-    emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId);
+    const to=document.getElementById('sendTo').value.trim();
+    const subject=document.getElementById('sendSubject').value.trim();
+    const cc=[...emailModalBody.querySelectorAll('.ccCheck:checked')].map(el=>el.value);
+    const errEl=document.getElementById('sendErr');
+    errEl.hidden=true;
+    if(!to||!subject){ errEl.textContent='A recipient and subject are required.'; errEl.hidden=false; return; }
+    const btn=document.getElementById('saveFinalBtn');
+    const originalLabel=btn.textContent;
+    btn.disabled=true; btn.textContent='Sending…';
+    try{
+      await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc});
+      emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId);
+    }catch(e){
+      errEl.textContent=e.message; errEl.hidden=false;
+      btn.disabled=false; btn.textContent=originalLabel;
+    }
   });
 }
 
@@ -389,6 +427,10 @@ const settingsModal=document.getElementById('settingsModal');
 const settingsBody=document.getElementById('settingsBody');
 async function openSettings(){
   const cfg=await window.api.getConfig();
+  const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
+  let gmailStatus={connected:false,email:'',hasCreds:false};
+  if(isAdmin){ try{ gmailStatus=await window.api.getGmailAdminStatus(); }catch{} }
+
   settingsModal.hidden=false;
   settingsBody.innerHTML=`
     <div class="settings-field"><label>Anthropic API key</label>
@@ -402,11 +444,43 @@ async function openSettings(){
       <button class="btn btn-ghost btn-sm" id="resetWatchBtn">Use default</button></div>
     <div class="settings-field"><label>Default follow-up gap (days)</label>
       <input type="number" class="field-input" id="followupDaysInput" value="${cfg.defaultFollowupDays}" min="1" max="30" style="width:100px"></div>
+    ${isAdmin?`
+    <div class="settings-field"><label>Gmail connection</label>
+      <div class="hint">Outreach emails send from this account, regardless of who is logged in.</div>
+      <div class="key-status ${gmailStatus.connected?'key-set':'key-unset'}">${gmailStatus.connected?`Connected as ${esc(gmailStatus.email)}.`:'Not connected.'}</div>
+      <div style="margin-top:8px;">
+        ${gmailStatus.connected
+          ?`<button class="btn btn-ghost btn-sm" id="gmailDisconnectBtn">Disconnect</button>`
+          :`<button class="btn btn-sm" id="gmailConnectBtn" ${gmailStatus.hasCreds?'':'disabled title="Add a Google Client ID and Secret below first"'}>Connect Gmail</button>`}
+      </div></div>
+    <div class="settings-field"><label>Google OAuth client</label>
+      <div class="hint">From Google Cloud Console &rarr; APIs &amp; Services &rarr; Credentials. Needed once, before connecting.</div>
+      <input class="field-input" id="googleClientIdInput" placeholder="${gmailStatus.hasCreds?'Client ID set (leave blank to keep it)':'Client ID'}" style="margin-bottom:8px;">
+      <input class="field-input" id="googleClientSecretInput" type="password" placeholder="${gmailStatus.hasCreds?'•••• Client Secret set (leave blank to keep it)':'Client Secret'}">
+      <div style="margin-top:8px;"><button class="btn btn-ghost btn-sm" id="saveGoogleCredsBtn">Save Google credentials</button></div></div>
+    `:''}
     <div class="modal-actions"><button class="btn" id="saveSettingsBtn">Save</button></div>`;
   window.api.watchedPath().then(p=>{const el=document.getElementById('watchPathDisplay');if(el)el.textContent=p;});
   document.getElementById('chooseWatchBtn').addEventListener('click',async()=>{const r=await window.api.chooseWatched();document.getElementById('watchPathDisplay').textContent=r.path;loadProspects();});
   document.getElementById('resetWatchBtn').addEventListener('click',async()=>{const r=await window.api.resetWatched();document.getElementById('watchPathDisplay').textContent=r.path;});
   document.getElementById('saveSettingsBtn').addEventListener('click',async()=>{const key=document.getElementById('apiKeyInput').value.trim();if(key)await window.api.setApiKey(key);const days=parseInt(document.getElementById('followupDaysInput').value,10);if(days)await window.api.updateConfig({defaultFollowupDays:days});settingsModal.hidden=true;});
+
+  if(isAdmin){
+    const connectBtn=document.getElementById('gmailConnectBtn');
+    if(connectBtn)connectBtn.addEventListener('click',()=>{ window.location.href='/api/admin/gmail/connect'; });
+    const disconnectBtn=document.getElementById('gmailDisconnectBtn');
+    if(disconnectBtn)disconnectBtn.addEventListener('click',async()=>{
+      if(!confirm('Disconnect Gmail? Outreach emails cannot be sent until reconnected.'))return;
+      await window.api.disconnectGmail(); openSettings();
+    });
+    document.getElementById('saveGoogleCredsBtn').addEventListener('click',async()=>{
+      const clientId=document.getElementById('googleClientIdInput').value.trim();
+      const clientSecret=document.getElementById('googleClientSecretInput').value.trim();
+      if(!clientId&&!clientSecret)return;
+      await window.api.saveGoogleCreds(clientId,clientSecret);
+      openSettings();
+    });
+  }
 }
 document.getElementById('settingsBtn').addEventListener('click',openSettings);
 document.getElementById('settingsClose').addEventListener('click',()=>settingsModal.hidden=true);
@@ -434,6 +508,7 @@ function renderUsers(list){
     const isSelf=u.id===me.id;
     return `<tr data-id="${u.id}">
       <td><strong>${esc(u.username)}</strong>${isSelf?' <span class="field-key">(you)</span>':''}</td>
+      <td><input class="field-input emailInput" data-id="${u.id}" value="${esc(u.email||'')}" placeholder="(none — can't be CC'd)" style="font-size:12.5px;padding:5px 8px;"></td>
       <td><select class="tb-select roleSelect" data-id="${u.id}">
         <option value="user" ${u.role==='user'?'selected':''}>User</option>
         <option value="admin" ${u.role==='admin'?'selected':''}>Admin</option>
@@ -451,9 +526,10 @@ function renderUsers(list){
   usersBody.innerHTML=`
     <div class="settings-field">
       <label>Create user</label>
-      <div class="hint">Password must be at least 8 characters.</div>
+      <div class="hint">Password must be at least 8 characters. Email is optional — set it so this person can be CC'd on outreach.</div>
       <input class="field-input" id="newUserName" placeholder="Username" style="margin-bottom:8px;">
       <input class="field-input" id="newUserPw" type="password" placeholder="Password" style="margin-bottom:8px;">
+      <input class="field-input" id="newUserEmail" placeholder="Email (optional)" style="margin-bottom:8px;">
       <select class="tb-select" id="newUserRole" style="margin-bottom:8px;">
         <option value="user">User</option>
         <option value="admin">Admin</option>
@@ -463,7 +539,7 @@ function renderUsers(list){
     </div>
     <div class="table-wrap" style="max-height:340px;">
       <table class="users-table">
-        <thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
@@ -472,13 +548,20 @@ function renderUsers(list){
     const username=document.getElementById('newUserName').value.trim();
     const password=document.getElementById('newUserPw').value;
     const role=document.getElementById('newUserRole').value;
+    const email=document.getElementById('newUserEmail').value.trim();
     const errEl=document.getElementById('createUserErr');
     errEl.hidden=true;
     try{
-      await window.api.createUser({username,password,role});
+      await window.api.createUser({username,password,role,email});
       openUsers();
     }catch(e){ errEl.textContent=e.message; errEl.hidden=false; }
   });
+
+  usersBody.querySelectorAll('.emailInput').forEach(inp=>inp.addEventListener('change',async(e)=>{
+    const id=parseInt(e.target.dataset.id,10);
+    try{ await window.api.setUserEmail(id,e.target.value.trim()); }
+    catch(err){ alert(err.message); openUsers(); }
+  }));
 
   usersBody.querySelectorAll('.roleSelect').forEach(sel=>sel.addEventListener('change',async(e)=>{
     const id=parseInt(e.target.dataset.id,10);
@@ -641,6 +724,17 @@ document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',a
 window.api.onIngested((r)=>{ if(r.outcome==='ingested'){loadProspects();toast('New prospect added from research');} else if(r.outcome==='duplicate'){toast('Skipped a duplicate');} });
 function toast(msg){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:100;opacity:0;transition:opacity .2s;';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},2200);}
 
+// After the Gmail OAuth redirect lands back on the app (see server.js's
+// /api/admin/gmail/callback), surface the result and clean the URL.
+function checkGmailRedirect(){
+  const params=new URLSearchParams(location.search);
+  const g=params.get('gmail');
+  if(!g)return;
+  if(g==='connected'){ toast('Gmail connected.'); openSettings(); }
+  else if(g==='error'){ toast('Could not connect Gmail. Check the Client ID/Secret and try again.'); openSettings(); }
+  history.replaceState(null,'',location.pathname);
+}
+
 // Wait for the login gate to authenticate before loading any data (API calls need the session).
-if (window.__authed) { applyRoleUI(); loadProspects(); }
-else { document.addEventListener('authed', () => { applyRoleUI(); loadProspects(); }, { once: true }); }
+if (window.__authed) { applyRoleUI(); loadProspects(); checkGmailRedirect(); }
+else { document.addEventListener('authed', () => { applyRoleUI(); loadProspects(); checkGmailRedirect(); }, { once: true }); }

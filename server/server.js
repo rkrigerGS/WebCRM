@@ -19,6 +19,7 @@ const emailEngine = require('./emailEngine');
 const auth = require('./auth');
 const users = require('./users');
 const audit = require('./audit');
+const gmail = require('./gmail');
 
 const APP_DIR = path.join(__dirname, '..');
 const DATA_DIR = path.join(APP_DIR, 'data');
@@ -31,6 +32,7 @@ catalogs.init(DATA_DIR, APP_DIR);
 auth.init(DATA_DIR);
 users.init(DATA_DIR);
 audit.init(DATA_DIR);
+gmail.init(DATA_DIR);
 seedApprovedEmails();
 
 let watcher = null;
@@ -134,6 +136,9 @@ function requireAdmin(req, res, next) {
 //     entry per ingested item in its own loop, not one entry per request.
 //   - tryIngestFile() (folder watcher, below) — not an HTTP route; there is no logged-in
 //     user, so it calls audit.log() directly with a "system" actor.
+//   - GET /api/admin/gmail/callback — the OAuth redirect target. It's a GET that responds
+//     with a redirect, not JSON, so it doesn't fit mutating()'s res.json() contract; it
+//     audits the connection manually.
 // ─────────────────────────────────────────────────────────────────────────────────────
 function mutating(action, handler) {
   const fn = async (req, res) => {
@@ -327,22 +332,90 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
   }
 }));
 
-app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', (q, res) => {
+// Saving a final email now actually sends it via Gmail (channel 'email' — the only
+// channel this endpoint is ever called with; "log outreach sent elsewhere" is the
+// separate /external endpoint above, untouched). Sequenced so the send is atomic from
+// the caller's perspective: the do-not-contact check and the Gmail-connected check run
+// before anything happens, and the prospect record is only updated AFTER the Gmail send
+// itself has actually succeeded. If gmail.sendEmail() throws, execution never reaches the
+// db.updateProspect()/catalogs.saveApprovedEmail() calls below, so a failed send leaves
+// the prospect record completely untouched — no partial state.
+app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (q, res) => {
   const id = +q.params.id;
   const p = db.getProspect(id);
   if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
   const { finalText, meta } = q.body;
-  const patch = { final_sent: finalText, status: 'sent', channel: (meta && meta.channel) || 'email', date_sent: new Date().toISOString().slice(0, 10) };
-  if (meta && meta.isFollowup) patch.followup_count = (p.followup_count || 0) + 1;
+  const to = ((meta && meta.to) || '').trim();
+  const subject = ((meta && meta.subject) || '').trim();
+  const cc = Array.isArray(meta && meta.cc) ? meta.cc.filter(e => typeof e === 'string' && e.trim()).map(e => e.trim()) : [];
+
+  const excludedBy = db.checkExclusion(id);
+  if (excludedBy) {
+    res.status(400).json({ error: `This company is on the do-not-contact list (matched: ${excludedBy}). Sending is blocked.` });
+    res.locals.skipAudit = true;
+    return;
+  }
+  if (!gmail.isConnected()) {
+    res.status(409).json({ error: 'Gmail is not connected. Ask an admin to connect it in Settings.' });
+    res.locals.skipAudit = true;
+    return;
+  }
+  if (!to || !subject) {
+    res.status(400).json({ error: 'A recipient and subject are required.' });
+    res.locals.skipAudit = true;
+    return;
+  }
+
+  const isFollowup = !!(meta && meta.isFollowup);
+  const priorIds = JSON.parse(p.gmail_message_ids || '[]');
+  const hasThread = isFollowup && p.gmail_thread_id && priorIds.length;
+
+  let sendResult;
+  try {
+    sendResult = await gmail.sendEmail({
+      to, cc, subject, bodyText: finalText,
+      threadId: hasThread ? p.gmail_thread_id : undefined,
+      inReplyTo: hasThread ? priorIds[priorIds.length - 1] : undefined,
+      references: hasThread ? priorIds.join(' ') : undefined
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not send via Gmail: ' + e.message });
+    res.locals.skipAudit = true;
+    return;
+  }
+
+  // Only reached once the Gmail send has actually succeeded.
+  const patch = {
+    final_sent: finalText, status: 'sent', channel: 'email',
+    date_sent: new Date().toISOString().slice(0, 10),
+    gmail_thread_id: p.gmail_thread_id || sendResult.gmailThreadId || ''
+  };
+  if (isFollowup) patch.followup_count = (p.followup_count || 0) + 1;
+  if (sendResult.gmailMessageId) patch.gmail_message_ids = JSON.stringify([...priorIds, sendResult.gmailMessageId]);
   db.updateProspect(id, patch);
   catalogs.saveApprovedEmail({
-    company_name: p.company_name, recipient: (meta && meta.recipient) || '',
+    company_name: p.company_name, recipient: to,
     services: (meta && meta.services) || [], first_draft: p.first_draft || '',
-    final_text: finalText, is_followup: !!(meta && meta.isFollowup), saved_at: new Date().toISOString()
+    final_text: finalText, is_followup: isFollowup, saved_at: new Date().toISOString()
   });
-  res.locals.audit = { prospectId: id, detail: `${(meta && meta.channel) || 'email'}${meta && meta.isFollowup ? ' (follow-up)' : ''}` };
+  res.locals.audit = {
+    prospectId: id,
+    detail: `Sent via Gmail to ${to}${cc.length ? ` (cc: ${cc.join(', ')})` : ''}${isFollowup ? (hasThread ? ' — follow-up, threaded' : ' — follow-up, new thread (no prior Gmail thread on file)') : ''}`
+  };
   return { ok: true };
 }));
+
+// Gmail connection status (boolean only) — any authenticated user, so the send screen
+// can gate itself regardless of who's logged in. Full detail (which account, whether
+// credentials are configured) is admin-only, in the Admin: Gmail section below.
+app.get('/api/gmail/status', (_q, res) => { try { ok(res, { connected: gmail.isConnected() }); } catch (e) { fail(res, e); } });
+
+// CC picker source — any authenticated user. Read-only, minimal shape (no role, no
+// creation date) since this is exposed beyond admins.
+app.get('/api/users/ccable', (_q, res) => {
+  try { ok(res, users.listUsers().filter(u => u.active && u.email).map(u => ({ id: u.id, username: u.username, email: u.email }))); }
+  catch (e) { fail(res, e); }
+});
 
 // Config
 app.get('/api/config', (_q, res) => {
@@ -356,11 +429,28 @@ app.post('/api/config/key', mutating('config.apiKey.update', (q, res) => {
   return { ok: true, hasApiKey: config.hasApiKey() };
 }));
 
+// Google Cloud OAuth client (Client ID/Secret) for the Gmail connection — admin-only,
+// same treatment as the Anthropic key: pasted in, stored server-side, never echoed back
+// to the browser and never logged. Like the Anthropic key field, the browser never sees
+// the stored value (only whether one is set), so a blank submitted field means "leave
+// this one alone," not "clear it" — otherwise updating just the Client ID would wipe an
+// already-saved Secret the admin didn't retype.
+app.post('/api/config/google', requireAdmin, mutating('config.google.update', (q, res) => {
+  const body = q.body || {};
+  const patch = {};
+  if (typeof body.clientId === 'string' && body.clientId.trim()) patch.googleClientId = body.clientId.trim();
+  if (typeof body.clientSecret === 'string' && body.clientSecret.trim()) patch.googleClientSecret = body.clientSecret.trim();
+  config.update(patch);
+  res.locals.audit = { detail: 'Google OAuth client updated' }; // never log the secret itself
+  return { ok: true, hasGoogleCreds: config.hasGoogleCreds() };
+}));
+
 app.post('/api/config', mutating('config.update', (q, res) => {
   config.update(q.body || {});
   if ('watchFolder' in (q.body || {})) restartWatching();
   const safeBody = { ...(q.body || {}) };
-  delete safeBody.anthropicApiKey; // defensive: this route isn't meant to carry the key, but never log it if it does
+  delete safeBody.anthropicApiKey; // defensive: this route isn't meant to carry secrets, but never log them if it does
+  delete safeBody.googleClientSecret;
   res.locals.audit = { detail: JSON.stringify(safeBody) };
   return { ok: true, watchFolder: watchedDir() };
 }));
@@ -431,6 +521,56 @@ app.post('/api/admin/users/:id/password', requireAdmin, mutating('user.password.
   return { ok: true };
 }));
 
+// Sets a user's email address (used by the CC picker on the send screen — see
+// /api/users/ccable). Admin-only, not self-service; keeps this change scoped to what the
+// Gmail feature needs rather than building a full profile-editing surface.
+app.post('/api/admin/users/:id/email', requireAdmin, mutating('user.email.update', (q, res) => {
+  const u = users.setEmail(+q.params.id, (q.body || {}).email);
+  res.locals.audit = { detail: `Set email for "${u.username}" to "${u.email || '(cleared)'}"` };
+  return u;
+}));
+
+// ---- Admin: Gmail connection ----
+// The redirect_uri Google requires must exactly match what's registered on the OAuth
+// client and what's sent on both the authorize request and the token exchange — derived
+// from the incoming request so the same code works for local dev and the Railway domain
+// without configuration, as long as both are registered as authorized redirect URIs.
+function gmailRedirectUri(req) {
+  return `${req.protocol}://${req.get('host')}/api/admin/gmail/callback`;
+}
+
+app.get('/api/admin/gmail/status', requireAdmin, (_q, res) => {
+  try { ok(res, { ...gmail.getStatus(), hasCreds: config.hasGoogleCreds() }); }
+  catch (e) { fail(res, e); }
+});
+
+app.get('/api/admin/gmail/connect', requireAdmin, (req, res) => {
+  try { res.redirect(gmail.getAuthUrl(gmailRedirectUri(req))); }
+  catch (e) { res.status(400).send(String(e.message || e)); }
+});
+
+// OAuth redirect target — see the AUDIT CONVENTION exception list above for why this
+// doesn't use mutating(). Reached by the browser navigating back from Google's consent
+// screen, still carrying the admin's session cookie from when they clicked Connect.
+app.get('/api/admin/gmail/callback', requireAdmin, async (req, res) => {
+  try {
+    if (req.query.error) return res.redirect('/?gmail=error');
+    await gmail.exchangeCode(req.query.code, gmailRedirectUri(req));
+    audit.log({ userId: req.user.id, username: req.user.username, action: 'gmail.connect', detail: `Connected as ${gmail.getStatus().email}` });
+    res.redirect('/?gmail=connected');
+  } catch (e) {
+    console.warn('Gmail OAuth callback failed:', e.message);
+    res.redirect('/?gmail=error');
+  }
+});
+
+app.post('/api/admin/gmail/disconnect', requireAdmin, mutating('gmail.disconnect', (_q, res) => {
+  const wasEmail = gmail.getStatus().email;
+  gmail.disconnect();
+  res.locals.audit = { detail: wasEmail ? `Disconnected ${wasEmail}` : 'Disconnected' };
+  return { ok: true };
+}));
+
 // ---- Admin: audit log ----
 // Supports three views admins need: (1) who did a given action — filter by action, read
 // the username per row; (2) everything one user did, with timestamps — filter by user;
@@ -457,7 +597,7 @@ app.get('*', (_q, res) => res.sendFile(path.join(APP_DIR, 'public', 'index.html'
 // Walks the registered routes and flags any POST/PATCH/PUT/DELETE /api/* route that
 // wasn't wired through mutating(). The four routes documented as exceptions in the AUDIT
 // CONVENTION comment above are expected to fail this check and are excluded on purpose.
-const AUDIT_EXEMPT_ROUTES = new Set(['/api/auth/setup', '/api/auth/login', '/api/auth/logout', '/api/prospects/upload']);
+const AUDIT_EXEMPT_ROUTES = new Set(['/api/auth/setup', '/api/auth/login', '/api/auth/logout', '/api/prospects/upload', '/api/admin/gmail/callback']);
 function checkAuditCoverage() {
   try {
     const offenders = [];

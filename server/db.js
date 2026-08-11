@@ -48,6 +48,11 @@ function blankProspect() {
     status: 'new', channel: '', first_draft: '', final_sent: '',
     date_sent: '', followup_count: 0, followup_days: 4, next_action_date: '',
     newsletter: 0, activity: '[]',
+    // Gmail threading: the thread id Gmail assigned on the first send, and the RFC
+    // "Message-ID" header value(s) sent so far in that thread (JSON array, oldest
+    // first) — used to build In-Reply-To/References on the next follow-up so it lands
+    // as a reply rather than a new message. Empty until the prospect's first Gmail send.
+    gmail_thread_id: '', gmail_message_ids: '[]',
     created_at: new Date().toISOString(), updated_at: new Date().toISOString()
   };
 }
@@ -135,7 +140,8 @@ function updateProspect(id, fields) {
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { updated: false };
   const allowed = ['status', 'channel', 'first_draft', 'final_sent', 'date_sent',
-    'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity'];
+    'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity',
+    'gmail_thread_id', 'gmail_message_ids'];
   for (const k of allowed) if (k in fields) p[k] = fields[k];
   p.updated_at = new Date().toISOString();
   save();
@@ -180,6 +186,17 @@ function editContact(id, patch) {
   return { ok: true };
 }
 
+// Do-not-contact check for an existing prospect (used before sending email — see
+// server.js). Reuses the same exclusions logic ingestDossier() already applies at
+// ingest time; a prospect's own uei/company_name are in the same shape isExcluded()
+// expects. Returns the matched exclusion value, or null if the prospect isn't excluded
+// (including if the prospect id doesn't exist, since there's nothing to block then).
+function checkExclusion(id) {
+  const p = store.prospects.find(x => x.id === id);
+  if (!p) return null;
+  return isExcluded(p);
+}
+
 function stats() {
   const c = { total: 0, new: 0, sent: 0, replied: 0, signed: 0 };
   for (const p of store.prospects) {
@@ -198,5 +215,5 @@ function safeParse(s, fallback) {
 
 module.exports = {
   init, ingestDossier, listProspects, getProspect, deleteProspect,
-  updateProspect, addNote, logExternal, editContact, stats
+  updateProspect, addNote, logExternal, editContact, checkExclusion, stats
 };

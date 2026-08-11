@@ -23,6 +23,7 @@ function load() {
     store = JSON.parse(fs.readFileSync(usersPath, 'utf8'));
     store.users = store.users || [];
     store.nextId = store.nextId || (store.users.reduce((m, u) => Math.max(m, u.id), 0) + 1);
+    for (const u of store.users) if (u.email === undefined) u.email = ''; // forward-compat with pre-email accounts
   } catch {
     save(); // no file yet: write the empty store
   }
@@ -68,21 +69,38 @@ function findById(id) {
   return store.users.find(u => u.id === id) || null;
 }
 
-function createUser({ username, password, role }) {
+const EMAIL_PATTERN = /^\S+@\S+\.\S+$/;
+
+function createUser({ username, password, role, email }) {
   const clean = String(username || '').trim();
   if (!clean) throw err(400, 'Username required');
   if (findByUsername(clean)) throw err(400, 'Username already taken');
   if (!password || password.length < MIN_PASSWORD_LENGTH) throw err(400, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+  const cleanEmail = String(email || '').trim();
+  if (cleanEmail && !EMAIL_PATTERN.test(cleanEmail)) throw err(400, 'Email address looks invalid');
   const u = {
     id: store.nextId++,
     username: clean,
     usernameLower: normalizeUsername(clean),
     passwordHash: hashPassword(password),
     role: role === 'admin' ? 'admin' : 'user',
+    email: cleanEmail,
     active: true,
     createdAt: new Date().toISOString()
   };
   store.users.push(u);
+  save();
+  return safe(u);
+}
+
+// Used for the CC picker on the send screen — set (or cleared) by an admin from the
+// Users panel. Not self-service; keeps the change scoped to what the feature needs.
+function setEmail(id, email) {
+  const u = findById(id);
+  if (!u) throw err(404, 'User not found');
+  const clean = String(email || '').trim();
+  if (clean && !EMAIL_PATTERN.test(clean)) throw err(400, 'Email address looks invalid');
+  u.email = clean;
   save();
   return safe(u);
 }
@@ -130,5 +148,5 @@ function safe(u) {
 
 module.exports = {
   init, hasAnyUser, createUser, checkLogin, findById, findByUsername,
-  listUsers, setActive, setRole, resetPassword, MIN_PASSWORD_LENGTH
+  listUsers, setActive, setRole, setEmail, resetPassword, MIN_PASSWORD_LENGTH
 };

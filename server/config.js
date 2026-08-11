@@ -14,7 +14,9 @@ const DEFAULTS = {
   draftModel: 'claude-sonnet-4-5-20250929',
   clerkPhrase: 'my law clerk',   // "my law clerk" | "my law clerks" | "some summer law clerks"
   defaultFollowupDays: 4,
-  watchFolder: ''                // where the research agent writes dossiers; '' = use built-in default
+  watchFolder: '',               // where the research agent writes dossiers; '' = use built-in default
+  googleClientId: '',            // Google Cloud OAuth client, pasted by an admin in Settings
+  googleClientSecret: ''         // (Gmail sending — see server/gmail.js)
 };
 
 function init(userDataDir) {
@@ -50,4 +52,9 @@ function hasApiKey() {
   return typeof k === 'string' && k.startsWith('sk-ant-');
 }
 
-module.exports = { init, get, update, save, hasApiKey };
+function hasGoogleCreds() {
+  const c = get();
+  return !!(c.googleClientId && c.googleClientSecret);
+}
+
+module.exports = { init, get, update, save, hasApiKey, hasGoogleCreds };
