@@ -9,6 +9,7 @@
   const user = document.getElementById('loginUser');
   const pw = document.getElementById('loginPw');
   const btn = document.getElementById('loginBtn');
+  const pwToggle = document.getElementById('loginPwToggle');
 
   let firstRun = false;
 
@@ -66,6 +67,12 @@
   btn.addEventListener('click', submit);
   user.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
   pw.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+  pwToggle.addEventListener('click', () => {
+    const showing = pw.type === 'text';
+    pw.type = showing ? 'password' : 'text';
+    pwToggle.textContent = showing ? 'Show' : 'Hide';
+    pwToggle.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+  });
 
   checkStatus();
 })();

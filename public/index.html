@@ -13,7 +13,10 @@
       <div class="login-tag">Prospecting</div>
       <div id="loginMsg" class="login-msg"></div>
       <input type="text" id="loginUser" class="login-input" placeholder="Username" autocomplete="username" />
-      <input type="password" id="loginPw" class="login-input" placeholder="Password" autocomplete="current-password" />
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;">
+        <input type="password" id="loginPw" class="login-input" placeholder="Password" autocomplete="current-password" style="margin-bottom:0;flex:1;" />
+        <button type="button" class="btn btn-ghost btn-sm" id="loginPwToggle" aria-label="Show password" style="width:auto;padding:5px 10px;flex-shrink:0;">Show</button>
+      </div>
       <button class="btn" id="loginBtn">Enter</button>
     </div>
   </div>

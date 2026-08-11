@@ -39,6 +39,12 @@ let watcher = null;
 startWatching();
 
 const app = express();
+// This app deploys behind Railway's edge proxy — without trusting it, req.ip would
+// resolve to the proxy's own address for every request, not the real client IP, which
+// would make the login rate limiter below lock out every user together instead of one
+// abusive IP. Railway is the only proxy this app ever sits behind (local dev has no
+// proxy in the chain at all, so this has no effect there).
+app.set('trust proxy', true);
 app.use(express.json({ limit: '5mb' }));
 
 // ---- Auth endpoints (these must be reachable without a token) ----
@@ -75,11 +81,36 @@ app.post('/api/auth/setup', (q, res) => {
   res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
 });
 
+// ---- Login rate limiting ----
+// In-memory only (no persistence needed, no new dependency): 5 failed attempts from one
+// IP within a 15-minute window locks that IP out for the remainder of that window. A
+// correct password at any point before the 5th failure succeeds normally and clears the
+// entry. No cleanup of stale entries — at this app's scale (1-2 users) the map never
+// grows large enough for that to matter.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 5;
+const loginAttempts = new Map(); // ip -> { count, firstFailureAt, lockedUntil }
+
 // Log in with a username and password.
 app.post('/api/auth/login', (q, res) => {
+  const ip = q.ip;
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (entry && entry.lockedUntil && now < entry.lockedUntil) {
+    const minutesLeft = Math.ceil((entry.lockedUntil - now) / 60000);
+    return res.status(429).json({ error: `Too many failed login attempts. Try again in ${minutesLeft} minute${minutesLeft === 1 ? '' : 's'}.` });
+  }
   const { username, password } = q.body || {};
   const user = users.checkLogin(username || '', password || '');
-  if (!user) return res.status(401).json({ error: 'Invalid username or password' });
+  if (!user) {
+    let e = entry;
+    if (!e || now - e.firstFailureAt > LOGIN_WINDOW_MS) e = { count: 0, firstFailureAt: now, lockedUntil: 0 };
+    e.count++;
+    if (e.count >= LOGIN_MAX_ATTEMPTS) e.lockedUntil = e.firstFailureAt + LOGIN_WINDOW_MS;
+    loginAttempts.set(ip, e);
+    return res.status(401).json({ error: 'Invalid username or password' });
+  }
+  loginAttempts.delete(ip);
   const token = auth.issueToken(user.id);
   res.set('Set-Cookie', `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
   res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });

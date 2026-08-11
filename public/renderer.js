@@ -435,7 +435,10 @@ async function openSettings(){
   settingsBody.innerHTML=`
     <div class="settings-field"><label>Anthropic API key</label>
       <div class="hint">Used to generate email drafts. Starts with sk-ant-. Stored only on this machine.</div>
-      <input type="password" class="field-input" id="apiKeyInput" placeholder="${cfg.hasApiKey?'•••• set (ends '+esc(cfg.keyTail)+')':'sk-ant-...'}">
+      <div style="display:flex;gap:6px;align-items:center;">
+        <input type="password" class="field-input" id="apiKeyInput" placeholder="${cfg.hasApiKey?'•••• set (ends '+esc(cfg.keyTail)+')':'sk-ant-...'}" style="flex:1;">
+        <button type="button" class="btn btn-ghost btn-sm" id="apiKeyPeek" aria-label="Show password briefly" style="flex-shrink:0;">Show</button>
+      </div>
       <div class="key-status ${cfg.hasApiKey?'key-set':'key-unset'}">${cfg.hasApiKey?'A key is set.':'No key set yet.'}</div></div>
     <div class="settings-field"><label>Research output folder</label>
       <div class="hint">Where your research agent writes dossier JSON. The app watches this and its batch subfolders.</div>
@@ -456,10 +459,16 @@ async function openSettings(){
     <div class="settings-field"><label>Google OAuth client</label>
       <div class="hint">From Google Cloud Console &rarr; APIs &amp; Services &rarr; Credentials. Needed once, before connecting.</div>
       <input class="field-input" id="googleClientIdInput" placeholder="${gmailStatus.hasCreds?'Client ID set (leave blank to keep it)':'Client ID'}" style="margin-bottom:8px;">
-      <input class="field-input" id="googleClientSecretInput" type="password" placeholder="${gmailStatus.hasCreds?'•••• Client Secret set (leave blank to keep it)':'Client Secret'}">
+      <div style="display:flex;gap:6px;align-items:center;">
+        <input class="field-input" id="googleClientSecretInput" type="password" placeholder="${gmailStatus.hasCreds?'•••• Client Secret set (leave blank to keep it)':'Client Secret'}" style="flex:1;">
+        <button type="button" class="btn btn-ghost btn-sm" id="googleSecretPeek" aria-label="Show password briefly" style="flex-shrink:0;">Show</button>
+      </div>
       <div style="margin-top:8px;"><button class="btn btn-ghost btn-sm" id="saveGoogleCredsBtn">Save Google credentials</button></div></div>
     `:''}
     <div class="modal-actions"><button class="btn" id="saveSettingsBtn">Save</button></div>`;
+  wirePeekToggle(document.getElementById('apiKeyPeek'),document.getElementById('apiKeyInput'));
+  const secretPeek=document.getElementById('googleSecretPeek');
+  if(secretPeek)wirePeekToggle(secretPeek,document.getElementById('googleClientSecretInput'));
   window.api.watchedPath().then(p=>{const el=document.getElementById('watchPathDisplay');if(el)el.textContent=p;});
   document.getElementById('chooseWatchBtn').addEventListener('click',async()=>{const r=await window.api.chooseWatched();document.getElementById('watchPathDisplay').textContent=r.path;loadProspects();});
   document.getElementById('resetWatchBtn').addEventListener('click',async()=>{const r=await window.api.resetWatched();document.getElementById('watchPathDisplay').textContent=r.path;});
@@ -493,19 +502,55 @@ function applyRoleUI(){
   if (sec) sec.hidden = !isAdmin;
 }
 
+// Wires a persistent show/hide toggle button next to a password input: click flips
+// between masked and plain text, and the button's own label/aria-label track state.
+function wirePasswordToggle(toggleBtn,input){
+  toggleBtn.addEventListener('click',()=>{
+    const showing=input.type==='text';
+    input.type=showing?'password':'text';
+    toggleBtn.textContent=showing?'Show':'Hide';
+    toggleBtn.setAttribute('aria-label',showing?'Show password':'Hide password');
+  });
+}
+
+// For secret/API-key fields (Anthropic key, Google Client Secret): a momentary peek
+// rather than a persistent toggle — reveals just long enough to check the format, then
+// auto-hides. Clicking again while already revealed just restarts the timer.
+function wirePeekToggle(btn,input,ms=1500){
+  let timer=null;
+  btn.addEventListener('click',()=>{
+    input.type='text';
+    clearTimeout(timer);
+    timer=setTimeout(()=>{ input.type='password'; },ms);
+  });
+}
+
 // ---- Admin: Users ----
 const usersModal=document.getElementById('usersModal');
 const usersBody=document.getElementById('usersBody');
+let resetPwId=null; // id of the user row currently showing the inline reset-password form, or null
 async function openUsers(){
   usersModal.hidden=false;
   usersBody.innerHTML='<div class="gen-status">Loading…</div>';
   const list=await window.api.listUsers();
+  resetPwId=null;
   renderUsers(list);
 }
 function renderUsers(list){
   const me=window.__currentUser;
   const rows=list.map(u=>{
     const isSelf=u.id===me.id;
+    const actions=resetPwId===u.id
+      ?`<div style="display:flex;gap:6px;align-items:center;">
+          <input class="field-input" id="resetPwInput" type="password" placeholder="New password" style="flex:1;font-size:12.5px;padding:5px 8px;">
+          <button type="button" class="btn btn-ghost btn-sm resetPwToggleBtn" aria-label="Show password" style="flex-shrink:0;">Show</button>
+          <button class="btn btn-sm resetPwSaveBtn" data-id="${u.id}" style="flex-shrink:0;">Save</button>
+          <button class="btn btn-ghost btn-sm resetPwCancelBtn" style="flex-shrink:0;">Cancel</button>
+        </div>`
+      :`${u.active
+          ?`<button class="btn btn-ghost btn-sm deactivateBtn" data-id="${u.id}">Deactivate</button>`
+          :`<button class="btn btn-ghost btn-sm reactivateBtn" data-id="${u.id}">Reactivate</button>`}
+        <button class="btn btn-ghost btn-sm resetPwBtn" data-id="${u.id}">Reset password</button>`;
     return `<tr data-id="${u.id}">
       <td><strong>${esc(u.username)}</strong>${isSelf?' <span class="field-key">(you)</span>':''}</td>
       <td><input class="field-input emailInput" data-id="${u.id}" value="${esc(u.email||'')}" placeholder="(none — can't be CC'd)" style="font-size:12.5px;padding:5px 8px;"></td>
@@ -514,12 +559,7 @@ function renderUsers(list){
         <option value="admin" ${u.role==='admin'?'selected':''}>Admin</option>
       </select></td>
       <td><span class="status-pill ${u.active?'badge-active':'badge-inactive'}">${u.active?'active':'inactive'}</span></td>
-      <td>
-        ${u.active
-          ?`<button class="btn btn-ghost btn-sm deactivateBtn" data-id="${u.id}">Deactivate</button>`
-          :`<button class="btn btn-ghost btn-sm reactivateBtn" data-id="${u.id}">Reactivate</button>`}
-        <button class="btn btn-ghost btn-sm resetPwBtn" data-id="${u.id}">Reset password</button>
-      </td>
+      <td>${actions}</td>
     </tr>`;
   }).join('');
 
@@ -528,7 +568,10 @@ function renderUsers(list){
       <label>Create user</label>
       <div class="hint">Password must be at least 8 characters. Email is optional — set it so this person can be CC'd on outreach.</div>
       <input class="field-input" id="newUserName" placeholder="Username" style="margin-bottom:8px;">
-      <input class="field-input" id="newUserPw" type="password" placeholder="Password" style="margin-bottom:8px;">
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
+        <input class="field-input" id="newUserPw" type="password" placeholder="Password" style="flex:1;margin-bottom:0;">
+        <button type="button" class="btn btn-ghost btn-sm" id="newUserPwToggle" aria-label="Show password" style="flex-shrink:0;">Show</button>
+      </div>
       <input class="field-input" id="newUserEmail" placeholder="Email (optional)" style="margin-bottom:8px;">
       <select class="tb-select" id="newUserRole" style="margin-bottom:8px;">
         <option value="user">User</option>
@@ -543,6 +586,8 @@ function renderUsers(list){
         <tbody>${rows}</tbody>
       </table>
     </div>`;
+
+  wirePasswordToggle(document.getElementById('newUserPwToggle'),document.getElementById('newUserPw'));
 
   document.getElementById('createUserBtn').addEventListener('click',async()=>{
     const username=document.getElementById('newUserName').value.trim();
@@ -579,11 +624,20 @@ function renderUsers(list){
     await window.api.reactivateUser(parseInt(b.dataset.id,10));
     openUsers();
   }));
-  usersBody.querySelectorAll('.resetPwBtn').forEach(b=>b.addEventListener('click',async()=>{
+  usersBody.querySelectorAll('.resetPwBtn').forEach(b=>b.addEventListener('click',()=>{
+    resetPwId=parseInt(b.dataset.id,10);
+    renderUsers(list);
+  }));
+  usersBody.querySelectorAll('.resetPwCancelBtn').forEach(b=>b.addEventListener('click',()=>{
+    resetPwId=null;
+    renderUsers(list);
+  }));
+  const resetToggle=usersBody.querySelector('.resetPwToggleBtn');
+  if(resetToggle) wirePasswordToggle(resetToggle,document.getElementById('resetPwInput'));
+  usersBody.querySelectorAll('.resetPwSaveBtn').forEach(b=>b.addEventListener('click',async()=>{
     const id=parseInt(b.dataset.id,10);
-    const pw=window.prompt('New password (minimum 8 characters):');
-    if(!pw)return;
-    try{ await window.api.resetUserPassword(id,pw); alert('Password reset.'); }
+    const pw=document.getElementById('resetPwInput').value;
+    try{ await window.api.resetUserPassword(id,pw); resetPwId=null; openUsers(); }
     catch(err){ alert(err.message); }
   }));
 }
