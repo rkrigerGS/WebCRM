@@ -12,7 +12,7 @@ const searchEl   = document.getElementById('searchBox');
 const detailPane = document.getElementById('detailPane');
 const bulkBar    = document.getElementById('bulkBar');
 
-const STATUS_LABELS={new:'Not contacted',sent:'Awaiting reply',replied:'Replied',signed:'Signed',dead:'Dead'};
+const STATUS_LABELS={new:'Not contacted',sent:'Awaiting reply',replied:'Replied',signed:'Signed',dead:'Dead',dormant:'Dormant'};
 function statusLabel(s){return STATUS_LABELS[s]||s;}
 function esc(s){return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function shorten(s,n){s=s||'';return s.length>n?s.slice(0,n-1)+'…':s;}
@@ -25,6 +25,7 @@ function daysBetween(a,b){return Math.floor((new Date(b)-new Date(a))/86400000);
 // Is this prospect due for a follow-up? (sent, not replied, and cadence days have passed)
 function isDue(p){
   if(p.status!=='sent') return false;
+  if(p.dormant_returned) return true; // surfaces immediately on the return date, regardless of the gap math below
   if(!p.date_sent) return false;
   const gap = p.followup_days || 4;
   return daysBetween(p.date_sent, todayStr()) >= gap;
@@ -45,6 +46,7 @@ function hasContact(p){
 
 function matchesView(p){
   switch(currentView){
+    case 'replies':  return p.awaiting_reply_review===true;
     case 'new':      return p.status==='new';
     case 'due':      return isDue(p);
     case 'awaiting': return p.status==='sent';
@@ -101,6 +103,7 @@ function renderList(){
     if(isOverdue(p)) flags.push('<span class="flag flag-overdue">Overdue</span>');
     if(!hasContact(p)) flags.push('<span class="flag flag-nocontact">No contact</span>');
     if(p.fit_score!=null && p.fit_score<=3 && p.status==='new') flags.push('<span class="flag flag-hot">Hot</span>');
+    if(p.dormant_returned) flags.push('<span class="flag flag-dormant-return">Returned from dormant</span>');
 
     let fu='';
     if(p.status==='sent' && p.date_sent){
@@ -122,7 +125,12 @@ function renderList(){
   }).join('');
 
   rowsEl.querySelectorAll('tr').forEach(tr=>{
-    tr.addEventListener('click',(e)=>{ if(e.target.classList.contains('rowcheck'))return; openDetail(parseInt(tr.dataset.id,10)); });
+    tr.addEventListener('click',(e)=>{
+      if(e.target.classList.contains('rowcheck'))return;
+      const id=parseInt(tr.dataset.id,10);
+      const p=allProspects.find(x=>x.id===id);
+      if(p&&p.awaiting_reply_review)openReplyReview(id); else openDetail(id);
+    });
   });
   rowsEl.querySelectorAll('.rowcheck').forEach(cb=>{
     cb.addEventListener('change',()=>{ const id=parseInt(cb.dataset.id,10); if(cb.checked)selectedIds.add(id);else selectedIds.delete(id); updateBulkBar(); });
@@ -135,10 +143,11 @@ function updateBulkBar(){
 }
 
 async function refreshCountsAndFilters(){
-  const counts={all:0,new:0,due:0,awaiting:0,replied:0,signed:0};
+  const counts={all:0,new:0,due:0,awaiting:0,replied:0,signed:0,replies:0};
   const states=new Set(), agencies=new Set(), designations=new Set();
   for(const p of allProspects){
     counts.all++;
+    if(p.awaiting_reply_review)counts.replies++;
     if(p.status==='new')counts.new++;
     if(isDue(p))counts.due++;
     if(p.status==='sent')counts.awaiting++;
@@ -393,6 +402,136 @@ function openDeadPileReview(list){
   renderRows();
 }
 
+// ---- Replies ----
+const replyModal=document.getElementById('replyModal');
+const replyModalBody=document.getElementById('replyModalBody');
+const replyModalTitle=document.getElementById('replyModalTitle');
+document.getElementById('replyModalClose').addEventListener('click',()=>replyModal.hidden=true);
+
+function parseEmailAddress(raw){ const m=(raw||'').match(/<([^>]+)>/); return m?m[1]:(raw||'').trim(); }
+
+async function openReplyReview(id){
+  replyModal.hidden=false;
+  replyModalBody.innerHTML='<div class="gen-status">Loading…</div>';
+  const p=await window.api.getProspect(id);
+  if(!p){replyModal.hidden=true;return;}
+  const d=p.dossier||{};
+  const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
+  const [ctx,templates]=await Promise.all([
+    window.api.getReplyContext(id).catch(e=>({replyText:'',error:e.message})),
+    window.api.getReplyTemplates(id).catch(()=>[])
+  ]);
+  replyModalTitle.textContent=`${d.company_name||p.company_name} — Reply`;
+  const activity=p.activity?JSON.parse(p.activity):[];
+  const defaultTo=parseEmailAddress(p.last_reply_from);
+  const defaultSubject=`Re: ${d.company_name||p.company_name}`;
+
+  const historyHtml=activity.length
+    ?activity.map(a=>`<div class="field"><span class="field-key">${esc(a.date)}${a.kind?` · ${esc(a.kind)}`:''}:</span> <span class="field-val">${esc(a.text)}</span></div>`).join('')
+    :'<div class="field-key">No prior activity logged.</div>';
+
+  const templatesHtml=templates.length
+    ?templates.map(t=>`<div class="opt" data-tid="${t.id}"><div class="opt-detail">${esc(t.text)}</div></div>`).join('')
+    :'<div class="q-hint">No saved reply phrases yet — send and save a few replies to build this up.</div>';
+
+  replyModalBody.innerHTML=`
+    <div class="section">
+      <div class="section-label">Prospect history</div>
+      <div class="field"><span class="score-chit ${scoreClass(p.fit_score)}">${p.fit_score??'—'}</span> <span class="field-val"><strong>${esc(d.company_name||p.company_name)}</strong></span> <span class="field-key">${esc(p.city_state||'')}</span></div>
+      ${historyHtml}
+    </div>
+    <div class="section">
+      <div class="section-label">Their reply${p.last_reply_at?` — ${esc(new Date(p.last_reply_at).toLocaleString())}`:''}</div>
+      <div class="field-key">${esc(p.last_reply_from||'Unknown sender')}</div>
+      <div class="prose" style="white-space:pre-wrap;margin-top:6px;">${ctx.error?`<span style="color:var(--red)">Could not load the full reply: ${esc(ctx.error)}</span>`:esc(ctx.replyText||p.last_reply_snippet||'(no content)')}</div>
+    </div>
+    <div class="section">
+      <div class="section-label">Quick-select reply phrases</div>
+      <div class="q-hint">From past approved replies, with [name]/[company] filled in where known. Click to add to the draft below.</div>
+      ${templatesHtml}
+    </div>
+    <div class="section">
+      <div class="section-label">Draft response</div>
+      <textarea class="draft-area" id="replyDraftArea" style="min-height:160px;" placeholder="Click phrases above, or type an instruction below and let Claude draft it."></textarea>
+      <div class="settings-field" style="margin-top:10px;"><label>Instruction for Claude (optional)</label>
+        <input class="field-input" id="replyInstruction" maxlength="280" placeholder="e.g. reply saying we'd like to schedule a call next week">
+        <div class="modal-actions"><button class="btn btn-sm" id="replyGenBtn">Draft with Claude</button><span class="usage-note" id="replyInstructionCount">0/280</span></div>
+      </div>
+      <div class="settings-field"><label>To</label><input class="field-input" id="replyTo" value="${esc(defaultTo)}"></div>
+      <div class="settings-field"><label>Subject</label><input class="field-input" id="replySubject" value="${esc(defaultSubject)}"></div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:10px;"><input type="checkbox" id="replySaveToLibrary" checked> Save this reply to the reply learning library</label>
+      <div id="replySendErr" class="error-note" hidden></div>
+      <div class="modal-actions"><button class="btn" id="replySendBtn">Send response</button></div>
+    </div>
+    <div class="section">
+      <div class="section-label">Or, move this prospect</div>
+      <div class="detail-actions">
+        <button class="btn btn-ghost btn-sm" id="replyMarkRepliedBtn">Mark replied / interested</button>
+        ${isAdmin?`<button class="btn btn-ghost btn-sm" id="replyMarkDormantBtn">Mark dormant</button>`:''}
+        <button class="btn btn-ghost btn-sm" id="replyMarkDeadBtn">Mark dead</button>
+      </div>
+    </div>`;
+
+  replyModalBody.querySelectorAll('.opt[data-tid]').forEach(el=>el.addEventListener('click',()=>{
+    const ta=document.getElementById('replyDraftArea');
+    ta.value=(ta.value?ta.value.trim()+' ':'')+el.querySelector('.opt-detail').textContent;
+  }));
+  const instrEl=document.getElementById('replyInstruction');
+  instrEl.addEventListener('input',()=>{document.getElementById('replyInstructionCount').textContent=`${instrEl.value.length}/280`;});
+  document.getElementById('replyGenBtn').addEventListener('click',async()=>{
+    const btn2=document.getElementById('replyGenBtn');
+    const orig=btn2.textContent; btn2.disabled=true; btn2.textContent='Drafting…';
+    try{
+      const res=await window.api.generateReply(id,{instruction:instrEl.value.trim(),seedDraft:document.getElementById('replyDraftArea').value.trim(),replyText:ctx.replyText||p.last_reply_snippet||''});
+      if(res.ok)document.getElementById('replyDraftArea').value=res.draft;
+      else alert('Could not draft: '+res.error);
+    }catch(e){alert(e.message);}
+    btn2.disabled=false; btn2.textContent=orig;
+  });
+  document.getElementById('replySendBtn').addEventListener('click',async()=>{
+    const finalText=document.getElementById('replyDraftArea').value;
+    const to=document.getElementById('replyTo').value.trim();
+    const subject=document.getElementById('replySubject').value.trim();
+    const saveToLibrary=document.getElementById('replySaveToLibrary').checked;
+    const errEl=document.getElementById('replySendErr'); errEl.hidden=true;
+    if(!to||!subject||!finalText.trim()){errEl.textContent='A recipient, subject, and draft are required.';errEl.hidden=false;return;}
+    const sendBtn=document.getElementById('replySendBtn'); const origLabel=sendBtn.textContent;
+    sendBtn.disabled=true; sendBtn.textContent='Sending…';
+    try{
+      await window.api.sendReply(id,{finalText,to,subject,saveToLibrary});
+      replyModal.hidden=true; loadProspects();
+      toast(`Reply sent to ${d.company_name||p.company_name}`);
+    }catch(e){
+      errEl.textContent=e.message; errEl.hidden=false;
+      sendBtn.disabled=false; sendBtn.textContent=origLabel;
+    }
+  });
+  document.getElementById('replyMarkRepliedBtn').addEventListener('click',async()=>{
+    const prevStatus=p.status;
+    await window.api.updateProspect(id,{status:'replied'});
+    replyModal.hidden=true; loadProspects();
+    toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('replied')}`,async()=>{await window.api.updateProspect(id,{status:prevStatus});loadProspects();});
+  });
+  const dormantBtn=document.getElementById('replyMarkDormantBtn');
+  if(dormantBtn)dormantBtn.addEventListener('click',async()=>{
+    const returnDate=window.prompt('Return date (YYYY-MM-DD):');
+    if(!returnDate)return;
+    try{
+      await window.api.setDormant(id,returnDate);
+      replyModal.hidden=true; loadProspects();
+      toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('dormant')}`,async()=>{await window.api.updateProspect(id,{status:p.status});loadProspects();});
+    }catch(e){alert(e.message);}
+  });
+  document.getElementById('replyMarkDeadBtn').addEventListener('click',async()=>{
+    const reason=window.prompt('Why is this prospect dead? (optional — helps the backup review later)');
+    if(reason&&reason.trim())await window.api.addNote(id,reason.trim());
+    const prevStatus=p.status;
+    await window.api.updateProspect(id,{status:'dead'});
+    replyModal.hidden=true; loadProspects();
+    toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('dead')}`,async()=>{await window.api.updateProspect(id,{status:prevStatus});loadProspects();});
+  });
+}
+
 // ---- Email generation flow ----
 let flowState=null;
 async function openEmailFlow(prospectId,dossier,isFollowup){
@@ -466,6 +605,7 @@ async function renderDraft(draft,usage){
     <div class="settings-field"><label>To</label><input class="field-input" id="sendTo" value="${esc(defaultTo)}" placeholder="recipient@example.com"></div>
     <div class="settings-field"><label>Subject</label><input class="field-input" id="sendSubject" value="${esc(defaultSubject)}"></div>
     <div class="settings-field"><label>CC (optional)</label>${ccOptions}</div>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;"><input type="checkbox" id="saveToLibraryCheck" checked> Save this email to the learning library</label>
     ${gmailStatus.connected?'':'<div class="error-note">Gmail is not connected. Ask an admin to connect it in Settings before sending.</div>'}
     <div id="sendErr" class="error-note" hidden></div>
     <div class="modal-actions"><button class="btn" id="saveFinalBtn" ${gmailStatus.connected?'':'disabled'}>${flowState.isFollowup?'Send follow-up':'Send email'}</button><span class="usage-note">Sends via Gmail, marks sent, and adds to the learning library.</span></div>`;
@@ -483,7 +623,8 @@ async function renderDraft(draft,usage){
     const originalLabel=btn.textContent;
     btn.disabled=true; btn.textContent='Sending…';
     try{
-      await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc});
+      const saveToLibrary=document.getElementById('saveToLibraryCheck').checked;
+      await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc,saveToLibrary});
       emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId);
     }catch(e){
       errEl.textContent=e.message; errEl.hidden=false;
@@ -637,18 +778,23 @@ function renderUsers(list){
           <button class="btn btn-sm resetPwSaveBtn" data-id="${u.id}" style="flex-shrink:0;">Save</button>
           <button class="btn btn-ghost btn-sm resetPwCancelBtn" style="flex-shrink:0;">Cancel</button>
         </div>`
-      :`${u.active
-          ?`<button class="btn btn-ghost btn-sm deactivateBtn" data-id="${u.id}">Deactivate</button>`
-          :`<button class="btn btn-ghost btn-sm reactivateBtn" data-id="${u.id}">Reactivate</button>`}
-        <button class="btn btn-ghost btn-sm resetPwBtn" data-id="${u.id}">Reset password</button>`;
+      :`${u.pending
+          ?`<button class="btn btn-sm resendInviteBtn" data-id="${u.id}">Resend invite</button>`
+          :`${u.active
+              ?`<button class="btn btn-ghost btn-sm deactivateBtn" data-id="${u.id}">Deactivate</button>`
+              :`<button class="btn btn-ghost btn-sm reactivateBtn" data-id="${u.id}">Reactivate</button>`}
+            <button class="btn btn-ghost btn-sm resetPwBtn" data-id="${u.id}">Reset password</button>`}`;
+    const pendingBadge=u.pending
+      ?`<span class="status-pill badge-inactive" title="${u.inviteExpiresAt?'Expires '+esc(new Date(u.inviteExpiresAt).toLocaleString()):''}">invite pending</span>`
+      :`<span class="status-pill ${u.active?'badge-active':'badge-inactive'}">${u.active?'active':'inactive'}</span>`;
     return `<tr data-id="${u.id}">
       <td><strong>${esc(u.username)}</strong>${isSelf?' <span class="field-key">(you)</span>':''}</td>
-      <td><input class="field-input emailInput" data-id="${u.id}" value="${esc(u.email||'')}" placeholder="(none — can't be CC'd)" style="font-size:12.5px;padding:5px 8px;"></td>
+      <td><input class="field-input emailInput" data-id="${u.id}" value="${esc(u.email||'')}" placeholder="required" style="font-size:12.5px;padding:5px 8px;"></td>
       <td><select class="tb-select roleSelect" data-id="${u.id}">
         <option value="user" ${u.role==='user'?'selected':''}>User</option>
         <option value="admin" ${u.role==='admin'?'selected':''}>Admin</option>
       </select></td>
-      <td><span class="status-pill ${u.active?'badge-active':'badge-inactive'}">${u.active?'active':'inactive'}</span></td>
+      <td>${pendingBadge}</td>
       <td>${actions}</td>
     </tr>`;
   }).join('');
@@ -656,18 +802,14 @@ function renderUsers(list){
   usersBody.innerHTML=`
     <div class="settings-field">
       <label>Create user</label>
-      <div class="hint">Password must be at least 8 characters. Email is optional — set it so this person can be CC'd on outreach.</div>
+      <div class="hint">An invitation email is sent automatically with a one-time link (expires in 48 hours) for this person to set their own password. Email is required.</div>
       <input class="field-input" id="newUserName" placeholder="Username" style="margin-bottom:8px;">
-      <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;">
-        <input class="field-input" id="newUserPw" type="password" placeholder="Password" style="flex:1;margin-bottom:0;">
-        <button type="button" class="btn btn-ghost btn-sm" id="newUserPwToggle" aria-label="Show password" style="flex-shrink:0;">Show</button>
-      </div>
-      <input class="field-input" id="newUserEmail" placeholder="Email (optional)" style="margin-bottom:8px;">
+      <input class="field-input" id="newUserEmail" placeholder="Email (required)" style="margin-bottom:8px;">
       <select class="tb-select" id="newUserRole" style="margin-bottom:8px;">
         <option value="user">User</option>
         <option value="admin">Admin</option>
       </select>
-      <div><button class="btn btn-sm" id="createUserBtn">Create</button></div>
+      <div><button class="btn btn-sm" id="createUserBtn">Create and send invite</button></div>
       <div id="createUserErr" class="error-note" hidden style="margin-top:8px;"></div>
     </div>
     <div class="table-wrap" style="max-height:340px;">
@@ -677,20 +819,27 @@ function renderUsers(list){
       </table>
     </div>`;
 
-  wirePasswordToggle(document.getElementById('newUserPwToggle'),document.getElementById('newUserPw'));
-
   document.getElementById('createUserBtn').addEventListener('click',async()=>{
     const username=document.getElementById('newUserName').value.trim();
-    const password=document.getElementById('newUserPw').value;
     const role=document.getElementById('newUserRole').value;
     const email=document.getElementById('newUserEmail').value.trim();
     const errEl=document.getElementById('createUserErr');
     errEl.hidden=true;
+    if(!email){ errEl.textContent='Email is required.'; errEl.hidden=false; return; }
     try{
-      await window.api.createUser({username,password,role,email});
+      const u=await window.api.createUser({username,role,email});
+      if(!u.inviteEmailSent) toast(u.inviteEmailError||'Invite email could not be sent.');
       openUsers();
     }catch(e){ errEl.textContent=e.message; errEl.hidden=false; }
   });
+  usersBody.querySelectorAll('.resendInviteBtn').forEach(b=>b.addEventListener('click',async()=>{
+    const id=parseInt(b.dataset.id,10);
+    try{
+      const u=await window.api.resendInvite(id);
+      toast(u.inviteEmailSent?'Invite resent.':(u.inviteEmailError||'Invite email could not be sent.'));
+    }catch(e){ alert(e.message); }
+    openUsers();
+  }));
 
   usersBody.querySelectorAll('.emailInput').forEach(inp=>inp.addEventListener('change',async(e)=>{
     const id=parseInt(e.target.dataset.id,10);
@@ -876,6 +1025,7 @@ document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',a
 
 // live ingest
 window.api.onIngested((r)=>{ if(r.outcome==='ingested'){loadProspects();toast('New prospect added from research');} else if(r.outcome==='duplicate'){toast('Skipped a duplicate');} });
+window.api.onReply((r)=>{ loadProspects(); if(r.company_name)toast(`New reply from ${r.company_name}`); });
 function toast(msg){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:100;opacity:0;transition:opacity .2s;';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},2200);}
 
 // A bottom-right toast with an Undo button, for status/view changes: shows what happened

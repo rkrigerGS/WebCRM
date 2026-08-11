@@ -70,6 +70,11 @@ window.api = {
     const es = new EventSource('/api/events');
     es.addEventListener('ingested', (e) => { try { cb(JSON.parse(e.data)); } catch {} });
   },
+  onReply: (cb) => {
+    const es = new EventSource('/api/events');
+    es.addEventListener('reply', (e) => { try { cb(JSON.parse(e.data)); } catch {} });
+    es.addEventListener('dormant-return', (e) => { try { cb(JSON.parse(e.data)); } catch {} });
+  },
 
   authStatus: ()                     => getJSON('/api/auth/status'),
   authLogout: ()                     => sendJSON('/api/auth/logout', 'POST'),
@@ -93,5 +98,12 @@ window.api = {
   saveGoogleCreds:     (clientId, clientSecret) => sendJSON('/api/config/google', 'POST', { clientId, clientSecret }),
 
   getDeadPile:         ()                  => getJSON('/api/admin/backup/dead-pile'),
-  saveBackupSchedule:  (backupFrequency)   => sendJSON('/api/config/backup-schedule', 'POST', { backupFrequency })
+  saveBackupSchedule:  (backupFrequency)   => sendJSON('/api/config/backup-schedule', 'POST', { backupFrequency }),
+
+  getReplyContext:     (id)                => getJSON('/api/prospects/' + id + '/reply-context'),
+  getReplyTemplates:   (prospectId)        => getJSON('/api/reply-templates' + toQuery({ prospectId })),
+  generateReply:       (id, body)          => sendJSON('/api/prospects/' + id + '/reply/generate', 'POST', body),
+  sendReply:           (id, body)          => sendJSON('/api/prospects/' + id + '/reply/send', 'POST', body),
+  setDormant:          (id, returnDate)    => sendJSON('/api/prospects/' + id + '/dormant', 'POST', { returnDate }),
+  resendInvite:        (id)                => sendJSON('/api/admin/users/' + id + '/resend-invite', 'POST')
 };

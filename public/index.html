@@ -21,6 +21,19 @@
     </div>
   </div>
 
+  <div class="login-gate" id="inviteGate" hidden>
+    <div class="login-card">
+      <img src="assets/logo.svg" alt="GovSpring Legal" class="login-logo" />
+      <div class="login-tag">Prospecting</div>
+      <div id="inviteMsg" class="login-msg"></div>
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;" id="inviteFormRow">
+        <input type="password" id="invitePw" class="login-input" placeholder="Choose a password" autocomplete="new-password" style="margin-bottom:0;flex:1;" />
+        <button type="button" class="btn btn-ghost btn-sm" id="invitePwToggle" aria-label="Show password" style="width:auto;padding:5px 10px;flex-shrink:0;">Show</button>
+      </div>
+      <button class="btn" id="inviteBtn">Set password and log in</button>
+    </div>
+  </div>
+
   <div class="app" id="appRoot" hidden>
     <nav class="sidebar">
       <div class="sidebar-brand">
@@ -31,6 +44,7 @@
       <div class="sidebar-section">
         <div class="sidebar-heading">Views</div>
         <button class="view-item active" data-view="all"><span class="view-label">All prospects</span><span class="view-count" id="count-all">0</span></button>
+        <button class="view-item" data-view="replies"><span class="view-label">Replies</span><span class="view-count" id="count-replies">0</span></button>
         <button class="view-item" data-view="new"><span class="view-label">Not contacted</span><span class="view-count" id="count-new">0</span></button>
         <button class="view-item" data-view="due"><span class="view-label">Due for follow-up</span><span class="view-count" id="count-due">0</span></button>
         <button class="view-item" data-view="awaiting"><span class="view-label">Awaiting reply</span><span class="view-count" id="count-awaiting">0</span></button>
@@ -172,6 +186,12 @@
     <div class="modal modal-wide">
       <div class="modal-head"><h3>Audit log</h3><button class="btn btn-ghost btn-sm" id="auditClose">Close</button></div>
       <div class="modal-body" id="auditBody"></div>
+    </div>
+  </div>
+  <div class="modal-backdrop" id="replyModal" hidden>
+    <div class="modal modal-wide">
+      <div class="modal-head"><h3 id="replyModalTitle">Reply</h3><button class="btn btn-ghost btn-sm" id="replyModalClose">Close</button></div>
+      <div class="modal-body" id="replyModalBody"></div>
     </div>
   </div>
 

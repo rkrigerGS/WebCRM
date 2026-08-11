@@ -261,11 +261,16 @@ async function sendEmail({ to, cc, subject, bodyText, threadId, inReplyTo, refer
   return result;
 }
 
-// Builds a multipart/mixed MIME message with one attachment. Separate from
-// buildRawMessage() above (outreach mail): a backup email is a plain notification to a
-// fixed address, not threaded or labeled, so it doesn't share that function's shape.
-function buildAttachmentMessage({ from, to, subject, bodyText, attachment }) {
-  const boundary = 'gs_backup_' + Date.now().toString(36);
+// Builds a standalone MIME message — plain text/plain, or multipart/mixed with one
+// attachment if given. Separate from buildRawMessage() above (outreach mail): these are
+// plain notifications to a fixed address, never threaded or labeled, so they don't share
+// that function's shape.
+function buildStandaloneMessage({ from, to, subject, bodyText, attachment }) {
+  if (!attachment) {
+    const headers = [`From: ${from}`, `To: ${to}`, `Subject: ${subject}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset="UTF-8"'];
+    return Buffer.from(headers.join('\r\n') + '\r\n\r\n' + bodyText, 'utf8').toString('base64url');
+  }
+  const boundary = 'gs_mail_' + Date.now().toString(36);
   const headers = [
     `From: ${from}`,
     `To: ${to}`,
@@ -293,14 +298,13 @@ function buildAttachmentMessage({ from, to, subject, bodyText, attachment }) {
   return Buffer.from(raw, 'utf8').toString('base64url');
 }
 
-// params: { to, subject, bodyText, attachment: { filename, contentType, data: Buffer } }.
-// No threading, no CC, no label — used only for the scheduled backup email (see
-// server/backup.js and server.js's scheduler), which is a standalone notification, not
-// outreach.
-async function sendAttachmentEmail({ to, subject, bodyText, attachment }) {
+// params: { to, subject, bodyText, attachment?: { filename, contentType, data: Buffer } }.
+// No threading, no CC, no label — used for the scheduled backup email (with an
+// attachment) and the user-invitation email (without one). Neither is outreach.
+async function sendStandaloneEmail({ to, subject, bodyText, attachment }) {
   const accessToken = await ensureAccessToken();
   const from = (token.email || 'marcos@govspringlegal.com');
-  const raw = buildAttachmentMessage({ from, to, subject, bodyText, attachment });
+  const raw = buildStandaloneMessage({ from, to, subject, bodyText, attachment });
   return requestJSON({
     hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST',
     headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
@@ -308,4 +312,70 @@ async function sendAttachmentEmail({ to, subject, bodyText, attachment }) {
   });
 }
 
-module.exports = { init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail, sendAttachmentEmail };
+function sendAttachmentEmail({ to, subject, bodyText, attachment }) {
+  return sendStandaloneEmail({ to, subject, bodyText, attachment });
+}
+
+function sendInviteEmail({ to, subject, bodyText }) {
+  return sendStandaloneEmail({ to, subject, bodyText });
+}
+
+// ---- Reply watching: reading thread/message content ----
+// Covered by the existing gmail.modify scope (a superset of read access), so no new
+// consent grant is needed from a previously connected account.
+
+// Walks a message's MIME payload tree for a text/plain part (preferring it over
+// text/html — if only HTML is present, a crude tag-strip is used as a last resort; the
+// caller must still escape this before rendering, since it is untrusted sender content).
+function extractPlainText(payload) {
+  if (!payload) return '';
+  if (payload.mimeType === 'text/plain' && payload.body && payload.body.data) {
+    return Buffer.from(payload.body.data, 'base64url').toString('utf8');
+  }
+  if (payload.parts) {
+    const direct = payload.parts.find(p => p.mimeType === 'text/plain' && p.body && p.body.data);
+    if (direct) return Buffer.from(direct.body.data, 'base64url').toString('utf8');
+    for (const part of payload.parts) {
+      const found = extractPlainText(part);
+      if (found) return found;
+    }
+  }
+  if (payload.mimeType === 'text/html' && payload.body && payload.body.data) {
+    const html = Buffer.from(payload.body.data, 'base64url').toString('utf8');
+    return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  return '';
+}
+
+// Cheap, metadata-only look at a thread's messages (no body fetch) — used by the reply
+// poll in server.js to detect new inbound messages without the cost of a full fetch per
+// message on every poll cycle.
+async function getThreadReplies(threadId) {
+  const accessToken = await ensureAccessToken();
+  const thread = await requestJSON({
+    hostname: 'gmail.googleapis.com',
+    path: `/gmail/v1/users/me/threads/${threadId}?format=metadata&metadataHeaders=From&metadataHeaders=Date`,
+    method: 'GET', headers: { authorization: `Bearer ${accessToken}` }
+  });
+  return (thread.messages || []).map(m => {
+    const headers = (m.payload && m.payload.headers) || [];
+    const from = (headers.find(h => h.name === 'From') || {}).value || '';
+    return { id: m.id, from, snippet: m.snippet || '', internalDate: m.internalDate };
+  });
+}
+
+// Full body fetch — only called on demand when the reply review screen opens, not during
+// polling, so polling stays cheap.
+async function getMessageBody(messageId) {
+  const accessToken = await ensureAccessToken();
+  const full = await requestJSON({
+    hostname: 'gmail.googleapis.com', path: `/gmail/v1/users/me/messages/${messageId}?format=full`,
+    method: 'GET', headers: { authorization: `Bearer ${accessToken}` }
+  });
+  return extractPlainText(full.payload);
+}
+
+module.exports = {
+  init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail,
+  sendAttachmentEmail, sendInviteEmail, getThreadReplies, getMessageBody
+};

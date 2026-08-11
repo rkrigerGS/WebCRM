@@ -29,9 +29,36 @@ function init(userDataDir, appDir) {
   const approvedDir = path.join(userDataDir, 'approved-emails');
   fs.mkdirSync(approvedDir, { recursive: true });
 
-  dirs = { userCatalogs, approvedDir };
+  // The reply library is completely separate from the outreach library — reply exemplars
+  // never mix with cold-outreach exemplars, and Claude draws from each independently (see
+  // emailEngine.js's generateDraft vs generateReplyDraft).
+  const replyDir = path.join(userDataDir, 'reply-emails');
+  fs.mkdirSync(replyDir, { recursive: true });
+
+  templatesPath = path.join(userDataDir, 'reply-templates.json');
+  loadTemplates();
+
+  dirs = { userCatalogs, approvedDir, replyDir };
   return dirs;
 }
+
+let templatesPath;
+let templateStore = { templates: [], nextId: 1 };
+function loadTemplates() {
+  try {
+    templateStore = JSON.parse(fs.readFileSync(templatesPath, 'utf8'));
+    templateStore.templates = templateStore.templates || [];
+    templateStore.nextId = templateStore.nextId || (templateStore.templates.reduce((m, t) => Math.max(m, t.id), 0) + 1);
+  } catch {
+    saveTemplates();
+  }
+}
+function saveTemplates() {
+  const tmp = templatesPath + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(templateStore, null, 2), 'utf8');
+  fs.renameSync(tmp, templatesPath);
+}
+const MAX_TEMPLATES = 300;
 
 function readFirmFacts() {
   return safeRead(path.join(dirs.userCatalogs, 'firm-and-people.md'));
@@ -67,11 +94,56 @@ function saveApprovedEmail(record) {
   return fname;
 }
 
+// The reply library: same shape and save mechanics as the approved-email library above,
+// in its own directory so replies never mix into the outreach exemplar pool.
+function listReplyEmails() {
+  const files = fs.readdirSync(dirs.replyDir).filter(f => f.endsWith('.json'));
+  return files.map(f => {
+    try { return JSON.parse(fs.readFileSync(path.join(dirs.replyDir, f), 'utf8')); }
+    catch { return null; }
+  }).filter(Boolean);
+}
+
+// record: { company_name, recipient, recipient_name, final_text, saved_at }. Also extracts
+// reusable sentence-level templates (see extractTemplates below) for the quick-select
+// panel — done once here, at save time, rather than re-derived from the whole library on
+// every panel open, so the panel stays fast.
+function saveReplyEmail(record) {
+  const safeName = (record.company_name || 'unknown').replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
+  const fname = `${Date.now()}_${safeName}.json`;
+  fs.writeFileSync(path.join(dirs.replyDir, fname), JSON.stringify(record, null, 2), 'utf8');
+  addTemplatesFromText(record.final_text || '', record.company_name || '', record.recipient_name || '');
+  return fname;
+}
+
+// Splits approved reply text into standalone sentences, replaces any occurrence of this
+// prospect's company name or the recipient's known first name with [company]/[name], and
+// stores each generalized sentence (deduped by exact text) for the quick-select panel.
+// A placeholder that can't be matched is simply not substituted — left as plain historical
+// text rather than guessed, which the panel then can't misfill.
+function addTemplatesFromText(text, companyName, recipientName) {
+  const sentences = text.split(/(?<=[.?!])\s+/).map(s => s.trim()).filter(s => s.length >= 20 && s.length <= 220);
+  for (const s of sentences) {
+    let t = s;
+    if (companyName) t = t.split(companyName).join('[company]');
+    if (recipientName) t = t.split(recipientName).join('[name]');
+    if (templateStore.templates.some(x => x.text === t)) continue;
+    templateStore.templates.push({ id: templateStore.nextId++, text: t, savedAt: new Date().toISOString() });
+  }
+  if (templateStore.templates.length > MAX_TEMPLATES) templateStore.templates = templateStore.templates.slice(-MAX_TEMPLATES);
+  saveTemplates();
+}
+
+function listReplyTemplates() {
+  return templateStore.templates.slice().reverse(); // most recently learned first
+}
+
 function safeRead(p) {
   try { return fs.readFileSync(p, 'utf8'); } catch { return ''; }
 }
 
 module.exports = {
   init, readFirmFacts, readServices, writeFirmFacts, writeServices,
-  listApprovedEmails, saveApprovedEmail, dirs: () => dirs
+  listApprovedEmails, saveApprovedEmail, listReplyEmails, saveReplyEmail, listReplyTemplates,
+  dirs: () => dirs
 };

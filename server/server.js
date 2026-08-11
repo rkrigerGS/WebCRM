@@ -82,6 +82,31 @@ app.post('/api/auth/setup', (q, res) => {
   res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
 });
 
+// Lets the pre-auth invite-acceptance page (see auth-client.js) show a clear error before
+// the user even types a password, rather than only on submit.
+app.get('/api/auth/invite-status', (q, res) => {
+  const u = users.findByInviteToken(q.query.token || '');
+  if (!u) return res.json({ valid: false, reason: 'Invalid or already-used invitation link.' });
+  if (new Date(u.inviteExpiresAt).getTime() < Date.now()) return res.json({ valid: false, reason: 'This invitation link has expired. Ask an admin to resend it.' });
+  res.json({ valid: true, username: u.username });
+});
+
+// Pre-session, like /api/auth/setup — sets the password via a one-time invite link and
+// logs the user in immediately after. Audits itself inline (see the AUDIT CONVENTION
+// exception list below) since there is no session yet to attribute it through mutating().
+app.post('/api/auth/accept-invite', (q, res) => {
+  try {
+    const { token, password } = q.body || {};
+    const u = users.acceptInvite(token, password);
+    audit.log({ userId: u.id, username: u.username, action: 'user.invite.accept', detail: 'Password set via invitation link' });
+    const sessToken = auth.issueToken(u.id);
+    res.set('Set-Cookie', `gs_session=${sessToken}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
+    res.json({ ok: true, user: { id: u.id, username: u.username, role: u.role } });
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e.message });
+  }
+});
+
 // ---- Login rate limiting ----
 // In-memory only (no persistence needed, no new dependency): 5 failed attempts from one
 // IP within a 15-minute window locks that IP out for the remainder of that window. A
@@ -171,6 +196,8 @@ function requireAdmin(req, res, next) {
 //   - GET /api/admin/gmail/callback — the OAuth redirect target. It's a GET that responds
 //     with a redirect, not JSON, so it doesn't fit mutating()'s res.json() contract; it
 //     audits the connection manually.
+//   - POST /api/auth/accept-invite — pre-session, like /api/auth/setup; sets a password via
+//     a one-time invite link and audits itself inline.
 // ─────────────────────────────────────────────────────────────────────────────────────
 function mutating(action, handler) {
   const fn = async (req, res) => {
@@ -380,6 +407,7 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
   const to = ((meta && meta.to) || '').trim();
   const subject = ((meta && meta.subject) || '').trim();
   const cc = Array.isArray(meta && meta.cc) ? meta.cc.filter(e => typeof e === 'string' && e.trim()).map(e => e.trim()) : [];
+  const saveToLibrary = !(meta && meta.saveToLibrary === false);
 
   const excludedBy = db.checkExclusion(id);
   if (excludedBy) {
@@ -425,17 +453,186 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
   if (isFollowup) patch.followup_count = (p.followup_count || 0) + 1;
   if (sendResult.gmailMessageId) patch.gmail_message_ids = JSON.stringify([...priorIds, sendResult.gmailMessageId]);
   db.updateProspect(id, patch);
-  catalogs.saveApprovedEmail({
-    company_name: p.company_name, recipient: to,
-    services: (meta && meta.services) || [], first_draft: p.first_draft || '',
-    final_text: finalText, is_followup: isFollowup, saved_at: new Date().toISOString()
-  });
+  db.addNote(id, `Sent ${isFollowup ? 'follow-up' : 'outreach'} email to ${to}: "${subject}"`, isFollowup ? 'followup' : 'outreach');
+  if (saveToLibrary) {
+    catalogs.saveApprovedEmail({
+      company_name: p.company_name, recipient: to,
+      services: (meta && meta.services) || [], first_draft: p.first_draft || '',
+      final_text: finalText, is_followup: isFollowup, saved_at: new Date().toISOString()
+    });
+  }
   res.locals.audit = {
     prospectId: id,
-    detail: `Sent via Gmail to ${to}${cc.length ? ` (cc: ${cc.join(', ')})` : ''}${isFollowup ? (hasThread ? ' — follow-up, threaded' : ' — follow-up, new thread (no prior Gmail thread on file)') : ''}`
+    detail: `Sent via Gmail to ${to}${cc.length ? ` (cc: ${cc.join(', ')})` : ''}${isFollowup ? (hasThread ? ' — follow-up, threaded' : ' — follow-up, new thread (no prior Gmail thread on file)') : ''}${saveToLibrary ? '' : ' — not saved to library'}`
   };
   return { ok: true };
 }));
+
+// ---- Reply lifecycle ----
+// Builds a compact, readable history string for the reply-draft prompt (see
+// emailEngine.buildReplyPrompt) from the same activity log the reply-review screen
+// renders, so Claude and the reviewer are looking at the same timeline.
+function buildHistoryText(p) {
+  let activity = [];
+  try { activity = JSON.parse(p.activity || '[]'); } catch {}
+  if (!activity.length) return '(no activity logged yet)';
+  return activity.map(a => `- ${a.date}${a.kind ? ` [${a.kind}]` : ''}: ${a.text}`).join('\n');
+}
+function firstName(full) { return (full || '').trim().split(/\s+/)[0] || ''; }
+
+// Sentence-level templates for the reply screen's quick-select panel, with [company]/
+// [name] placeholders filled from the given prospect's dossier. A placeholder that can't
+// be matched (no known contact name) is left as literal text rather than guessed.
+app.get('/api/reply-templates', (q, res) => {
+  try {
+    const pid = q.query.prospectId ? +q.query.prospectId : null;
+    const p = pid ? db.getProspect(pid) : null;
+    const company = p ? (p.dossier.company_name || p.company_name || '') : '';
+    const contacts = p && Array.isArray(p.dossier.contacts) ? p.dossier.contacts : [];
+    const name = contacts.length ? firstName(contacts[0].name) : '';
+    const templates = catalogs.listReplyTemplates().map(t => ({
+      id: t.id,
+      text: (company ? t.text.split('[company]').join(company) : t.text).split('[name]').join(name || '[name]')
+    }));
+    ok(res, templates);
+  } catch (e) { fail(res, e); }
+});
+
+// Read-only: fetches the live reply body from Gmail on demand (not cached — polling only
+// stores a snippet, see server.js's pollForReplies below). Any authenticated user.
+app.get('/api/prospects/:id/reply-context', async (q, res) => {
+  try {
+    const p = db.getProspect(+q.params.id);
+    if (!p) return res.status(404).json({ error: 'not found' });
+    if (!p.last_reply_message_id) return ok(res, { replyText: '' });
+    if (!gmail.isConnected()) return res.status(409).json({ error: 'Gmail is not connected.' });
+    const replyText = await gmail.getMessageBody(p.last_reply_message_id);
+    ok(res, { replyText });
+  } catch (e) { fail(res, e); }
+});
+
+// Drafts a reply with Claude, from the reply library only (see emailEngine.js). Audited
+// like the outreach /generate route: every call spends API tokens even when nothing is
+// persisted yet.
+app.post('/api/prospects/:id/reply/generate', mutating('prospect.reply.draft.generate', async (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  const { instruction, seedDraft, replyText } = q.body || {};
+  if ((instruction || '').length > 280) {
+    res.status(400).json({ error: 'Instruction is too long (280 characters max).' });
+    res.locals.skipAudit = true;
+    return;
+  }
+  try {
+    const { draft, usage } = await emailEngine.generateReplyDraft({
+      dossier: p.dossier, replyText: replyText || p.last_reply_snippet || '',
+      instruction, historyText: buildHistoryText(p), seedDraft
+    });
+    res.locals.audit = { prospectId: id, detail: `Reply draft generated — tokens in ${(usage && usage.input_tokens) || 0} / out ${(usage && usage.output_tokens) || 0}` };
+    return { ok: true, draft, usage };
+  } catch (e) {
+    res.locals.skipAudit = true;
+    return res.json({ ok: false, error: String(e && e.message || e) });
+  }
+}));
+
+// Atomic exactly like /saveFinal above: the Gmail send happens first, and the prospect
+// record, activity note, and reply-library save only happen once it has actually
+// succeeded. Sets status to 'replied' (which also clears awaiting_reply_review and any
+// stale dormant tag via db.updateProspect's auto-clear — see db.js).
+app.post('/api/prospects/:id/reply/send', mutating('prospect.reply.send', async (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  const { finalText, to, subject, saveToLibrary } = q.body || {};
+  const toClean = (to || '').trim();
+  const subjClean = (subject || '').trim();
+  if (!toClean || !subjClean) { res.status(400).json({ error: 'A recipient and subject are required.' }); res.locals.skipAudit = true; return; }
+  if (!p.gmail_thread_id) { res.status(400).json({ error: 'This prospect has no Gmail thread to reply on.' }); res.locals.skipAudit = true; return; }
+  if (!gmail.isConnected()) { res.status(409).json({ error: 'Gmail is not connected. Ask an admin to connect it in Settings.' }); res.locals.skipAudit = true; return; }
+
+  const priorIds = JSON.parse(p.gmail_message_ids || '[]');
+  let sendResult;
+  try {
+    sendResult = await gmail.sendEmail({
+      to: toClean, subject: subjClean, bodyText: finalText,
+      threadId: p.gmail_thread_id, inReplyTo: priorIds[priorIds.length - 1], references: priorIds.join(' ')
+    });
+  } catch (e) {
+    res.status(502).json({ error: 'Could not send via Gmail: ' + e.message });
+    res.locals.skipAudit = true;
+    return;
+  }
+
+  const shouldSave = saveToLibrary !== false;
+  const newIds = sendResult.gmailMessageId ? [...priorIds, sendResult.gmailMessageId] : priorIds;
+  db.updateProspect(id, { status: 'replied', gmail_message_ids: JSON.stringify(newIds) });
+  db.addNote(id, `Sent reply to ${toClean}: "${subjClean}"`, 'reply');
+  if (shouldSave) {
+    const dossierContact = (p.dossier.contacts || []).find(c => c.email === toClean);
+    catalogs.saveReplyEmail({
+      company_name: p.company_name, recipient: toClean,
+      recipient_name: dossierContact ? firstName(dossierContact.name) : '',
+      final_text: finalText, saved_at: new Date().toISOString()
+    });
+  }
+  res.locals.audit = { prospectId: id, detail: `Sent reply via Gmail to ${toClean}${shouldSave ? '' : ' — not saved to library'}` };
+  return { ok: true };
+}));
+
+// Admin-only, reachable only from the reply screen (not the main prospect record).
+app.post('/api/prospects/:id/dormant', requireAdmin, mutating('prospect.dormant.set', (q, res) => {
+  const id = +q.params.id;
+  const until = (q.body || {}).returnDate;
+  if (!until || !/^\d{4}-\d{2}-\d{2}$/.test(until)) { const e = new Error('A valid return date is required.'); e.status = 400; throw e; }
+  const p = db.getProspect(id);
+  if (!p) { const e = new Error('not found'); e.status = 404; throw e; }
+  db.setDormant(id, until);
+  db.addNote(id, `Marked dormant by ${q.user.username}, returns ${until}`, 'dormant');
+  res.locals.audit = { prospectId: id, detail: `Marked dormant, returns ${until}` };
+  return { ok: true };
+}));
+
+// Polls only prospects with a Gmail thread on file and not dead — one cheap metadata-only
+// Gmail call per active thread, not a global inbox scan. At this app's scale (a bounded
+// number of active outreach threads, not thousands) this is well within Gmail's API
+// quota. Runs only when Gmail is connected; skips the cycle otherwise, no error surfaced.
+async function pollForReplies() {
+  if (!gmail.isConnected()) return;
+  const candidates = db.listProspects().filter(p => p.gmail_thread_id && p.status !== 'dead');
+  for (const p of candidates) {
+    try {
+      const messages = await gmail.getThreadReplies(p.gmail_thread_id);
+      const sentIds = new Set(JSON.parse(p.gmail_message_ids || '[]'));
+      const incoming = messages.filter(m => !sentIds.has(m.id));
+      if (!incoming.length) continue;
+      const latest = incoming[incoming.length - 1];
+      if (latest.id === p.last_reply_message_id) continue; // already surfaced
+      db.recordReply(p.id, {
+        messageId: latest.id, from: latest.from, snippet: latest.snippet,
+        at: latest.internalDate ? new Date(Number(latest.internalDate)).toISOString() : new Date().toISOString()
+      });
+      audit.log({ userId: null, username: 'system (reply poll)', action: 'prospect.reply.detected', prospectId: p.id, detail: `From ${latest.from}` });
+      broadcast('reply', { id: p.id, company_name: p.company_name });
+    } catch (e) {
+      console.warn(`Reply poll failed for prospect ${p.id}:`, e.message);
+    }
+  }
+}
+setInterval(pollForReplies, 3 * 60 * 1000);
+
+// Independent of Gmail — a plain date check, same cadence.
+function checkDormantReturns() {
+  const today = new Date().toISOString().slice(0, 10);
+  for (const id of db.listDormantDue(today)) {
+    db.returnFromDormant(id);
+    db.addNote(id, 'Returned from dormant', 'dormant');
+    audit.log({ userId: null, username: 'system (dormant check)', action: 'prospect.dormant.return', prospectId: id, detail: `Returned on ${today}` });
+    broadcast('dormant-return', { id });
+  }
+}
+setInterval(checkDormantReturns, 3 * 60 * 1000);
 
 // Gmail connection status (boolean only) — any authenticated user, so the send screen
 // can gate itself regardless of who's logged in. Full detail (which account, whether
@@ -520,10 +717,45 @@ function blockSelfLockout(req, targetId, wouldLoseAdminAccess) {
 
 app.get('/api/admin/users', requireAdmin, (_q, res) => { try { ok(res, users.listUsers()); } catch (e) { fail(res, e); } });
 
-app.post('/api/admin/users', requireAdmin, mutating('user.create', (q, res) => {
-  const u = users.createUser(q.body || {});
-  res.locals.audit = { detail: `Created user "${u.username}" (${u.role})` };
-  return u;
+// Invite link + email body shared by user creation and resend below.
+function inviteLink(req, token) { return `${req.protocol}://${req.get('host')}/?invite=${token}`; }
+function inviteEmailBody(username, link) {
+  return `Hi ${username},\n\nAn account has been created for you on GovSpring Prospecting. Use the link below to set your password and log in. This link expires in 48 hours.\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`;
+}
+
+// Creates the account and emails an invite with a one-time set-password link (see
+// users.createInvitedUser) — no password is set here; that only happens via the link. If
+// Gmail isn't connected, the account is still created (not blocked on an unrelated
+// integration being down) but the response flags that the email couldn't be sent, so the
+// admin knows to use "Resend invite" later.
+app.post('/api/admin/users', requireAdmin, mutating('user.create', async (q, res) => {
+  const { user, inviteToken } = users.createInvitedUser(q.body || {});
+  let inviteEmailSent = false, inviteEmailError = '';
+  if (gmail.isConnected()) {
+    try {
+      await gmail.sendInviteEmail({ to: user.email, subject: 'Set up your GovSpring Prospecting account', bodyText: inviteEmailBody(user.username, inviteLink(q, inviteToken)) });
+      inviteEmailSent = true;
+    } catch (e) { inviteEmailError = e.message; }
+  } else {
+    inviteEmailError = 'Gmail is not connected — the invite email could not be sent. Use "Resend invite" once Gmail is connected.';
+  }
+  res.locals.audit = { detail: `Created user "${user.username}" (${user.role})${inviteEmailSent ? '' : ' — invite email not sent'}` };
+  return { ...user, inviteEmailSent, inviteEmailError };
+}));
+
+app.post('/api/admin/users/:id/resend-invite', requireAdmin, mutating('user.invite.resend', async (q, res) => {
+  const { user, inviteToken } = users.resendInvite(+q.params.id);
+  let inviteEmailSent = false, inviteEmailError = '';
+  if (gmail.isConnected()) {
+    try {
+      await gmail.sendInviteEmail({ to: user.email, subject: 'Set up your GovSpring Prospecting account', bodyText: inviteEmailBody(user.username, inviteLink(q, inviteToken)) });
+      inviteEmailSent = true;
+    } catch (e) { inviteEmailError = e.message; }
+  } else {
+    inviteEmailError = 'Gmail is not connected — the invite email could not be sent.';
+  }
+  res.locals.audit = { detail: `Resent invite to "${user.username}"${inviteEmailSent ? '' : ' — invite email not sent'}` };
+  return { ...user, inviteEmailSent, inviteEmailError };
 }));
 
 app.post('/api/admin/users/:id/deactivate', requireAdmin, mutating('user.deactivate', (q, res) => {
@@ -714,7 +946,7 @@ app.get('*', (_q, res) => res.sendFile(path.join(APP_DIR, 'public', 'index.html'
 // Walks the registered routes and flags any POST/PATCH/PUT/DELETE /api/* route that
 // wasn't wired through mutating(). The four routes documented as exceptions in the AUDIT
 // CONVENTION comment above are expected to fail this check and are excluded on purpose.
-const AUDIT_EXEMPT_ROUTES = new Set(['/api/auth/setup', '/api/auth/login', '/api/auth/logout', '/api/prospects/upload', '/api/admin/gmail/callback']);
+const AUDIT_EXEMPT_ROUTES = new Set(['/api/auth/setup', '/api/auth/login', '/api/auth/logout', '/api/prospects/upload', '/api/admin/gmail/callback', '/api/auth/accept-invite']);
 function checkAuditCoverage() {
   try {
     const offenders = [];

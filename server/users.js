@@ -9,6 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const MIN_PASSWORD_LENGTH = 8;
+const INVITE_TTL_MS = 48 * 60 * 60 * 1000;
 
 let usersPath;
 let store = { users: [], nextId: 1 };
@@ -93,6 +94,69 @@ function createUser({ username, password, role, email }) {
   return safe(u);
 }
 
+// Creates a user with no usable password (empty hash — verifyPassword safely rejects any
+// login attempt against it) and a random one-time invite token, valid 48 hours. Used only
+// by the admin Users panel (POST /api/admin/users in server.js), which emails the token as
+// a set-password link. Distinct from createUser() above, which stays exactly as it was for
+// the one place that still sets a password directly: first-run setup, which has no admin
+// or Gmail connection yet to send an invite through.
+function createInvitedUser({ username, role, email }) {
+  const clean = String(username || '').trim();
+  if (!clean) throw err(400, 'Username required');
+  if (findByUsername(clean)) throw err(400, 'Username already taken');
+  const cleanEmail = String(email || '').trim();
+  if (!cleanEmail) throw err(400, 'Email is required');
+  if (!EMAIL_PATTERN.test(cleanEmail)) throw err(400, 'Email address looks invalid');
+  const u = {
+    id: store.nextId++,
+    username: clean,
+    usernameLower: normalizeUsername(clean),
+    passwordHash: '',
+    role: role === 'admin' ? 'admin' : 'user',
+    email: cleanEmail,
+    active: true,
+    pending: true,
+    inviteToken: crypto.randomBytes(24).toString('base64url'),
+    inviteExpiresAt: new Date(Date.now() + INVITE_TTL_MS).toISOString(),
+    createdAt: new Date().toISOString()
+  };
+  store.users.push(u);
+  save();
+  return { user: safe(u), inviteToken: u.inviteToken };
+}
+
+// Regenerates the token+expiry for a still-pending user (implicitly invalidating any
+// earlier link, since only the current stored token is ever checked). Not meaningful once
+// a user has set their password.
+function resendInvite(id) {
+  const u = findById(id);
+  if (!u) throw err(404, 'User not found');
+  if (!u.pending) throw err(400, 'This user has already set their password');
+  u.inviteToken = crypto.randomBytes(24).toString('base64url');
+  u.inviteExpiresAt = new Date(Date.now() + INVITE_TTL_MS).toISOString();
+  save();
+  return { user: safe(u), inviteToken: u.inviteToken };
+}
+
+function findByInviteToken(token) {
+  return store.users.find(u => u.pending && u.inviteToken && u.inviteToken === token) || null;
+}
+
+// Validates the token and expiry, sets the password, and clears the invite — the account
+// is fully activated from here on, indistinguishable from one created via createUser().
+function acceptInvite(token, password) {
+  const u = findByInviteToken(token);
+  if (!u) throw err(400, 'Invalid or already-used invitation link');
+  if (new Date(u.inviteExpiresAt).getTime() < Date.now()) throw err(400, 'This invitation link has expired. Ask an admin to resend it.');
+  if (!password || password.length < MIN_PASSWORD_LENGTH) throw err(400, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+  u.passwordHash = hashPassword(password);
+  u.pending = false;
+  u.inviteToken = '';
+  u.inviteExpiresAt = '';
+  save();
+  return safe(u);
+}
+
 // Used for the CC picker on the send screen — set (or cleared) by an admin from the
 // Users panel. Not self-service; keeps the change scoped to what the feature needs.
 function setEmail(id, email) {
@@ -140,13 +204,16 @@ function resetPassword(id, newPassword) {
   return safe(u);
 }
 
-// Never expose the password hash or the lowercased lookup key.
+// Never expose the password hash, the lowercased lookup key, or the raw invite token
+// (a live, single-use credential — same trust boundary as a password) — pending/
+// inviteExpiresAt are safe to show (they're what the Users panel needs to offer "resend").
 function safe(u) {
-  const { passwordHash, usernameLower, ...rest } = u;
+  const { passwordHash, usernameLower, inviteToken, ...rest } = u;
   return rest;
 }
 
 module.exports = {
   init, hasAnyUser, createUser, checkLogin, findById, findByUsername,
-  listUsers, setActive, setRole, setEmail, resetPassword, MIN_PASSWORD_LENGTH
+  listUsers, setActive, setRole, setEmail, resetPassword, MIN_PASSWORD_LENGTH,
+  createInvitedUser, resendInvite, acceptInvite, findByInviteToken
 };

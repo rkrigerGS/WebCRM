@@ -56,6 +56,18 @@ function blankProspect() {
     // Captured automatically the moment a prospect transitions into 'dead' (see
     // updateProspect below) so the backup feature's dead-pile review can restore it.
     pre_dead_status: '',
+    // Reply lifecycle (see server.js's reply-poll interval and /api/prospects/:id/reply/*).
+    // awaiting_reply_review is the Replies-tab flag: true whenever a reply has arrived
+    // that hasn't been acted on yet. last_reply_message_id is the dedup watermark that
+    // tells the poll which inbound messages it has already surfaced.
+    awaiting_reply_review: false,
+    last_reply_at: '', last_reply_from: '', last_reply_snippet: '', last_reply_message_id: '',
+    // Dormant status (admin-only, set only from the reply screen — see server.js).
+    // pre_dormant_status mirrors pre_dead_status: captured on the way in so a return (or an
+    // undo) can restore the exact prior status. dormant_returned is the "returned from
+    // dormant" tag shown in the Due for follow-up view; it clears on the next status change
+    // or send.
+    dormant_until: '', dormant_returned: false, pre_dormant_status: '',
     created_at: new Date().toISOString(), updated_at: new Date().toISOString()
   };
 }
@@ -121,6 +133,10 @@ function listProspects() {
       followup_days: p.followup_days, next_action_date: p.next_action_date,
       date_sent: p.date_sent, final_sent: p.final_sent, activity: p.activity,
       pre_dead_status: p.pre_dead_status,
+      awaiting_reply_review: p.awaiting_reply_review, last_reply_at: p.last_reply_at,
+      last_reply_from: p.last_reply_from, last_reply_snippet: p.last_reply_snippet,
+      dormant_until: p.dormant_until, dormant_returned: p.dormant_returned,
+      gmail_thread_id: p.gmail_thread_id, gmail_message_ids: p.gmail_message_ids,
       dossier: safeParse(p.dossier_json, {})
     }))
     .sort((a, b) => ((a.fit_score == null) - (b.fit_score == null))
@@ -147,6 +163,17 @@ function updateProspect(id, fields) {
   // new->dead transition only (not on repeated writes while already dead), so a dead-pile
   // review can restore it correctly.
   if (fields.status === 'dead' && p.status !== 'dead') p.pre_dead_status = p.status;
+  // Any deliberate status change (from anywhere — the main detail pane, bulk actions, or
+  // the reply screen's quick-action buttons) acknowledges whatever attention flags were
+  // pending: a reviewed reply, or a stale dormant-return tag / dormant window that no
+  // longer applies once the status has moved on.
+  if ('status' in fields && fields.status !== p.status) {
+    p.awaiting_reply_review = false;
+    if (fields.status !== 'dormant') {
+      p.dormant_returned = false;
+      p.dormant_until = '';
+    }
+  }
   const allowed = ['status', 'channel', 'first_draft', 'final_sent', 'date_sent',
     'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity',
     'gmail_thread_id', 'gmail_message_ids', 'pre_dead_status'];
@@ -156,15 +183,72 @@ function updateProspect(id, fields) {
   return { updated: true };
 }
 
-function addNote(id, text) {
+// kind is optional and purely presentational (the reply-review screen's history timeline
+// uses it to distinguish sent-email/status entries from plain notes) — entries written
+// before this existed simply have no kind, and render exactly as they always have.
+function addNote(id, text, kind) {
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { ok: false };
   const log = safeParse(p.activity, []);
-  log.push({ date: new Date().toISOString().slice(0, 10), text });
+  const entry = { date: new Date().toISOString().slice(0, 10), text };
+  if (kind) entry.kind = kind;
+  log.push(entry);
   p.activity = JSON.stringify(log);
   p.updated_at = new Date().toISOString();
   save();
   return { ok: true };
+}
+
+// Called by the reply-poll interval in server.js when a new inbound message is found on a
+// tracked thread. Does not touch status — dormant stays dormant, sent stays sent — so the
+// reviewer decides the next status from the reply screen.
+function recordReply(id, { messageId, from, snippet, at }) {
+  const p = store.prospects.find(x => x.id === id);
+  if (!p) return { ok: false };
+  p.awaiting_reply_review = true;
+  p.last_reply_message_id = messageId || '';
+  p.last_reply_from = from || '';
+  p.last_reply_snippet = snippet || '';
+  p.last_reply_at = at || new Date().toISOString();
+  p.updated_at = new Date().toISOString();
+  save();
+  return { ok: true };
+}
+
+// Admin-only, set only from the reply screen (see server.js). Captures pre_dormant_status
+// the same way marking dead captures pre_dead_status, so an undo or a manual restore has
+// somewhere correct to go back to.
+function setDormant(id, until) {
+  const p = store.prospects.find(x => x.id === id);
+  if (!p) return { ok: false };
+  p.pre_dormant_status = p.status;
+  p.status = 'dormant';
+  p.dormant_until = until;
+  p.dormant_returned = false;
+  p.awaiting_reply_review = false;
+  p.updated_at = new Date().toISOString();
+  save();
+  return { ok: true };
+}
+
+// Called by server.js's dormant-return interval for every dormant prospect whose
+// dormant_until has passed. Always returns to 'sent' — that's what the Due for follow-up
+// view requires to surface it — tagged dormant_returned until the next status change.
+function returnFromDormant(id) {
+  const p = store.prospects.find(x => x.id === id);
+  if (!p) return { ok: false };
+  p.status = 'sent';
+  p.dormant_until = '';
+  p.dormant_returned = true;
+  p.updated_at = new Date().toISOString();
+  save();
+  return { ok: true };
+}
+
+// Every prospect currently dormant whose return date has passed — used by server.js's
+// interval check so it doesn't need to know db.js's internal store shape.
+function listDormantDue(today) {
+  return store.prospects.filter(p => p.status === 'dormant' && p.dormant_until && p.dormant_until <= today).map(p => p.id);
 }
 
 function logExternal(id, { channel, text }) {
@@ -223,5 +307,6 @@ function safeParse(s, fallback) {
 
 module.exports = {
   init, ingestDossier, listProspects, getProspect, deleteProspect,
-  updateProspect, addNote, logExternal, editContact, checkExclusion, stats
+  updateProspect, addNote, logExternal, editContact, checkExclusion, stats,
+  recordReply, setDormant, returnFromDormant, listDormantDue
 };

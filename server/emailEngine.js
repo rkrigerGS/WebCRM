@@ -184,6 +184,56 @@ Write only the email body, starting with the greeting. Use the recipient's first
   return { system, user, model: cfg.draftModel };
 }
 
+// ---- Reply drafting (additive — does not touch buildDraftPrompt/generateDraft above) ----
+// Draws exemplars from the reply library only (catalogs.listReplyEmails), never the
+// outreach library, per the two-libraries requirement.
+
+function buildReplyPrompt({ dossier, replyText, instruction, historyText, seedDraft }) {
+  const firm = catalogs.readFirmFacts();
+  const replyExemplars = catalogs.listReplyEmails();
+  const exemplars = replyExemplars.slice(0, 6)
+    .map((e, i) => `EXAMPLE ${i + 1} (to ${e.recipient} at ${e.company_name}):\n${e.final_text}`)
+    .join('\n\n---\n\n');
+
+  const cfg = config.get();
+
+  const system = `You are drafting a reply email for Marcos Gonzalez, Managing Attorney at GovSpring Legal, a boutique government-contracts law firm, responding to a prospect who replied to his outreach. You write in his exact voice, learned from the real approved reply examples below (a separate voice reference from cold outreach — replies are shorter and more conversational).
+
+NON-NEGOTIABLE STYLE RULES:
+- This is a reply, not a fresh pitch. Do not re-introduce the firm or repeat the original outreach's full pitch.
+- Length: as short as the situation allows, typically 40 to 120 words.
+- NO em dashes anywhere. NO en dashes except in numeric ranges. Use periods, commas, or semicolons.
+- Only state facts about the prospect that appear in the dossier or the reply thread provided. Never invent a detail.
+- Match the tone of their reply: brief and businesslike if theirs was, warmer if theirs was warm.
+
+FIRM AND PEOPLE FACTS:
+${firm}
+
+APPROVED REPLY EXAMPLES (match this voice and length; do not copy their specific facts):
+${exemplars || '(none saved yet — write in a warm, direct, professional voice consistent with the firm facts above.)'}`;
+
+  const user = `PROSPECT: ${dossier.company_name || ''} (${dossier.city_state || ''})
+
+CONVERSATION HISTORY SO FAR:
+${historyText || '(no prior history on file)'}
+
+THEIR REPLY (the message you are responding to):
+${replyText}
+
+${seedDraft ? `A partial draft has already been started (assembled from saved reply phrases) — refine and complete it, keeping its existing content unless the instruction below contradicts it:\n${seedDraft}\n` : ''}
+INSTRUCTION FROM THE REVIEWER: ${instruction || '(write a reasonable reply based on the history and their message; no specific instruction given)'}
+
+Write only the reply body, starting with the greeting. Do not include a subject line.`;
+
+  return { system, user, model: cfg.draftModel };
+}
+
+async function generateReplyDraft(params) {
+  const prompt = buildReplyPrompt(params);
+  const { text, usage } = await callClaude(prompt);
+  return { draft: text, usage };
+}
+
 function rankExemplars(approved, chosenServices) {
   const chosen = new Set((chosenServices || []).map(s => s.toLowerCase()));
   return [...approved].sort((a, b) => score(b) - score(a));
@@ -251,4 +301,4 @@ async function generateDraft(params) {
   return { draft: text, usage };
 }
 
-module.exports = { buildQuestions, generateDraft, buildDraftPrompt, callClaude };
+module.exports = { buildQuestions, generateDraft, buildDraftPrompt, callClaude, buildReplyPrompt, generateReplyDraft };

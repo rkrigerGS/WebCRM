@@ -157,6 +157,7 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
 .status-replied { background: var(--green-bg); color: var(--green); }
 .status-signed { background: var(--green); color: #fff; }
 .status-dead { background: var(--line-soft); color: var(--text-faint); }
+.status-dormant { background: #ece7f2; color: var(--blue); }
 
 .flags { display: inline-flex; gap: 5px; }
 .flag {
@@ -166,6 +167,7 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
 .flag-overdue { background: var(--red-bg); color: var(--red); }
 .flag-nocontact { background: var(--line); color: var(--text-soft); }
 .flag-hot { background: var(--gold); color: var(--ink); }
+.flag-dormant-return { background: #ece7f2; color: var(--blue); }
 
 .fu-cell { font-size: 12.5px; color: var(--text-soft); }
 .fu-overdue { color: var(--red); font-weight: 600; }
