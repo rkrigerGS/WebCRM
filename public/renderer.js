@@ -210,6 +210,7 @@ async function openDetail(id){
   document.getElementById('detailBody').innerHTML=`
     <div class="section">
       <div class="section-label">Status</div>
+      ${p.added_by?`<div class="field"><span class="field-key">Added by ${esc(p.added_by)}${p.added_at?` on ${esc(new Date(p.added_at).toLocaleDateString())}`:''}</span></div>`:''}
       <div class="field"><span class="status-pill status-${p.status}">${esc(p.status)}</span>
         ${p.date_sent?` <span class="field-key">sent ${esc(p.date_sent)}</span>`:''}
         ${p.followup_count?` <span class="field-key">· ${p.followup_count} follow-up(s)</span>`:''}</div>
@@ -502,8 +503,9 @@ async function openReplyReview(id){
       replyModal.hidden=true; loadProspects();
       toast(`Reply sent to ${d.company_name||p.company_name}`);
     }catch(e){
-      errEl.textContent=e.message; errEl.hidden=false;
       sendBtn.disabled=false; sendBtn.textContent=origLabel;
+      if(e.exclusion){ renderExclusionBlock(errEl,e.exclusion,id,()=>document.getElementById('replySendBtn').click()); return; }
+      errEl.textContent=e.message; errEl.hidden=false;
     }
   });
   document.getElementById('replyMarkRepliedBtn').addEventListener('click',async()=>{
@@ -627,8 +629,9 @@ async function renderDraft(draft,usage){
       await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc,saveToLibrary});
       emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId);
     }catch(e){
-      errEl.textContent=e.message; errEl.hidden=false;
       btn.disabled=false; btn.textContent=originalLabel;
+      if(e.exclusion){ renderExclusionBlock(errEl,e.exclusion,flowState.prospectId,()=>document.getElementById('saveFinalBtn').click()); return; }
+      errEl.textContent=e.message; errEl.hidden=false;
     }
   });
 }
@@ -1046,6 +1049,33 @@ function toastUndo(msg,onUndo,ms=6000){
     await onUndo();
   });
   t._timer=setTimeout(()=>{t.style.opacity='0';},ms);
+}
+
+// Shown in place of a plain error when a send is blocked by the do-not-contact list (see
+// server.js's blockIfExcluded — used by both the outreach and reply send routes). Any
+// user can mark the prospect dead and move on; only an admin can remove the matched rule
+// and retry the same send via onRetry.
+function renderExclusionBlock(container,exclusion,prospectId,onRetry){
+  const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
+  container.hidden=false;
+  container.innerHTML=`
+    <div>This company is on the do-not-contact list (matched ${esc(exclusion.match_type)}: "${esc(exclusion.value)}"). Sending is blocked.</div>
+    <div class="modal-actions" style="margin-top:8px;">
+      ${isAdmin?`<button class="btn btn-sm" id="removeExclusionBtn">Remove from exclusions and send</button>`:''}
+      <button class="btn btn-ghost btn-sm" id="exclusionMarkDeadBtn">Mark dead and move on</button>
+    </div>`;
+  const removeBtn=document.getElementById('removeExclusionBtn');
+  if(removeBtn)removeBtn.addEventListener('click',async()=>{
+    try{ await window.api.removeExclusion(exclusion.match_type,exclusion.value); toast('Exclusion removed.'); onRetry(); }
+    catch(err){ alert(err.message); }
+  });
+  document.getElementById('exclusionMarkDeadBtn').addEventListener('click',async()=>{
+    const reason=window.prompt('Why is this prospect dead? (optional — helps the backup review later)');
+    if(reason&&reason.trim())await window.api.addNote(prospectId,reason.trim());
+    await window.api.updateProspect(prospectId,{status:'dead'});
+    emailModal.hidden=true; replyModal.hidden=true; loadProspects();
+    toast('Marked dead.');
+  });
 }
 
 // After the Gmail OAuth redirect lands back on the app (see server.js's

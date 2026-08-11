@@ -14,7 +14,14 @@ async function sendJSON(url, method, body) {
     headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined
   });
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  if (!r.ok) {
+    const errBody = await r.json().catch(() => ({}));
+    const err = new Error(errBody.error || r.statusText);
+    // Carried through so a do-not-contact block can be told apart from any other failure
+    // and shown its own UI (see renderer.js's renderExclusionBlock), not just an error string.
+    if (errBody.exclusion) err.exclusion = errBody.exclusion;
+    throw err;
+  }
   return r.json();
 }
 function toQuery(params) {
@@ -105,5 +112,6 @@ window.api = {
   generateReply:       (id, body)          => sendJSON('/api/prospects/' + id + '/reply/generate', 'POST', body),
   sendReply:           (id, body)          => sendJSON('/api/prospects/' + id + '/reply/send', 'POST', body),
   setDormant:          (id, returnDate)    => sendJSON('/api/prospects/' + id + '/dormant', 'POST', { returnDate }),
-  resendInvite:        (id)                => sendJSON('/api/admin/users/' + id + '/resend-invite', 'POST')
+  resendInvite:        (id)                => sendJSON('/api/admin/users/' + id + '/resend-invite', 'POST'),
+  removeExclusion:     (match_type, value) => sendJSON('/api/admin/exclusions/remove', 'POST', { match_type, value })
 };

@@ -283,7 +283,36 @@ const ok = (res, data) => res.json(data);
 const fail = (res, e) => res.status(500).json({ error: String(e && e.message || e) });
 
 app.get('/api/prospects', (_q, res) => { try { ok(res, db.listProspects()); } catch (e) { fail(res, e); } });
-app.get('/api/prospects/:id', (q, res) => { try { const p = db.getProspect(+q.params.id); p ? ok(res, p) : res.status(404).json({ error: 'not found' }); } catch (e) { fail(res, e); } });
+
+// Who added this prospect, read straight from its creation event in the audit log
+// (prospect.upload for a browser upload, prospect.ingest for the folder watcher) — no new
+// storage; this is a record, not an editable field.
+function findAddedBy(id) {
+  const entry = audit.list({ prospectId: id }).find(e => e.action === 'prospect.upload' || e.action === 'prospect.ingest');
+  return entry ? { by: entry.username, at: entry.at } : null;
+}
+app.get('/api/prospects/:id', (q, res) => {
+  try {
+    const p = db.getProspect(+q.params.id);
+    if (!p) return res.status(404).json({ error: 'not found' });
+    const added = findAddedBy(p.id);
+    ok(res, { ...p, added_by: added ? added.by : '', added_at: added ? added.at : '' });
+  } catch (e) { fail(res, e); }
+});
+
+// Do-not-contact enforcement at the send layer (the exclusions list already runs at
+// ingest time — see db.js's isExcluded/ingestDossier, unchanged). Checked first, before
+// anything else, in both send routes below. On a match: nothing is sent, nothing is
+// persisted, and — unlike a plain precondition failure — the attempt itself is audited,
+// since a blocked send attempt on a do-not-contact company is meaningful history.
+function blockIfExcluded(req, res, id) {
+  const rule = db.checkExclusion(id);
+  if (!rule) return false;
+  audit.log({ userId: req.user.id, username: req.user.username, action: 'prospect.send.blocked', prospectId: id, detail: `Blocked: matched exclusion ${rule.match_type}="${rule.value}"` });
+  res.status(400).json({ error: `This company is on the do-not-contact list (matched: ${rule.value}). Sending is blocked.`, exclusion: rule });
+  res.locals.skipAudit = true;
+  return true;
+}
 
 app.patch('/api/prospects/:id', mutating('prospect.update', (q, res) => {
   const id = +q.params.id;
@@ -409,12 +438,7 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
   const cc = Array.isArray(meta && meta.cc) ? meta.cc.filter(e => typeof e === 'string' && e.trim()).map(e => e.trim()) : [];
   const saveToLibrary = !(meta && meta.saveToLibrary === false);
 
-  const excludedBy = db.checkExclusion(id);
-  if (excludedBy) {
-    res.status(400).json({ error: `This company is on the do-not-contact list (matched: ${excludedBy}). Sending is blocked.` });
-    res.locals.skipAudit = true;
-    return;
-  }
+  if (blockIfExcluded(q, res, id)) return;
   if (!gmail.isConnected()) {
     res.status(409).json({ error: 'Gmail is not connected. Ask an admin to connect it in Settings.' });
     res.locals.skipAudit = true;
@@ -545,6 +569,7 @@ app.post('/api/prospects/:id/reply/send', mutating('prospect.reply.send', async 
   const id = +q.params.id;
   const p = db.getProspect(id);
   if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  if (blockIfExcluded(q, res, id)) return;
   const { finalText, to, subject, saveToLibrary } = q.body || {};
   const toClean = (to || '').trim();
   const subjClean = (subject || '').trim();
@@ -919,6 +944,16 @@ async function checkScheduledBackup() {
   }
 }
 setInterval(checkScheduledBackup, 5 * 60 * 1000);
+
+// Admin-only removal, used from a blocked-send screen's "remove and send" action. Not a
+// general exclusions-management surface — that's out of scope for this feature.
+app.post('/api/admin/exclusions/remove', requireAdmin, mutating('exclusion.remove', (q, res) => {
+  const { match_type, value } = q.body || {};
+  if (!match_type || !value) { const e = new Error('match_type and value are required'); e.status = 400; throw e; }
+  const result = db.removeExclusion(match_type, value);
+  res.locals.audit = { detail: `Removed exclusion ${match_type}="${value}"` };
+  return result;
+}));
 
 // ---- Admin: audit log ----
 // Supports three views admins need: (1) who did a given action — filter by action, read

@@ -74,12 +74,15 @@ function blankProspect() {
 
 // ---- Ingestion ----
 
+// Returns the whole matched rule ({match_type, value}), not just its value, so the send-
+// layer block (see server.js's blockIfExcluded) can tell the user precisely which rule
+// matched and let an admin remove that exact rule.
 function isExcluded(dossier) {
   const uei = dossier.uei || '';
   const name = (dossier.company_name || '').toUpperCase();
   for (const r of store.exclusions) {
-    if (r.match_type === 'uei' && uei && r.value === uei) return r.value;
-    if (r.match_type === 'name_contains' && name.includes((r.value || '').toUpperCase())) return r.value;
+    if (r.match_type === 'uei' && uei && r.value === uei) return r;
+    if (r.match_type === 'name_contains' && name.includes((r.value || '').toUpperCase())) return r;
   }
   return null;
 }
@@ -93,7 +96,7 @@ function ingestDossier(dossier, filename) {
   }
   const excludedBy = isExcluded(dossier);
   if (excludedBy) {
-    logIngest(filename, uei, 'excluded', `matched exclusion: ${excludedBy}`);
+    logIngest(filename, uei, 'excluded', `matched exclusion: ${excludedBy.value}`);
     return { outcome: 'excluded', uei };
   }
 
@@ -289,6 +292,20 @@ function checkExclusion(id) {
   return isExcluded(p);
 }
 
+function listExclusions() {
+  return store.exclusions.slice();
+}
+
+// Used by the admin "remove and send" action from a blocked-send screen (see server.js).
+// Matches by content (match_type + value), not an id — existing exclusion entries have
+// none, and the caller always already knows exactly which rule matched.
+function removeExclusion(match_type, value) {
+  const before = store.exclusions.length;
+  store.exclusions = store.exclusions.filter(r => !(r.match_type === match_type && r.value === value));
+  save();
+  return { removed: before !== store.exclusions.length };
+}
+
 function stats() {
   const c = { total: 0, new: 0, sent: 0, replied: 0, signed: 0 };
   for (const p of store.prospects) {
@@ -308,5 +325,6 @@ function safeParse(s, fallback) {
 module.exports = {
   init, ingestDossier, listProspects, getProspect, deleteProspect,
   updateProspect, addNote, logExternal, editContact, checkExclusion, stats,
-  recordReply, setDormant, returnFromDormant, listDormantDue
+  recordReply, setDormant, returnFromDormant, listDormantDue,
+  listExclusions, removeExclusion
 };
