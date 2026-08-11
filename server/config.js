@@ -16,7 +16,9 @@ const DEFAULTS = {
   defaultFollowupDays: 4,
   watchFolder: '',               // where the research agent writes dossiers; '' = use built-in default
   googleClientId: '',            // Google Cloud OAuth client, pasted by an admin in Settings
-  googleClientSecret: ''         // (Gmail sending — see server/gmail.js)
+  googleClientSecret: '',        // (Gmail sending — see server/gmail.js)
+  backupFrequency: 'off',        // 'off' | 'daily' | '3days' | 'weekly' (see server/backup.js)
+  lastBackupAt: ''               // ISO timestamp of the last scheduled backup sent, or '' if never
 };
 
 function init(userDataDir) {

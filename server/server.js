@@ -20,6 +20,7 @@ const auth = require('./auth');
 const users = require('./users');
 const audit = require('./audit');
 const gmail = require('./gmail');
+const backup = require('./backup');
 
 const APP_DIR = path.join(__dirname, '..');
 const DATA_DIR = path.join(APP_DIR, 'data');
@@ -451,7 +452,11 @@ app.get('/api/users/ccable', (_q, res) => {
 // Config
 app.get('/api/config', (_q, res) => {
   const c = config.get();
-  ok(res, { hasApiKey: config.hasApiKey(), keyTail: c.anthropicApiKey ? c.anthropicApiKey.slice(-4) : '', draftModel: c.draftModel, defaultFollowupDays: c.defaultFollowupDays, watchFolder: watchedDir() });
+  ok(res, {
+    hasApiKey: config.hasApiKey(), keyTail: c.anthropicApiKey ? c.anthropicApiKey.slice(-4) : '',
+    draftModel: c.draftModel, defaultFollowupDays: c.defaultFollowupDays, watchFolder: watchedDir(),
+    backupFrequency: c.backupFrequency, lastBackupAt: c.lastBackupAt
+  });
 });
 
 app.post('/api/config/key', mutating('config.apiKey.update', (q, res) => {
@@ -601,6 +606,87 @@ app.post('/api/admin/gmail/disconnect', requireAdmin, mutating('gmail.disconnect
   res.locals.audit = { detail: wasEmail ? `Disconnected ${wasEmail}` : 'Disconnected' };
   return { ok: true };
 }));
+
+// ---- Admin: backup ----
+// Dead-pile review (see public/renderer.js): every currently-dead prospect, plus enough
+// context to decide keep/restore at a glance. "Who marked it dead" comes from the audit
+// log (no schema change needed there); "why" comes from the prospect's own activity log,
+// since marking a prospect dead now optionally prompts for a one-line reason that gets
+// saved as its most recent note (see renderer.js) — for prospects marked dead before this
+// existed, there simply isn't one to show. Read-only: no mutating() needed.
+app.get('/api/admin/backup/dead-pile', requireAdmin, (_q, res) => {
+  try {
+    const dead = db.listProspects().filter(p => p.status === 'dead');
+    const result = dead.map(p => {
+      let activity = [];
+      try { activity = JSON.parse(p.activity || '[]'); } catch {}
+      const reason = activity.length ? activity[activity.length - 1].text : '';
+      const entries = audit.list({ action: 'prospect.update', prospectId: p.id });
+      let markedBy = '', markedAt = '';
+      for (const e of entries) {
+        try {
+          if (JSON.parse(e.detail || '{}').status === 'dead') { markedBy = e.username; markedAt = e.at; break; }
+        } catch {}
+      }
+      return { id: p.id, company_name: p.company_name, fit_score: p.fit_score, reason, markedBy, markedAt, restoreStatus: p.pre_dead_status || 'new' };
+    });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+
+// Generates and streams the backup zip. A GET that returns binary, not JSON, so it
+// doesn't fit mutating()'s res.json() contract (same reasoning as the Gmail OAuth
+// callback) — audited manually instead, matching that precedent.
+app.get('/api/admin/backup/download', requireAdmin, (req, res) => {
+  try {
+    const { buffer, filename } = backup.buildBackupZip(DATA_DIR);
+    audit.log({ userId: req.user.id, username: req.user.username, action: 'backup.download', detail: filename });
+    res.set({ 'Content-Type': 'application/zip', 'Content-Disposition': `attachment; filename="${filename}"` });
+    res.send(buffer);
+  } catch (e) { fail(res, e); }
+});
+
+const BACKUP_FREQUENCIES = new Set(['off', 'daily', '3days', 'weekly']);
+app.post('/api/config/backup-schedule', requireAdmin, mutating('config.backup.update', (q, res) => {
+  const freq = (q.body || {}).backupFrequency;
+  if (!BACKUP_FREQUENCIES.has(freq)) { const e = new Error('Invalid backup frequency'); e.status = 400; throw e; }
+  if (freq !== 'off' && !gmail.isConnected()) { const e = new Error('Connect Gmail before enabling scheduled backups.'); e.status = 400; throw e; }
+  const patch = { backupFrequency: freq };
+  // Start the clock now, the first time scheduling is turned on, so the first automatic
+  // backup fires one full interval from now rather than immediately.
+  if (freq !== 'off' && !config.get().lastBackupAt) patch.lastBackupAt = new Date().toISOString();
+  config.update(patch);
+  res.locals.audit = { detail: `Backup schedule set to ${freq}` };
+  return { ok: true, backupFrequency: freq };
+}));
+
+// Checked periodically rather than with one long-lived setTimeout, so a server restart, a
+// schedule change, or Gmail disconnecting all self-correct on the next check instead of
+// needing special-case handling. lastBackupAt persists in config.json, so the schedule
+// survives restarts.
+const BACKUP_INTERVAL_MS = { daily: 24 * 60 * 60 * 1000, '3days': 3 * 24 * 60 * 60 * 1000, weekly: 7 * 24 * 60 * 60 * 1000 };
+async function checkScheduledBackup() {
+  const cfg = config.get();
+  const intervalMs = BACKUP_INTERVAL_MS[cfg.backupFrequency];
+  if (!intervalMs) return; // 'off'
+  const last = cfg.lastBackupAt ? new Date(cfg.lastBackupAt).getTime() : Date.now();
+  if (Date.now() - last < intervalMs) return;
+  if (!gmail.isConnected()) { console.warn('Scheduled backup is due but Gmail is not connected; will retry next check.'); return; }
+  try {
+    const { buffer, filename } = backup.buildBackupZip(DATA_DIR);
+    await gmail.sendAttachmentEmail({
+      to: 'marcos@govspringlegal.com',
+      subject: `GovSpring Prospecting backup — ${filename}`,
+      bodyText: 'Attached is the scheduled backup of the GovSpring Prospecting database.',
+      attachment: { filename, contentType: 'application/zip', data: buffer }
+    });
+    config.update({ lastBackupAt: new Date().toISOString() });
+    audit.log({ userId: null, username: 'system (scheduled backup)', action: 'backup.scheduled', detail: filename });
+  } catch (e) {
+    console.warn('Scheduled backup failed:', e.message);
+  }
+}
+setInterval(checkScheduledBackup, 5 * 60 * 1000);
 
 // ---- Admin: audit log ----
 // Supports three views admins need: (1) who did a given action — filter by action, read

@@ -90,5 +90,8 @@ window.api = {
 
   getGmailAdminStatus: ()                  => getJSON('/api/admin/gmail/status'),
   disconnectGmail:     ()                  => sendJSON('/api/admin/gmail/disconnect', 'POST'),
-  saveGoogleCreds:     (clientId, clientSecret) => sendJSON('/api/config/google', 'POST', { clientId, clientSecret })
+  saveGoogleCreds:     (clientId, clientSecret) => sendJSON('/api/config/google', 'POST', { clientId, clientSecret }),
+
+  getDeadPile:         ()                  => getJSON('/api/admin/backup/dead-pile'),
+  saveBackupSchedule:  (backupFrequency)   => sendJSON('/api/config/backup-schedule', 'POST', { backupFrequency })
 };

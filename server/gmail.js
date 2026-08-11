@@ -261,4 +261,51 @@ async function sendEmail({ to, cc, subject, bodyText, threadId, inReplyTo, refer
   return result;
 }
 
-module.exports = { init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail };
+// Builds a multipart/mixed MIME message with one attachment. Separate from
+// buildRawMessage() above (outreach mail): a backup email is a plain notification to a
+// fixed address, not threaded or labeled, so it doesn't share that function's shape.
+function buildAttachmentMessage({ from, to, subject, bodyText, attachment }) {
+  const boundary = 'gs_backup_' + Date.now().toString(36);
+  const headers = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/mixed; boundary="${boundary}"`
+  ];
+  const bodyPart = [
+    `--${boundary}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    '',
+    bodyText,
+    ''
+  ].join('\r\n');
+  const attachmentPart = [
+    `--${boundary}`,
+    `Content-Type: ${attachment.contentType}; name="${attachment.filename}"`,
+    'Content-Transfer-Encoding: base64',
+    `Content-Disposition: attachment; filename="${attachment.filename}"`,
+    '',
+    attachment.data.toString('base64').replace(/(.{76})/g, '$1\r\n'),
+    ''
+  ].join('\r\n');
+  const raw = headers.join('\r\n') + '\r\n\r\n' + bodyPart + attachmentPart + `--${boundary}--`;
+  return Buffer.from(raw, 'utf8').toString('base64url');
+}
+
+// params: { to, subject, bodyText, attachment: { filename, contentType, data: Buffer } }.
+// No threading, no CC, no label — used only for the scheduled backup email (see
+// server/backup.js and server.js's scheduler), which is a standalone notification, not
+// outreach.
+async function sendAttachmentEmail({ to, subject, bodyText, attachment }) {
+  const accessToken = await ensureAccessToken();
+  const from = (token.email || 'marcos@govspringlegal.com');
+  const raw = buildAttachmentMessage({ from, to, subject, bodyText, attachment });
+  return requestJSON({
+    hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST',
+    headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+    body: { raw }
+  });
+}
+
+module.exports = { init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail, sendAttachmentEmail };

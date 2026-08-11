@@ -53,6 +53,9 @@ function blankProspect() {
     // first) — used to build In-Reply-To/References on the next follow-up so it lands
     // as a reply rather than a new message. Empty until the prospect's first Gmail send.
     gmail_thread_id: '', gmail_message_ids: '[]',
+    // Captured automatically the moment a prospect transitions into 'dead' (see
+    // updateProspect below) so the backup feature's dead-pile review can restore it.
+    pre_dead_status: '',
     created_at: new Date().toISOString(), updated_at: new Date().toISOString()
   };
 }
@@ -117,6 +120,7 @@ function listProspects() {
       status: p.status, channel: p.channel, followup_count: p.followup_count,
       followup_days: p.followup_days, next_action_date: p.next_action_date,
       date_sent: p.date_sent, final_sent: p.final_sent, activity: p.activity,
+      pre_dead_status: p.pre_dead_status,
       dossier: safeParse(p.dossier_json, {})
     }))
     .sort((a, b) => ((a.fit_score == null) - (b.fit_score == null))
@@ -139,9 +143,13 @@ function deleteProspect(id) {
 function updateProspect(id, fields) {
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { updated: false };
+  // Capture the status a prospect had right before being marked dead, on the actual
+  // new->dead transition only (not on repeated writes while already dead), so a dead-pile
+  // review can restore it correctly.
+  if (fields.status === 'dead' && p.status !== 'dead') p.pre_dead_status = p.status;
   const allowed = ['status', 'channel', 'first_draft', 'final_sent', 'date_sent',
     'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity',
-    'gmail_thread_id', 'gmail_message_ids'];
+    'gmail_thread_id', 'gmail_message_ids', 'pre_dead_status'];
   for (const k of allowed) if (k in fields) p[k] = fields[k];
   p.updated_at = new Date().toISOString();
   save();

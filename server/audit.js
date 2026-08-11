@@ -48,12 +48,14 @@ function log({ userId, username, action, prospectId, detail }) {
 }
 
 // Filters: userId (exact match), action (exact match), since (ISO string — entries at or
-// after this instant). Returns newest-first.
-function list({ userId, action, since } = {}) {
+// after this instant), prospectId (exact match — used by the backup dead-pile review to
+// find who last marked a given prospect dead). Returns newest-first.
+function list({ userId, action, since, prospectId } = {}) {
   let out = store.entries;
   if (userId != null && userId !== '') out = out.filter(e => String(e.userId) === String(userId));
   if (action) out = out.filter(e => e.action === action);
   if (since) out = out.filter(e => e.at >= since);
+  if (prospectId != null && prospectId !== '') out = out.filter(e => String(e.prospectId) === String(prospectId));
   return out.slice().reverse();
 }
 

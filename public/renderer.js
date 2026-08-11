@@ -12,6 +12,8 @@ const searchEl   = document.getElementById('searchBox');
 const detailPane = document.getElementById('detailPane');
 const bulkBar    = document.getElementById('bulkBar');
 
+const STATUS_LABELS={new:'Not contacted',sent:'Awaiting reply',replied:'Replied',signed:'Signed',dead:'Dead'};
+function statusLabel(s){return STATUS_LABELS[s]||s;}
 function esc(s){return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function shorten(s,n){s=s||'';return s.length>n?s.slice(0,n-1)+'…':s;}
 function scoreClass(s){return (s==null)?'score-none':'score-'+s;}
@@ -260,7 +262,21 @@ async function openDetail(id){
   document.getElementById('logExternalBtn').addEventListener('click',()=>openLogExternal(id));
   document.getElementById('noteBtn').addEventListener('click',()=>openNote(id));
   document.getElementById('editContactBtn').addEventListener('click',()=>openEditContact(id,c));
-  document.getElementById('statusSelect').addEventListener('change',async(e)=>{ if(e.target.value){ await window.api.updateProspect(id,{status:e.target.value}); loadProspects(); openDetail(id); } });
+  document.getElementById('statusSelect').addEventListener('change',async(e)=>{
+    const newStatus=e.target.value;
+    if(!newStatus)return;
+    const prevStatus=p.status;
+    if(newStatus==='dead'){
+      const reason=window.prompt('Why is this prospect dead? (optional — helps the backup review later)');
+      if(reason&&reason.trim())await window.api.addNote(id,reason.trim());
+    }
+    await window.api.updateProspect(id,{status:newStatus});
+    loadProspects(); openDetail(id);
+    toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel(newStatus)}`,async()=>{
+      await window.api.updateProspect(id,{status:prevStatus});
+      loadProspects(); openDetail(id);
+    });
+  });
   document.getElementById('fuDays').addEventListener('change',async(e)=>{ await window.api.updateProspect(id,{followup_days:parseInt(e.target.value,10)||4}); });
   document.getElementById('deleteBtn').addEventListener('click',async()=>{ if(confirm(`Delete ${d.company_name}? This removes it entirely.`)){ await window.api.deleteProspect(id); detailPane.hidden=true; selectedId=null; loadProspects(); } });
 
@@ -319,6 +335,62 @@ function openEditContact(id,c){
     emailModal.hidden=true; openDetail(id);
   });
   function val(x){return document.getElementById(x).value.trim();}
+}
+
+// ---- Backup: dead-pile review ----
+// Last chance to recover a dead prospect before a backup makes it historical (see
+// server.js's /api/admin/backup/*). Reuses the emailModal shell, widened for this one flow
+// via the existing .modal-wide class rather than adding new markup to index.html.
+async function startBackupFlow(){
+  const deadList=await window.api.getDeadPile();
+  if(!deadList.length){ triggerBackupDownload(); return; }
+  openDeadPileReview(deadList);
+}
+function triggerBackupDownload(){
+  settingsModal.hidden=true;
+  window.location.href='/api/admin/backup/download';
+}
+function openDeadPileReview(list){
+  emailModalTitle.textContent='Dead prospect review';
+  emailModal.hidden=false;
+  emailModal.querySelector('.modal').classList.add('modal-wide');
+  const decided=new Set();
+  function renderRows(){
+    emailModalBody.innerHTML=`
+      <div class="q-hint">Last chance to recover a dead prospect before this backup makes it historical. Restore any that shouldn't be dead — everything else stays dead by default.</div>
+      ${list.map(p=>`
+        <div class="opt" style="cursor:default;display:flex;align-items:center;justify-content:space-between;gap:14px;${decided.has(p.id)?'opacity:0.45;':''}">
+          <div style="flex:1;min-width:0;">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span class="score-chit ${scoreClass(p.fit_score)}">${p.fit_score??'—'}</span>
+              <span class="opt-title">${esc(p.company_name)}</span>
+            </div>
+            <div class="opt-detail">${p.markedBy?`Marked dead by ${esc(p.markedBy)} on ${esc(new Date(p.markedAt).toLocaleDateString())}`:'Marked dead — who/when unknown'}</div>
+            <div class="opt-detail">${p.reason?`Reason: ${esc(p.reason)}`:'No reason recorded'}</div>
+          </div>
+          <div style="display:flex;gap:6px;flex-shrink:0;">
+            <button class="btn btn-sm restoreBtn" data-id="${p.id}" ${decided.has(p.id)?'disabled':''}>Restore</button>
+            <button class="btn btn-ghost btn-sm keepDeadBtn" data-id="${p.id}" ${decided.has(p.id)?'disabled':''}>Keep dead</button>
+          </div>
+        </div>`).join('')}
+      <div class="modal-actions"><button class="btn" id="proceedBackupBtn">Download backup</button>
+        <span class="usage-note">${decided.size}/${list.length} reviewed</span></div>`;
+    emailModalBody.querySelectorAll('.restoreBtn').forEach(btn=>btn.addEventListener('click',async()=>{
+      const id=parseInt(btn.dataset.id,10);
+      const row=list.find(x=>x.id===id);
+      await window.api.updateProspect(id,{status:row.restoreStatus});
+      decided.add(id); renderRows(); loadProspects();
+      toastUndo(`${row.company_name} moved to ${statusLabel(row.restoreStatus)}`,async()=>{
+        await window.api.updateProspect(id,{status:'dead'});
+        loadProspects();
+      });
+    }));
+    emailModalBody.querySelectorAll('.keepDeadBtn').forEach(btn=>btn.addEventListener('click',()=>{
+      decided.add(parseInt(btn.dataset.id,10)); renderRows();
+    }));
+    document.getElementById('proceedBackupBtn').addEventListener('click',triggerBackupDownload);
+  }
+  renderRows();
 }
 
 // ---- Email generation flow ----
@@ -420,7 +492,7 @@ async function renderDraft(draft,usage){
   });
 }
 
-document.getElementById('emailModalClose').addEventListener('click',()=>emailModal.hidden=true);
+document.getElementById('emailModalClose').addEventListener('click',()=>{emailModal.hidden=true;emailModal.querySelector('.modal').classList.remove('modal-wide');});
 
 // ---- Settings ----
 const settingsModal=document.getElementById('settingsModal');
@@ -464,6 +536,18 @@ async function openSettings(){
         <button type="button" class="btn btn-ghost btn-sm" id="googleSecretPeek" aria-label="Show password briefly" style="flex-shrink:0;">Show</button>
       </div>
       <div style="margin-top:8px;"><button class="btn btn-ghost btn-sm" id="saveGoogleCredsBtn">Save Google credentials</button></div></div>
+    <div class="settings-field"><label>Backup</label>
+      <div class="hint">Downloads a zip of all app data — prospects, accounts, catalogs, audit log, config — except your Anthropic API key and Google Client Secret, which never leave the server.</div>
+      <button class="btn btn-sm" id="downloadBackupBtn">Download backup</button></div>
+    <div class="settings-field"><label>Scheduled automatic backup</label>
+      <div class="hint">${gmailStatus.connected?'Emails a backup zip to marcos@govspringlegal.com on this schedule.':'Connect Gmail above to enable scheduled backups.'}</div>
+      <select id="backupFreqSelect" class="tb-select" ${gmailStatus.connected?'':'disabled title="Connect Gmail above first"'}>
+        <option value="off" ${cfg.backupFrequency==='off'?'selected':''}>Off</option>
+        <option value="daily" ${cfg.backupFrequency==='daily'?'selected':''}>Daily</option>
+        <option value="3days" ${cfg.backupFrequency==='3days'?'selected':''}>Every 3 days</option>
+        <option value="weekly" ${cfg.backupFrequency==='weekly'?'selected':''}>Weekly</option>
+      </select>
+      ${cfg.lastBackupAt?`<div class="key-status key-set">Last automatic backup: ${esc(new Date(cfg.lastBackupAt).toLocaleString())}</div>`:''}</div>
     `:''}
     <div class="modal-actions"><button class="btn" id="saveSettingsBtn">Save</button></div>`;
   wirePeekToggle(document.getElementById('apiKeyPeek'),document.getElementById('apiKeyInput'));
@@ -487,6 +571,12 @@ async function openSettings(){
       const clientSecret=document.getElementById('googleClientSecretInput').value.trim();
       if(!clientId&&!clientSecret)return;
       await window.api.saveGoogleCreds(clientId,clientSecret);
+      openSettings();
+    });
+    document.getElementById('downloadBackupBtn').addEventListener('click',startBackupFlow);
+    document.getElementById('backupFreqSelect').addEventListener('change',async(e)=>{
+      try{ await window.api.saveBackupSchedule(e.target.value); }
+      catch(err){ alert(err.message); }
       openSettings();
     });
   }
@@ -769,14 +859,44 @@ document.getElementById('selectAll').addEventListener('change',(e)=>{
 document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',async()=>{
   const action=b.dataset.bulk; const ids=[...selectedIds];
   if(!ids.length)return;
-  if(action==='delete'){ if(!confirm(`Delete ${ids.length} prospect(s)?`))return; for(const id of ids)await window.api.deleteProspect(id); }
-  else { for(const id of ids)await window.api.updateProspect(id,{status:action}); }
+  if(action==='delete'){ if(!confirm(`Delete ${ids.length} prospect(s)?`))return; for(const id of ids)await window.api.deleteProspect(id); selectedIds.clear(); updateBulkBar(); loadProspects(); return; }
+  const prevStatuses={};
+  allProspects.filter(p=>ids.includes(p.id)).forEach(p=>{prevStatuses[p.id]=p.status;});
+  if(action==='dead'){
+    const reason=window.prompt('Why are these prospects dead? (optional — applies to all selected, helps the backup review later)');
+    if(reason&&reason.trim())for(const id of ids)await window.api.addNote(id,reason.trim());
+  }
+  for(const id of ids)await window.api.updateProspect(id,{status:action});
   selectedIds.clear(); updateBulkBar(); loadProspects();
+  toastUndo(`${ids.length} prospect(s) moved to ${statusLabel(action)}`,async()=>{
+    for(const id of ids)await window.api.updateProspect(id,{status:prevStatuses[id]});
+    loadProspects();
+  });
 }));
 
 // live ingest
 window.api.onIngested((r)=>{ if(r.outcome==='ingested'){loadProspects();toast('New prospect added from research');} else if(r.outcome==='duplicate'){toast('Skipped a duplicate');} });
 function toast(msg){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:100;opacity:0;transition:opacity .2s;';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},2200);}
+
+// A bottom-right toast with an Undo button, for status/view changes: shows what happened
+// and gives a few seconds to catch a mistake and reverse it before it's gone.
+function toastUndo(msg,onUndo,ms=6000){
+  let t=document.getElementById('toastUndo');
+  if(!t){
+    t=document.createElement('div');
+    t.id='toastUndo';
+    t.style.cssText='position:fixed;bottom:20px;right:20px;background:var(--ink);color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;z-index:100;display:flex;align-items:center;gap:12px;box-shadow:0 8px 24px rgba(0,0,0,0.25);opacity:0;transition:opacity .2s;';
+    document.body.appendChild(t);
+  }
+  clearTimeout(t._timer);
+  t.innerHTML=`<span>${esc(msg)}</span><button class="btn btn-sm" id="toastUndoBtn" style="flex-shrink:0;">Undo</button>`;
+  t.style.opacity='1';
+  document.getElementById('toastUndoBtn').addEventListener('click',async()=>{
+    t.style.opacity='0'; clearTimeout(t._timer);
+    await onUndo();
+  });
+  t._timer=setTimeout(()=>{t.style.opacity='0';},ms);
+}
 
 // After the Gmail OAuth redirect lands back on the app (see server.js's
 // /api/admin/gmail/callback), surface the result and clean the URL.
