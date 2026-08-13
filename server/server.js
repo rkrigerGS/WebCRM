@@ -777,8 +777,19 @@ function inviteEmailBody(username, link) {
 // Gmail isn't connected, the account is still created (not blocked on an unrelated
 // integration being down) but the response flags that the email couldn't be sent, so the
 // admin knows to use "Resend invite" later.
+//
+// If the request includes a `password` field, skip the invite/email flow entirely and set
+// it directly (users.createUser) — for handing someone a working login when Gmail isn't
+// connected yet to send the invite link. The admin should tell them to change it via
+// "Reset password" in this same panel once they're in.
 app.post('/api/admin/users', requireAdmin, mutating('user.create', async (q, res) => {
-  const { user, inviteToken } = users.createInvitedUser(q.body || {});
+  const body = q.body || {};
+  if (body.password) {
+    const user = users.createUser(body);
+    res.locals.audit = { detail: `Created user "${user.username}" (${user.role}) with a directly-set password` };
+    return { ...user, inviteEmailSent: false, inviteEmailError: '' };
+  }
+  const { user, inviteToken } = users.createInvitedUser(body);
   let inviteEmailSent = false, inviteEmailError = '';
   if (gmail.isConnected()) {
     try {
