@@ -231,6 +231,9 @@ function resetPassword(id, newPassword) {
   if (!u) throw err(404, 'User not found');
   if (!newPassword || newPassword.length < MIN_PASSWORD_LENGTH) throw err(400, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
   u.passwordHash = hashPassword(newPassword);
+  u.pending = false;
+  u.inviteToken = '';
+  u.inviteExpiresAt = '';
   save();
   return safe(u);
 }
