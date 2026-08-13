@@ -24,7 +24,10 @@ const backup = require('./backup');
 const digest = require('./digest');
 
 const APP_DIR = path.join(__dirname, '..');
-const DATA_DIR = path.join(APP_DIR, 'data');
+// On Railway, RAILWAY_VOLUME_MOUNT_PATH points at the persistent volume (e.g. /data) —
+// use it when present so restarts/redeploys don't wipe users, prospects, and the audit
+// log. Falls back to APP_DIR/data for local dev, where there is no volume.
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(APP_DIR, 'data');
 const PORT = process.env.PORT || 3000;
 
 // ---- Startup ----
