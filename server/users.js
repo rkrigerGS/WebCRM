@@ -169,6 +169,37 @@ function setEmail(id, email) {
   return safe(u);
 }
 
+// A single, no-password "test" account for handing the app to someone quickly. It has no
+// usable password (same empty-hash trick as createInvitedUser) and is instead reached via
+// a fixed random URL slug (see /api/auth/test-login/:slug in server.js). Idempotent: if
+// the account already exists (e.g. from a prior deploy), returns it and its existing slug
+// unchanged rather than minting a new one, so the URL you shared with someone keeps working.
+function ensureTestUser() {
+  let u = findByUsername('test');
+  if (u) return { user: safe(u), slug: u.testLoginSlug };
+  const slug = crypto.randomBytes(6).toString('base64url');
+  u = {
+    id: store.nextId++,
+    username: 'test',
+    usernameLower: 'test',
+    passwordHash: '',
+    role: 'admin',
+    email: '',
+    active: true,
+    testUser: true,
+    noLog: true,
+    testLoginSlug: slug,
+    createdAt: new Date().toISOString()
+  };
+  store.users.push(u);
+  save();
+  return { user: safe(u), slug };
+}
+
+function findByTestLoginSlug(slug) {
+  return store.users.find(u => u.testUser && u.testLoginSlug && u.testLoginSlug === slug) || null;
+}
+
 function checkLogin(username, password) {
   const u = findByUsername(username);
   if (!u || !u.active) return null;
@@ -208,12 +239,13 @@ function resetPassword(id, newPassword) {
 // (a live, single-use credential — same trust boundary as a password) — pending/
 // inviteExpiresAt are safe to show (they're what the Users panel needs to offer "resend").
 function safe(u) {
-  const { passwordHash, usernameLower, inviteToken, ...rest } = u;
+  const { passwordHash, usernameLower, inviteToken, testLoginSlug, ...rest } = u;
   return rest;
 }
 
 module.exports = {
   init, hasAnyUser, createUser, checkLogin, findById, findByUsername,
   listUsers, setActive, setRole, setEmail, resetPassword, MIN_PASSWORD_LENGTH,
-  createInvitedUser, resendInvite, acceptInvite, findByInviteToken
+  createInvitedUser, resendInvite, acceptInvite, findByInviteToken,
+  ensureTestUser, findByTestLoginSlug
 };
