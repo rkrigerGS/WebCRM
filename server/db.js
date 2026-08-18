@@ -8,9 +8,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const store_ = require('./store');
 
 let dbPath;
-let store = { prospects: [], exclusions: [], nextId: 1, ingest_log: [] };
+let store = { prospects: [], exclusions: [], nextId: 1 };
 
 function init(dataDir) {
   fs.mkdirSync(dataDir, { recursive: true });
@@ -20,23 +21,24 @@ function init(dataDir) {
 }
 
 function load() {
-  try {
-    store = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
-    // Ensure all expected top-level keys exist (forward-compatible with older files).
-    store.prospects = store.prospects || [];
-    store.exclusions = store.exclusions || [];
-    store.ingest_log = store.ingest_log || [];
-    store.nextId = store.nextId || (store.prospects.reduce((m, p) => Math.max(m, p.id), 0) + 1);
-  } catch {
-    save(); // no file yet: write the empty store
-  }
+  const raw = store_.readJSON(dbPath); // throws on a corrupt/unreadable file
+  if (!raw) return save(); // genuinely no file yet: write the empty store
+  store = raw;
+  // Ensure all expected top-level keys exist (forward-compatible with older files).
+  store.prospects = store.prospects || [];
+  store.exclusions = store.exclusions || [];
+  store.nextId = store.nextId || store_.nextIdFrom(store.prospects);
 }
 
-// Atomic save: write to a temp file then rename over the real one.
 function save() {
-  const tmp = dbPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8');
-  fs.renameSync(tmp, dbPath);
+  store_.writeJSON(dbPath, store);
+}
+
+// Required lazily, inside the function, so db.js and config.js don't have to agree on
+// init() order at require time.
+function defaultFollowupDays() {
+  const n = Number(require('./config').get().defaultFollowupDays);
+  return Number.isFinite(n) && n > 0 ? n : 4;
 }
 
 // ---- Prospect shape ----
@@ -46,7 +48,8 @@ function blankProspect() {
     id: null, uei: null, company_name: '', city_state: '', industry: '',
     fit_score: null, designations: '', dossier_json: '',
     status: 'new', channel: '', first_draft: '', final_sent: '',
-    date_sent: '', followup_count: 0, followup_days: 4, next_action_date: '',
+    // Honours the Settings value at ingest time; 4 only if config is unreadable or unset.
+    date_sent: '', followup_count: 0, followup_days: defaultFollowupDays(), next_action_date: '',
     newsletter: 0, activity: '[]',
     // Gmail threading: the thread id Gmail assigned on the first send, and the RFC
     // "Message-ID" header value(s) sent so far in that thread (JSON array, oldest
@@ -91,12 +94,10 @@ function ingestDossier(dossier, filename) {
   const uei = dossier.uei || null;
 
   if (uei && store.prospects.some(p => p.uei === uei)) {
-    logIngest(filename, uei, 'duplicate', 'UEI already in CRM');
     return { outcome: 'duplicate', uei };
   }
   const excludedBy = isExcluded(dossier);
   if (excludedBy) {
-    logIngest(filename, uei, 'excluded', `matched exclusion: ${excludedBy.value}`);
     return { outcome: 'excluded', uei };
   }
 
@@ -114,14 +115,16 @@ function ingestDossier(dossier, filename) {
   p.dossier_json = JSON.stringify(dossier);
   store.prospects.push(p);
   save();
-  logIngest(filename, uei, 'ingested', null);
   return { outcome: 'ingested', uei, id: p.id };
 }
 
-function logIngest(filename, uei, outcome, detail) {
-  store.ingest_log.push({ filename: filename || '', uei: uei || '', outcome, detail: detail || '', at: new Date().toISOString() });
-  if (store.ingest_log.length > 1000) store.ingest_log = store.ingest_log.slice(-1000);
-}
+// REMOVED: logIngest() and the store.ingest_log array it appended to.
+// Nothing ever read it — no route, no view, no report — and it grew inside the same
+// govspring.json that holds every prospect, so each ingest made every subsequent save of
+// the whole database larger for no benefit. Every ingest is already recorded in the audit
+// log (see audit.js), which is where a human actually looks. An existing ingest_log key in
+// govspring.json is left untouched on disk: load() no longer normalizes it, but it also
+// never deletes it, so nothing already stored is lost.
 
 // ---- Reads ----
 
@@ -138,6 +141,9 @@ function listProspects() {
       pre_dead_status: p.pre_dead_status,
       awaiting_reply_review: p.awaiting_reply_review, last_reply_at: p.last_reply_at,
       last_reply_from: p.last_reply_from, last_reply_snippet: p.last_reply_snippet,
+      // The reply poller dedupes on this: without it in the projection, the reply screen
+      // can't tell an already-reviewed message from a new one.
+      last_reply_message_id: p.last_reply_message_id,
       dormant_until: p.dormant_until, dormant_returned: p.dormant_returned,
       gmail_thread_id: p.gmail_thread_id, gmail_message_ids: p.gmail_message_ids,
       created_at: p.created_at,
@@ -178,10 +184,26 @@ function updateProspect(id, fields) {
       p.dormant_until = '';
     }
   }
+  // pre_dead_status is deliberately NOT writable from here: it is bookkeeping this
+  // function maintains itself (above), and letting a request body set it would let a
+  // client rewrite where the dead-pile review restores a prospect to.
   const allowed = ['status', 'channel', 'first_draft', 'final_sent', 'date_sent',
     'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity',
-    'gmail_thread_id', 'gmail_message_ids', 'pre_dead_status'];
+    'gmail_thread_id', 'gmail_message_ids'];
   for (const k of allowed) if (k in fields) p[k] = fields[k];
+
+  // Read-modify-write operations, applied here against the live record rather than from a
+  // snapshot the caller read earlier. The email send path reads the prospect, awaits the
+  // Gmail API for several seconds, then writes — long enough for a second send to land in
+  // between, and a caller-computed `followup_count: n + 1` or a rebuilt message-id array
+  // would then silently discard the other one's increment.
+  if (fields.incFollowupCount) p.followup_count = (Number(p.followup_count) || 0) + 1;
+  if (fields.appendMessageId) {
+    const ids = safeParse(p.gmail_message_ids, []);
+    if (!ids.includes(fields.appendMessageId)) ids.push(fields.appendMessageId);
+    p.gmail_message_ids = JSON.stringify(ids);
+  }
+
   p.updated_at = new Date().toISOString();
   save();
   return { updated: true };
@@ -236,12 +258,13 @@ function setDormant(id, until) {
 }
 
 // Called by server.js's dormant-return interval for every dormant prospect whose
-// dormant_until has passed. Always returns to 'sent' — that's what the Due for follow-up
+// dormant_until has passed. Returns to whatever status it held before going dormant
+// (captured by setDormant), falling back to 'sent' — which is what the Due for follow-up
 // view requires to surface it — tagged dormant_returned until the next status change.
 function returnFromDormant(id) {
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { ok: false };
-  p.status = 'sent';
+  p.status = p.pre_dormant_status && p.pre_dormant_status !== 'dormant' ? p.pre_dormant_status : 'sent';
   p.dormant_until = '';
   p.dormant_returned = true;
   p.updated_at = new Date().toISOString();
@@ -265,6 +288,12 @@ function logExternal(id, { channel, text }) {
   p.status = 'sent';
   p.channel = channel;
   p.date_sent = today;
+  // Logging fresh outreach is a deliberate status change, so it acknowledges the same
+  // attention flags updateProspect() clears — otherwise a prospect stays flagged as
+  // awaiting reply review, or keeps a stale dormant tag, after being contacted again.
+  p.awaiting_reply_review = false;
+  p.dormant_returned = false;
+  p.dormant_until = '';
   if (channel === 'email' && !p.final_sent) p.final_sent = text;
   p.updated_at = new Date().toISOString();
   save();

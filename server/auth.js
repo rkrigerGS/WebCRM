@@ -22,7 +22,8 @@ function init(dataDir) {
     secret = fs.readFileSync(secretPath, 'utf8');
   } else {
     secret = crypto.randomBytes(32).toString('hex');
-    fs.writeFileSync(secretPath, secret, 'utf8');
+    // 0600: this file forges any session if read, so no other account on the host needs it.
+    fs.writeFileSync(secretPath, secret, { encoding: 'utf8', mode: 0o600 });
   }
 }
 

@@ -16,44 +16,67 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const store = require('./store');
+const audit = require('./audit');
 
 const SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
 const LABEL_NAME = 'WebApp Outreach';
 const TOKEN_REFRESH_SKEW_MS = 2 * 60 * 1000; // refresh 2 minutes before actual expiry
+const REQUEST_TIMEOUT_MS = 20000;            // see requestJSON()
 
 let tokenPath;
 let token = null; // { refreshToken, accessToken, accessTokenExpiry, email, labelId } | null
+let loadError = ''; // non-empty when the token file exists but could not be read
 
 function init(dataDir) {
   tokenPath = path.join(dataDir, 'gmail-token.json');
   load();
 }
 
+// Unlike the database, an unreadable token file is not worth refusing to boot over: the
+// worst case is that Gmail shows as disconnected and an admin reconnects, which rewrites
+// the file anyway. But it must be loud and it must be visible in Settings — "silently
+// disconnected, no reason given" is exactly the failure mode the team reported.
 function load() {
+  loadError = '';
   try {
-    token = JSON.parse(fs.readFileSync(tokenPath, 'utf8'));
-  } catch {
+    token = store.readJSON(tokenPath);
+  } catch (e) {
     token = null;
+    // store.readJSON's message is written for the stores that refuse to start; say what
+    // actually happens here instead.
+    loadError = `${tokenPath} could not be read (${e.code || 'invalid JSON'}). Gmail will show as disconnected until an admin reconnects it in Settings.`;
+    console.error('GMAIL TOKEN UNREADABLE —', loadError, '\n  underlying:', e.message);
   }
 }
 
 function save() {
-  const tmp = tokenPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(token, null, 2), 'utf8');
-  fs.renameSync(tmp, tokenPath);
+  store.writeJSON(tokenPath, token); // atomic (temp + fsync + rename), same as every other store
 }
 
 function clear() {
   token = null;
+  loadError = '';
   try { fs.unlinkSync(tokenPath); } catch {}
 }
 
+// Both halves are required to actually send: the stored refresh token AND the Google client
+// ID/secret it must be exchanged against. Reporting "connected" on the token alone let the
+// send screen enable itself after the credentials were cleared or rotated, and every send
+// then failed at the refresh step.
 function isConnected() {
-  return !!(token && token.refreshToken);
+  return !!(token && token.refreshToken) && config.hasGoogleCreds();
 }
 
 function getStatus() {
-  return { connected: isConnected(), email: (token && token.email) || '' };
+  return {
+    connected: isConnected(),
+    email: (token && token.email) || '',
+    // Distinguishes "never connected" from "connected, but the Google client credentials
+    // are gone" — the second is fixed in Settings, not by reconnecting.
+    needsCreds: !!(token && token.refreshToken) && !config.hasGoogleCreds(),
+    loadError
+  };
 }
 
 function disconnect() {
@@ -61,13 +84,20 @@ function disconnect() {
 }
 
 // ---- Raw HTTPS JSON helper (mirrors emailEngine.js's callClaude request shape) ----
+// Node's HTTPS client has no default socket idle timeout, so without the timeout below a
+// half-open connection to Google leaves this promise pending forever: the staffer's Send
+// spinner never stops and they have no way to know whether the mail went out.
 function requestJSON({ hostname, path: p, method, headers, body }) {
   return new Promise((resolve, reject) => {
     const payload = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : null;
     const req = https.request({
-      hostname, path: p, method,
+      hostname, path: p, method, timeout: REQUEST_TIMEOUT_MS,
       headers: { ...(headers || {}), ...(payload ? { 'content-length': Buffer.byteLength(payload) } : {}) }
     }, (res) => {
+      // Decode as UTF-8 across chunk boundaries. Concatenating raw Buffers into a string
+      // splits multi-byte characters at TLS record edges, which corrupted reply text on the
+      // review screen and in the text handed to Claude for the draft.
+      res.setEncoding('utf8');
       let data = '';
       res.on('data', (d) => data += d);
       res.on('end', () => {
@@ -78,10 +108,69 @@ function requestJSON({ hostname, path: p, method, headers, body }) {
         reject(Object.assign(new Error((json.error && (json.error.message || json.error)) || `HTTP ${res.statusCode}`), { status: res.statusCode, body: json }));
       });
     });
+    req.on('timeout', () => req.destroy(new Error(
+      `Gmail request timed out after ${REQUEST_TIMEOUT_MS / 1000}s (${method} ${String(p).split('?')[0]}). ` +
+      `The email may or may not have been sent — check the Sent folder before retrying.`
+    )));
     req.on('error', reject);
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+// One call against the Gmail API with a valid access token. A 401 here means the token was
+// invalidated server-side before its nominal expiry (a password change, a revoked session,
+// a clock ahead of Google's); one forced refresh and retry turns that from a hard failure
+// into a recovery the user never sees. `build(accessToken)` returns the requestJSON options.
+async function callGmail(build) {
+  const accessToken = await ensureAccessToken();
+  try {
+    return await requestJSON(build(accessToken));
+  } catch (e) {
+    if (e.status !== 401) throw e;
+    return requestJSON(build(await ensureAccessToken({ force: true })));
+  }
+}
+
+// ---- RFC 2047 header encoding ----
+// A header value containing any byte above 0x7F is invalid under RFC 5322 if emitted raw.
+// Gmail may pass it through, but strict clients (Outlook, which government recipients
+// predominantly use) then render mojibake in the subject line. Every subject the app builds
+// contains an em dash, so this is not a corner case.
+function encodeHeader(value) {
+  // Interior CR/LF would split the header block and make Gmail reject the message with no
+  // usable explanation — a subject pasted from a document is enough to trigger it.
+  const clean = String(value == null ? '' : value).replace(/[\r\n]+/g, ' ').trim();
+  if (!/[^\x00-\x7F]/.test(clean)) return clean;
+  // RFC 2047 caps one encoded-word at 75 characters, so long values become several words
+  // joined by a folding CRLF+space. Chunks are cut on character boundaries, never mid-
+  // sequence, so no character is ever split across two words.
+  const words = [];
+  let chunk = '';
+  for (const ch of clean) {
+    if (Buffer.byteLength(chunk + ch, 'utf8') > 36) { words.push(chunk); chunk = ''; }
+    chunk += ch;
+  }
+  if (chunk) words.push(chunk);
+  return words.map(w => '=?UTF-8?B?' + Buffer.from(w, 'utf8').toString('base64') + '?=').join('\r\n ');
+}
+
+// Address headers differ: only the display name may be encoded, since an encoded address
+// itself is not a valid address. "Ana Muñoz <ana@x.gov>" → "=?UTF-8?B?…?= <ana@x.gov>".
+// A bare address is passed through untouched (minus CR/LF) rather than mangled.
+function encodeAddress(value) {
+  const clean = String(value == null ? '' : value).replace(/[\r\n]+/g, ' ').trim();
+  const m = clean.match(/^(.*?)\s*<([^>]+)>$/);
+  if (!m) return clean;
+  const name = m[1].replace(/^"|"$/g, '').trim();
+  return (name ? encodeHeader(name) + ' ' : '') + `<${m[2].trim()}>`;
+}
+
+// Bodies go out base64-encoded rather than raw. That fixes three RFC problems in one line:
+// 8-bit characters under a 7bit default encoding, the 998-octet line limit, and bare LFs.
+function encodeBody(text) {
+  return Buffer.from(String(text == null ? '' : text), 'utf8')
+    .toString('base64').replace(/(.{76})/g, '$1\r\n');
 }
 
 function requireCreds() {
@@ -142,9 +231,12 @@ async function exchangeCode(code, redirectUri) {
   }
 }
 
-async function ensureAccessToken() {
-  if (!isConnected()) throw new Error('Gmail is not connected.');
-  if (token.accessToken && token.accessTokenExpiry && Date.now() < token.accessTokenExpiry - TOKEN_REFRESH_SKEW_MS) {
+// force: true skips the cached access token — used by callGmail() after a 401.
+async function ensureAccessToken({ force = false } = {}) {
+  // Checked separately from isConnected() so a missing client ID/secret produces
+  // requireCreds()'s specific message instead of a generic "not connected".
+  if (!token || !token.refreshToken) throw new Error('Gmail is not connected.');
+  if (!force && token.accessToken && token.accessTokenExpiry && Date.now() < token.accessTokenExpiry - TOKEN_REFRESH_SKEW_MS) {
     return token.accessToken;
   }
   const { clientId, clientSecret } = requireCreds();
@@ -166,6 +258,15 @@ async function ensureAccessToken() {
     // is genuinely gone and re-authorizing is the only fix, so reflect that in status
     // rather than leaving a connection that will fail on every future send.
     if (e.body && e.body.error === 'invalid_grant') {
+      // This disconnects Gmail for the whole team, and it is usually reached from the
+      // background reply poller, whose only handler is a console.warn. Record it in the
+      // audit trail with Google's own explanation so there is something to look at
+      // afterwards besides one line of stdout.
+      const why = e.body.error_description || e.body.error || '';
+      console.error('GMAIL DISCONNECTED — Google rejected the refresh token:', why);
+      try {
+        audit.log({ userId: null, username: 'system (gmail)', action: 'gmail.revoked', detail: why });
+      } catch { /* never let audit failure mask the real error */ }
       clear();
       throw new Error('Gmail access was revoked. Reconnect in Settings.');
     }
@@ -175,19 +276,19 @@ async function ensureAccessToken() {
 
 // ---- Label: get-or-create "WebApp Outreach", cached on the token record ----
 
-async function ensureLabel(accessToken) {
+async function ensureLabel() {
   if (token.labelId) return token.labelId;
-  const list = await requestJSON({
+  const list = await callGmail(accessToken => ({
     hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/labels', method: 'GET',
     headers: { authorization: `Bearer ${accessToken}` }
-  });
+  }));
   const existing = (list.labels || []).find(l => l.name === LABEL_NAME);
   if (existing) { token.labelId = existing.id; save(); return existing.id; }
-  const created = await requestJSON({
+  const created = await callGmail(accessToken => ({
     hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/labels', method: 'POST',
     headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
     body: { name: LABEL_NAME, labelListVisibility: 'labelShow', messageListVisibility: 'show' }
-  });
+  }));
   token.labelId = created.id;
   save();
   return created.id;
@@ -197,16 +298,17 @@ async function ensureLabel(accessToken) {
 
 function buildRawMessage({ from, to, cc, subject, bodyText, inReplyTo, references }) {
   const headers = [
-    `From: ${from}`,
-    `To: ${to}`,
-    ...(cc && cc.length ? [`Cc: ${cc.join(', ')}`] : []),
-    `Subject: ${subject}`,
-    ...(inReplyTo ? [`In-Reply-To: ${inReplyTo}`] : []),
-    ...(references ? [`References: ${references}`] : []),
+    `From: ${encodeAddress(from)}`,
+    `To: ${encodeAddress(to)}`,
+    ...(cc && cc.length ? [`Cc: ${cc.map(encodeAddress).join(', ')}`] : []),
+    `Subject: ${encodeHeader(subject)}`,
+    ...(inReplyTo ? [`In-Reply-To: ${encodeHeader(inReplyTo)}`] : []),
+    ...(references ? [`References: ${encodeHeader(references)}`] : []),
     'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset="UTF-8"'
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: base64'
   ];
-  const raw = headers.join('\r\n') + '\r\n\r\n' + bodyText;
+  const raw = headers.join('\r\n') + '\r\n\r\n' + encodeBody(bodyText);
   return Buffer.from(raw, 'utf8').toString('base64url');
 }
 
@@ -216,18 +318,17 @@ function buildRawMessage({ from, to, cc, subject, bodyText, inReplyTo, reference
 // fetched back, the send has still succeeded and the function still returns normally
 // with gmailMessageId as ''.
 async function sendEmail({ to, cc, subject, bodyText, threadId, inReplyTo, references }) {
-  const accessToken = await ensureAccessToken();
-  const from = (token.email || 'marcos@govspringlegal.com');
+  const from = (token && token.email) || 'marcos@govspringlegal.com';
   const raw = buildRawMessage({ from, to, cc, subject, bodyText, inReplyTo, references });
 
   const sendBody = { raw };
   if (threadId) sendBody.threadId = threadId;
 
-  const sent = await requestJSON({
+  const sent = await callGmail(accessToken => ({
     hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST',
     headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
     body: sendBody
-  });
+  }));
 
   const result = { gmailThreadId: sent.threadId, gmailMessageId: '' };
 
@@ -236,11 +337,11 @@ async function sendEmail({ to, cc, subject, bodyText, threadId, inReplyTo, refer
   // applying the label only affects Gmail-side organization — neither should make this
   // call report failure for an email that actually sent.
   try {
-    const full = await requestJSON({
+    const full = await callGmail(accessToken => ({
       hostname: 'gmail.googleapis.com',
       path: `/gmail/v1/users/me/messages/${sent.id}?format=metadata&metadataHeaders=Message-ID`,
       method: 'GET', headers: { authorization: `Bearer ${accessToken}` }
-    });
+    }));
     const header = ((full.payload && full.payload.headers) || []).find(h => h.name === 'Message-ID');
     if (header) result.gmailMessageId = header.value;
   } catch (e) {
@@ -248,12 +349,12 @@ async function sendEmail({ to, cc, subject, bodyText, threadId, inReplyTo, refer
   }
 
   try {
-    const labelId = await ensureLabel(accessToken);
-    await requestJSON({
+    const labelId = await ensureLabel();
+    await callGmail(accessToken => ({
       hostname: 'gmail.googleapis.com', path: `/gmail/v1/users/me/messages/${sent.id}/modify`, method: 'POST',
       headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
       body: { addLabelIds: [labelId] }
-    });
+    }));
   } catch (e) {
     console.warn('Sent via Gmail, but could not apply the "WebApp Outreach" label:', e.message);
   }
@@ -267,22 +368,26 @@ async function sendEmail({ to, cc, subject, bodyText, threadId, inReplyTo, refer
 // that function's shape.
 function buildStandaloneMessage({ from, to, subject, bodyText, attachment }) {
   if (!attachment) {
-    const headers = [`From: ${from}`, `To: ${to}`, `Subject: ${subject}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset="UTF-8"'];
-    return Buffer.from(headers.join('\r\n') + '\r\n\r\n' + bodyText, 'utf8').toString('base64url');
+    const headers = [
+      `From: ${encodeAddress(from)}`, `To: ${encodeAddress(to)}`, `Subject: ${encodeHeader(subject)}`,
+      'MIME-Version: 1.0', 'Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64'
+    ];
+    return Buffer.from(headers.join('\r\n') + '\r\n\r\n' + encodeBody(bodyText), 'utf8').toString('base64url');
   }
   const boundary = 'gs_mail_' + Date.now().toString(36);
   const headers = [
-    `From: ${from}`,
-    `To: ${to}`,
-    `Subject: ${subject}`,
+    `From: ${encodeAddress(from)}`,
+    `To: ${encodeAddress(to)}`,
+    `Subject: ${encodeHeader(subject)}`,
     'MIME-Version: 1.0',
     `Content-Type: multipart/mixed; boundary="${boundary}"`
   ];
   const bodyPart = [
     `--${boundary}`,
     'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: base64',
     '',
-    bodyText,
+    encodeBody(bodyText),
     ''
   ].join('\r\n');
   const attachmentPart = [
@@ -302,14 +407,13 @@ function buildStandaloneMessage({ from, to, subject, bodyText, attachment }) {
 // No threading, no CC, no label — used for the scheduled backup email (with an
 // attachment) and the user-invitation email (without one). Neither is outreach.
 async function sendStandaloneEmail({ to, subject, bodyText, attachment }) {
-  const accessToken = await ensureAccessToken();
-  const from = (token.email || 'marcos@govspringlegal.com');
+  const from = (token && token.email) || 'marcos@govspringlegal.com';
   const raw = buildStandaloneMessage({ from, to, subject, bodyText, attachment });
-  return requestJSON({
+  return callGmail(accessToken => ({
     hostname: 'gmail.googleapis.com', path: '/gmail/v1/users/me/messages/send', method: 'POST',
     headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
     body: { raw }
-  });
+  }));
 }
 
 function sendAttachmentEmail({ to, subject, bodyText, attachment }) {
@@ -351,12 +455,11 @@ function extractPlainText(payload) {
 // poll in server.js to detect new inbound messages without the cost of a full fetch per
 // message on every poll cycle.
 async function getThreadReplies(threadId) {
-  const accessToken = await ensureAccessToken();
-  const thread = await requestJSON({
+  const thread = await callGmail(accessToken => ({
     hostname: 'gmail.googleapis.com',
-    path: `/gmail/v1/users/me/threads/${threadId}?format=metadata&metadataHeaders=From&metadataHeaders=Date`,
+    path: `/gmail/v1/users/me/threads/${encodeURIComponent(threadId)}?format=metadata&metadataHeaders=From&metadataHeaders=Date`,
     method: 'GET', headers: { authorization: `Bearer ${accessToken}` }
-  });
+  }));
   return (thread.messages || []).map(m => {
     const headers = (m.payload && m.payload.headers) || [];
     const from = (headers.find(h => h.name === 'From') || {}).value || '';
@@ -367,15 +470,21 @@ async function getThreadReplies(threadId) {
 // Full body fetch — only called on demand when the reply review screen opens, not during
 // polling, so polling stays cheap.
 async function getMessageBody(messageId) {
-  const accessToken = await ensureAccessToken();
-  const full = await requestJSON({
-    hostname: 'gmail.googleapis.com', path: `/gmail/v1/users/me/messages/${messageId}?format=full`,
+  const full = await callGmail(accessToken => ({
+    hostname: 'gmail.googleapis.com', path: `/gmail/v1/users/me/messages/${encodeURIComponent(messageId)}?format=full`,
     method: 'GET', headers: { authorization: `Bearer ${accessToken}` }
-  });
+  }));
   return extractPlainText(full.payload);
+}
+
+// The address the app sends from — the reply poller needs it to tell our own messages in a
+// thread apart from the prospect's.
+function connectedEmail() {
+  return (token && token.email) || '';
 }
 
 module.exports = {
   init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail,
-  sendAttachmentEmail, sendInviteEmail, sendStandaloneEmail, getThreadReplies, getMessageBody
+  sendAttachmentEmail, sendInviteEmail, sendStandaloneEmail, getThreadReplies, getMessageBody,
+  connectedEmail
 };

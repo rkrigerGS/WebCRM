@@ -30,11 +30,22 @@ function toQuery(params) {
   return qs ? '?' + qs : '';
 }
 
+// Opened on first use and reused for every event type. The browser reconnects it on its
+// own if the connection drops, so listeners registered here stay live across a restart.
+let eventStream = null;
+function onServerEvent(name, cb) {
+  if (!eventStream) eventStream = new EventSource('/api/events');
+  eventStream.addEventListener(name, (e) => { try { cb(JSON.parse(e.data)); } catch {} });
+}
+
 window.api = {
   listProspects:  ()          => getJSON('/api/prospects'),
   getProspect:    (id)        => getJSON('/api/prospects/' + id),
   updateProspect: (id, f)     => sendJSON('/api/prospects/' + id, 'PATCH', f),
   deleteProspect: (id)        => sendJSON('/api/prospects/' + id, 'DELETE'),
+  // No UI calls getStats, readCatalog, writeCatalog or authStatus today — the catalog
+  // editor screen was never built, so the two catalogs are edited on disk (or through
+  // these from the console). Kept because the routes exist and are admin-guarded.
   getStats:       ()          => getJSON('/api/stats'),
 
   addNote:        (id, text)  => sendJSON('/api/prospects/' + id + '/note', 'POST', { text }),
@@ -72,16 +83,14 @@ window.api = {
   readCatalog:    (which)     => getJSON('/api/catalog/' + which).then(r => r.text),
   writeCatalog:   (which, t)  => sendJSON('/api/catalog/' + which, 'POST', { text: t }),
 
-  // Live updates: the server pushes an SSE event when a dossier is ingested.
-  onIngested: (cb) => {
-    const es = new EventSource('/api/events');
-    es.addEventListener('ingested', (e) => { try { cb(JSON.parse(e.data)); } catch {} });
-  },
-  onReply: (cb) => {
-    const es = new EventSource('/api/events');
-    es.addEventListener('reply', (e) => { try { cb(JSON.parse(e.data)); } catch {} });
-    es.addEventListener('dormant-return', (e) => { try { cb(JSON.parse(e.data)); } catch {} });
-  },
+  // Live updates over SSE. One stream per tab, shared by every listener below: each
+  // EventSource is a held-open connection on the server, and opening three for one stream
+  // tripled that cost for no benefit.
+  onIngested:     (cb) => onServerEvent('ingested', cb),
+  // A dossier the watcher could not read or parse. Separate from onIngested so a failure
+  // can be shown differently from a success.
+  onIngestFailed: (cb) => onServerEvent('ingest-failed', cb),
+  onReply: (cb) => { onServerEvent('reply', cb); onServerEvent('dormant-return', cb); },
 
   authStatus: ()                     => getJSON('/api/auth/status'),
   authLogout: ()                     => sendJSON('/api/auth/logout', 'POST'),

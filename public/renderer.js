@@ -14,7 +14,27 @@ const bulkBar    = document.getElementById('bulkBar');
 
 const STATUS_LABELS={new:'Not contacted',sent:'Awaiting reply',replied:'Replied',signed:'Signed',dead:'Dead',dormant:'Dormant'};
 function statusLabel(s){return STATUS_LABELS[s]||s;}
-function esc(s){return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+// Asked from four places (detail pane, reply review, dead-pile review, bulk bar); kept
+// here so the wording can't drift apart again.
+const DEAD_REASON_PROMPT='Why is this prospect dead? (optional — helps the backup review later)';
+const DEAD_REASON_PROMPT_BULK='Why are these prospects dead? (optional — applies to all selected, helps the backup review later)';
+// Quotes matter as much as angle brackets here: esc() is used inside quoted HTML
+// attributes in several places, and some of those values come from outside the team — the
+// From: header of an inbound email, uploaded dossier JSON — so an unescaped " would close
+// the attribute and let whatever follows run as markup in a logged-in session.
+function esc(s){return (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+// Escaping characters does not make a URL safe: `javascript:…` passes through esc()
+// untouched and runs script in this origin when clicked. Only web and mail links are
+// rendered as links; anything else returns '' and the caller shows it as plain text, so
+// the user still sees the value and can judge it.
+function safeUrl(u){
+  const raw=String(u==null?'':u).trim();
+  try{ return ['http:','https:','mailto:'].includes(new URL(raw,window.location.origin).protocol)?raw:''; }
+  catch{ return ''; }
+}
+// Every "Loading…" placeholder needs somewhere to land when the request fails, or the
+// panel sits on that word forever and looks like a hang.
+function errorBlock(msg){return `<div class="error-note">${esc(msg)}</div>`;}
 function shorten(s,n){s=s||'';return s.length>n?s.slice(0,n-1)+'…':s;}
 function scoreClass(s){return (s==null)?'score-none':'score-'+s;}
 function todayStr(){return new Date().toISOString().slice(0,10);}
@@ -96,6 +116,12 @@ function renderList(){
   const viewFiltered = allProspects.filter(matchesView);
   const filtered = sortList(applyToolbar(viewFiltered));
 
+  // Selection is only ever meaningful for rows the user can see. Without this, selecting
+  // rows in one view and then switching view or filter left them selected but invisible —
+  // and "Delete 5 prospect(s)?" would permanently delete five records nobody was looking at.
+  const visibleIds = new Set(filtered.map(p=>p.id));
+  for(const id of [...selectedIds]) if(!visibleIds.has(id)) selectedIds.delete(id);
+
   emptyEl.hidden = filtered.length!==0;
 
   rowsEl.innerHTML = filtered.map(p=>{
@@ -118,7 +144,7 @@ function renderList(){
       <td class="col-score"><span class="score-chit ${scoreClass(p.fit_score)}">${p.fit_score??'—'}</span></td>
       <td><div class="company-cell">${esc(p.company_name)}</div>${p.industry?`<div class="company-sub">${esc(shorten(p.industry,42))}</div>`:''}</td>
       <td>${esc(p.city_state)}</td>
-      <td><span class="status-pill status-${p.status}">${esc(p.status)}</span></td>
+      <td><span class="status-pill status-${p.status}">${esc(statusLabel(p.status))}</span></td>
       <td><span class="flags">${flags.join('')}</span></td>
       <td class="fu-cell">${fu}</td>
     </tr>`;
@@ -135,11 +161,20 @@ function renderList(){
   rowsEl.querySelectorAll('.rowcheck').forEach(cb=>{
     cb.addEventListener('change',()=>{ const id=parseInt(cb.dataset.id,10); if(cb.checked)selectedIds.add(id);else selectedIds.delete(id); updateBulkBar(); });
   });
+  updateBulkBar();
 }
 
 function updateBulkBar(){
   bulkBar.hidden = selectedIds.size===0;
   if(selectedIds.size) document.getElementById('bulkCount').textContent = `${selectedIds.size} selected`;
+  // Keep the header checkbox honest: it used to stay ticked after a bulk action cleared
+  // the selection, and stay unticked after every visible row had been ticked by hand.
+  const all=document.getElementById('selectAll');
+  if(all){
+    const boxes=rowsEl.querySelectorAll('.rowcheck');
+    all.checked = boxes.length>0 && selectedIds.size===boxes.length;
+    all.indeterminate = selectedIds.size>0 && selectedIds.size<boxes.length;
+  }
 }
 
 async function refreshCountsAndFilters(){
@@ -186,12 +221,16 @@ async function loadProspects(){
 
 // ---- Detail pane ----
 
-function field(k,v,link){ if(!v)return''; const val=link?`<a href="${esc(v)}" target="_blank" rel="noreferrer">${esc(v)}</a>`:esc(v); return `<div class="field"><span class="field-key">${k}:</span> <span class="field-val">${val}</span></div>`; }
+function field(k,v,link){ if(!v)return''; const href=link?safeUrl(v):''; const val=href?`<a href="${esc(href)}" target="_blank" rel="noreferrer">${esc(v)}</a>`:esc(v); return `<div class="field"><span class="field-key">${k}:</span> <span class="field-val">${val}</span></div>`; }
 function litLine(l,t){ if(!t)return''; const cls=/NEEDS CHECKING/i.test(t)?'needs-check':''; return `<div class="field"><span class="field-key">${l}:</span> <span class="field-val ${cls}">${esc(t)}</span></div>`; }
 
 async function openDetail(id){
   selectedId=id; renderList();
-  const p=await window.api.getProspect(id);
+  let p;
+  // If the row is gone (deleted by someone else) or the request fails, close the pane
+  // instead of leaving the previous prospect's details on screen under a new highlight.
+  try{ p=await window.api.getProspect(id); }
+  catch(e){ detailPane.hidden=true; selectedId=null; renderList(); toast('Could not open this prospect: '+e.message,6000); loadProspects(); return; }
   if(!p)return;
   const d=p.dossier||{};
   const hasApproved=!!(p.final_sent);
@@ -211,7 +250,7 @@ async function openDetail(id){
     <div class="section">
       <div class="section-label">Status</div>
       ${p.added_by?`<div class="field"><span class="field-key">Added by ${esc(p.added_by)}${p.added_at?` on ${esc(new Date(p.added_at).toLocaleDateString())}`:''}</span></div>`:''}
-      <div class="field"><span class="status-pill status-${p.status}">${esc(p.status)}</span>
+      <div class="field"><span class="status-pill status-${p.status}">${esc(statusLabel(p.status))}</span>
         ${p.date_sent?` <span class="field-key">sent ${esc(p.date_sent)}</span>`:''}
         ${p.followup_count?` <span class="field-key">· ${p.followup_count} follow-up(s)</span>`:''}</div>
       <div class="detail-actions" style="margin-top:10px;">
@@ -249,7 +288,7 @@ async function openDetail(id){
       <div class="section-label">General contact <button class="btn btn-ghost btn-sm" id="editContactBtn" style="float:right;padding:2px 8px;">Edit</button></div>
       ${field('Website',c.website,true)}${field('Email',c.email)}${field('Phone',c.phone)}${field('LinkedIn',c.linkedin,true)}
     </div>
-    ${contacts.length?`<div class="section"><div class="section-label">Decision-makers</div>${contacts.map(ct=>`<div class="field"><div class="field-val"><strong>${esc(ct.name||'(name not found)')}</strong> — ${esc(ct.title)}</div>${ct.email?`<div class="field-val">${esc(ct.email)}</div>`:''}${ct.linkedin?`<div class="field-val"><a href="${esc(ct.linkedin)}" target="_blank" rel="noreferrer">LinkedIn</a></div>`:''}</div>`).join('')}</div>`:''}
+    ${contacts.length?`<div class="section"><div class="section-label">Decision-makers</div>${contacts.map(ct=>`<div class="field"><div class="field-val"><strong>${esc(ct.name||'(name not found)')}</strong> — ${esc(ct.title)}</div>${ct.email?`<div class="field-val">${esc(ct.email)}</div>`:''}${safeUrl(ct.linkedin)?`<div class="field-val"><a href="${esc(safeUrl(ct.linkedin))}" target="_blank" rel="noreferrer">LinkedIn</a></div>`:(ct.linkedin?`<div class="field-val">${esc(ct.linkedin)}</div>`:'')}</div>`).join('')}</div>`:''}
     <div class="section">
       <div class="section-label">Current contract</div>
       ${field('Agency',contract.agency)}${field('Award ID',contract.award_id)}${field('Amount',contract.award_amount)}${field('NAICS',contract.naics)}${field('PSC',contract.psc)}
@@ -277,18 +316,34 @@ async function openDetail(id){
     if(!newStatus)return;
     const prevStatus=p.status;
     if(newStatus==='dead'){
-      const reason=window.prompt('Why is this prospect dead? (optional — helps the backup review later)');
-      if(reason&&reason.trim())await window.api.addNote(id,reason.trim());
+      const reason=window.prompt(DEAD_REASON_PROMPT);
+      if(reason&&reason.trim()){
+        try{ await window.api.addNote(id,reason.trim()); }
+        catch(err){ toast('The reason note could not be saved: '+err.message,6000); }
+      }
     }
-    await window.api.updateProspect(id,{status:newStatus});
+    // A failed save used to leave the new status sitting in the dropdown as if it had
+    // taken, so the next person to look at the row saw a status the server never had.
+    try{ await window.api.updateProspect(id,{status:newStatus}); }
+    catch(err){ e.target.value=prevStatus; toast('Status not changed: '+err.message,6000); return; }
     loadProspects(); openDetail(id);
     toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel(newStatus)}`,async()=>{
-      await window.api.updateProspect(id,{status:prevStatus});
+      try{ await window.api.updateProspect(id,{status:prevStatus}); }
+      catch(err){ toast('Could not undo: '+err.message,6000); return; }
       loadProspects(); openDetail(id);
     });
   });
-  document.getElementById('fuDays').addEventListener('change',async(e)=>{ await window.api.updateProspect(id,{followup_days:parseInt(e.target.value,10)||4}); });
-  document.getElementById('deleteBtn').addEventListener('click',async()=>{ if(confirm(`Delete ${d.company_name}? This removes it entirely.`)){ await window.api.deleteProspect(id); detailPane.hidden=true; selectedId=null; loadProspects(); } });
+  document.getElementById('fuDays').addEventListener('change',async(e)=>{
+    const prev=p.followup_days||4;
+    try{ await window.api.updateProspect(id,{followup_days:parseInt(e.target.value,10)||4}); }
+    catch(err){ e.target.value=prev; toast('Follow-up gap not saved: '+err.message,6000); }
+  });
+  document.getElementById('deleteBtn').addEventListener('click',async()=>{
+    if(!confirm(`Delete ${d.company_name||p.company_name||'this prospect'}? This removes it entirely.`))return;
+    try{ await window.api.deleteProspect(id); }
+    catch(err){ toast('Not deleted: '+err.message,6000); return; }
+    detailPane.hidden=true; selectedId=null; loadProspects();
+  });
 
   detailPane.hidden=false;
 }
@@ -309,11 +364,15 @@ function openLogExternal(id){
       <textarea id="extText" class="draft-area" style="min-height:180px;" placeholder="Paste the message sent, or note what was discussed on the call."></textarea></div>
     <div class="modal-actions"><button class="btn" id="extSave">Save outreach</button>
       <span class="usage-note">Marks the prospect as contacted and sets the follow-up date.</span></div>`;
-  document.getElementById('extSave').addEventListener('click',async()=>{
+  document.getElementById('extSave').addEventListener('click',async(e)=>{
+    const btn=e.currentTarget;
+    if(btn.disabled)return;
     const channel=document.getElementById('extChannel').value;
     const text=document.getElementById('extText').value.trim();
     if(!text)return;
-    await window.api.logExternal(id,{channel,text});
+    btn.disabled=true;
+    try{ await window.api.logExternal(id,{channel,text}); }
+    catch(err){ btn.disabled=false; toast('Outreach not logged: '+err.message,6000); return; }
     emailModal.hidden=true; loadProspects(); openDetail(id);
   });
 }
@@ -325,10 +384,14 @@ function openNote(id){
     <div class="settings-field"><label>Note</label>
       <textarea id="noteText" class="draft-area" style="min-height:120px;" placeholder="e.g. Spoke with Gary, interested but busy until September."></textarea></div>
     <div class="modal-actions"><button class="btn" id="noteSave">Save note</button></div>`;
-  document.getElementById('noteSave').addEventListener('click',async()=>{
+  document.getElementById('noteSave').addEventListener('click',async(e)=>{
+    const btn=e.currentTarget;
+    if(btn.disabled)return;
     const text=document.getElementById('noteText').value.trim();
     if(!text)return;
-    await window.api.addNote(id,text);
+    btn.disabled=true;
+    try{ await window.api.addNote(id,text); }
+    catch(err){ btn.disabled=false; toast('Note not saved: '+err.message,6000); return; }
     emailModal.hidden=true; openDetail(id);
   });
 }
@@ -352,12 +415,21 @@ function openEditContact(id,c){
 // server.js's /api/admin/backup/*). Reuses the emailModal shell, widened for this one flow
 // via the existing .modal-wide class rather than adding new markup to index.html.
 async function startBackupFlow(){
-  const deadList=await window.api.getDeadPile();
+  let deadList;
+  // A failed dead-pile lookup used to make the Download backup button do nothing at all.
+  // The review is a courtesy step; the backup itself is the point, so fall through to it.
+  try{ deadList=await window.api.getDeadPile(); }
+  catch(e){ toast('Could not load the dead-prospect review ('+e.message+') — downloading the backup anyway',6000); triggerBackupDownload(); return; }
   if(!deadList.length){ triggerBackupDownload(); return; }
   openDeadPileReview(deadList);
 }
 function triggerBackupDownload(){
   settingsModal.hidden=true;
+  // The dead-pile review borrows the email modal and widens it; leaving it open (and wide)
+  // after the download meant the next flow to use that modal opened at the wrong size.
+  emailModal.hidden=true;
+  const shell=emailModal.querySelector('.modal');
+  if(shell)shell.classList.remove('modal-wide');
   window.location.href='/api/admin/backup/download';
 }
 function openDeadPileReview(list){
@@ -414,7 +486,9 @@ function parseEmailAddress(raw){ const m=(raw||'').match(/<([^>]+)>/); return m?
 async function openReplyReview(id){
   replyModal.hidden=false;
   replyModalBody.innerHTML='<div class="gen-status">Loading…</div>';
-  const p=await window.api.getProspect(id);
+  let p;
+  try{ p=await window.api.getProspect(id); }
+  catch(e){ replyModalBody.innerHTML=errorBlock('Could not load this prospect: '+e.message); return; }
   if(!p){replyModal.hidden=true;return;}
   const d=p.dossier||{};
   const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
@@ -525,7 +599,7 @@ async function openReplyReview(id){
     }catch(e){alert(e.message);}
   });
   document.getElementById('replyMarkDeadBtn').addEventListener('click',async()=>{
-    const reason=window.prompt('Why is this prospect dead? (optional — helps the backup review later)');
+    const reason=window.prompt(DEAD_REASON_PROMPT);
     if(reason&&reason.trim())await window.api.addNote(id,reason.trim());
     const prevStatus=p.status;
     await window.api.updateProspect(id,{status:'dead'});
@@ -574,7 +648,13 @@ function updateGen(){const b=document.getElementById('genBtn');if(b)b.disabled=!
 
 async function runGeneration(){
   emailModalBody.innerHTML=`<div class="gen-status">Writing the draft in Marcos's voice…</div>`;
-  const res=await window.api.emailGenerate(flowState.prospectId,{issueId:flowState.issueId,services:flowState.services,personalNote:flowState.personalNote,isFollowup:flowState.isFollowup});
+  let res;
+  try{ res=await window.api.emailGenerate(flowState.prospectId,{issueId:flowState.issueId,services:flowState.services,personalNote:flowState.personalNote,isFollowup:flowState.isFollowup}); }
+  catch(e){
+    emailModalBody.innerHTML=errorBlock("Couldn't generate: "+e.message)+`<div class="modal-actions"><button class="btn btn-ghost" id="backBtn">Back</button></div>`;
+    document.getElementById('backBtn').addEventListener('click',()=>openEmailFlow(flowState.prospectId,flowState.dossier,flowState.isFollowup));
+    return;
+  }
   if(!res.ok){ emailModalBody.innerHTML=`<div class="error-note">Couldn't generate: ${esc(res.error)}</div><div class="modal-actions"><button class="btn btn-ghost" id="backBtn">Back</button></div>`; document.getElementById('backBtn').addEventListener('click',()=>openEmailFlow(flowState.prospectId,flowState.dossier,flowState.isFollowup)); return; }
   renderDraft(res.draft,res.usage);
 }
@@ -652,7 +732,11 @@ async function openSettings(){
   }
 
   settingsModal.hidden=false;
+  // Everything in this modal is an app-wide setting — the shared API key, the folder the
+  // server watches, the default follow-up gap. The server rejects these writes from a
+  // non-admin, so non-admins get a short explanation instead of controls that would fail.
   settingsBody.innerHTML=`
+    ${isAdmin?`
     <div class="settings-field"><label>Anthropic API key</label>
       <div class="hint">Used to generate email drafts. Starts with sk-ant-. Stored only on this machine.</div>
       <div style="display:flex;gap:6px;align-items:center;">
@@ -666,7 +750,11 @@ async function openSettings(){
       <button class="btn btn-ghost btn-sm" id="chooseWatchBtn">Choose folder</button>
       <button class="btn btn-ghost btn-sm" id="resetWatchBtn">Use default</button></div>
     <div class="settings-field"><label>Default follow-up gap (days)</label>
-      <input type="number" class="field-input" id="followupDaysInput" value="${cfg.defaultFollowupDays}" min="1" max="30" style="width:100px"></div>
+      <input type="number" class="field-input" id="followupDaysInput" value="${cfg.defaultFollowupDays}" min="1" max="30" style="width:100px"></div>`:`
+    <div class="settings-field"><label>Settings</label>
+      <div class="hint">These settings apply to everyone using this CRM, so only an admin can change them. Ask an admin if something here needs adjusting.</div>
+      <div class="key-status ${cfg.hasApiKey?'key-set':'key-unset'}">${cfg.hasApiKey?'Email drafting is set up and ready.':'No Anthropic API key is set yet — drafting is unavailable until an admin adds one.'}</div>
+      <div class="key-status">Default follow-up gap: ${esc(String(cfg.defaultFollowupDays))} days</div></div>`}
     ${isAdmin?`
     <div class="settings-field"><label>Gmail connection</label>
       <div class="hint">Outreach emails send from this account, regardless of who is logged in.</div>
@@ -706,14 +794,24 @@ async function openSettings(){
       </div>
       ${cfg.lastDigestWeekKey?`<div class="key-status key-set" style="margin-top:6px;">Last digest week: ${esc(cfg.lastDigestWeekKey)}</div>`:''}</div>
     `:''}
-    <div class="modal-actions"><button class="btn" id="saveSettingsBtn">Save</button></div>`;
-  wirePeekToggle(document.getElementById('apiKeyPeek'),document.getElementById('apiKeyInput'));
+    <div class="modal-actions"><button class="btn" id="saveSettingsBtn">${isAdmin?'Save':'Close'}</button></div>`;
+  const keyPeek=document.getElementById('apiKeyPeek');
+  if(keyPeek)wirePeekToggle(keyPeek,document.getElementById('apiKeyInput'));
   const secretPeek=document.getElementById('googleSecretPeek');
   if(secretPeek)wirePeekToggle(secretPeek,document.getElementById('googleClientSecretInput'));
-  window.api.watchedPath().then(p=>{const el=document.getElementById('watchPathDisplay');if(el)el.textContent=p;});
-  document.getElementById('chooseWatchBtn').addEventListener('click',async()=>{const r=await window.api.chooseWatched();document.getElementById('watchPathDisplay').textContent=r.path;loadProspects();});
-  document.getElementById('resetWatchBtn').addEventListener('click',async()=>{const r=await window.api.resetWatched();document.getElementById('watchPathDisplay').textContent=r.path;});
-  document.getElementById('saveSettingsBtn').addEventListener('click',async()=>{const key=document.getElementById('apiKeyInput').value.trim();if(key)await window.api.setApiKey(key);const days=parseInt(document.getElementById('followupDaysInput').value,10);if(days)await window.api.updateConfig({defaultFollowupDays:days});settingsModal.hidden=true;});
+  if(isAdmin){
+    window.api.watchedPath().then(p=>{const el=document.getElementById('watchPathDisplay');if(el)el.textContent=p;}).catch(()=>{});
+    document.getElementById('chooseWatchBtn').addEventListener('click',async()=>{const r=await window.api.chooseWatched();document.getElementById('watchPathDisplay').textContent=r.path;loadProspects();});
+    document.getElementById('resetWatchBtn').addEventListener('click',async()=>{const r=await window.api.resetWatched();document.getElementById('watchPathDisplay').textContent=r.path;});
+  }
+  document.getElementById('saveSettingsBtn').addEventListener('click',async()=>{
+    const keyEl=document.getElementById('apiKeyInput');
+    const daysEl=document.getElementById('followupDaysInput');
+    if(keyEl&&keyEl.value.trim())await window.api.setApiKey(keyEl.value.trim());
+    const days=daysEl?parseInt(daysEl.value,10):NaN;
+    if(days)await window.api.updateConfig({defaultFollowupDays:days});
+    settingsModal.hidden=true;
+  });
 
   if(isAdmin){
     const connectBtn=document.getElementById('gmailConnectBtn');
@@ -791,7 +889,9 @@ let resetPwId=null; // id of the user row currently showing the inline reset-pas
 async function openUsers(){
   usersModal.hidden=false;
   usersBody.innerHTML='<div class="gen-status">Loading…</div>';
-  const list=await window.api.listUsers();
+  let list;
+  try{ list=await window.api.listUsers(); }
+  catch(e){ usersBody.innerHTML=errorBlock('Could not load the user list: '+e.message); return; }
   resetPwId=null;
   renderUsers(list);
 }
@@ -807,7 +907,12 @@ function renderUsers(list){
           <button class="btn btn-ghost btn-sm resetPwCancelBtn" style="flex-shrink:0;">Cancel</button>
         </div>`
       :`${u.pending
-          ?`<button class="btn btn-sm resendInviteBtn" data-id="${u.id}">Resend invite</button>`
+          // Deactivate is offered on pending rows too: an invite sent to the wrong address
+          // used to have no off switch at all until the person accepted it.
+          ?`<button class="btn btn-sm resendInviteBtn" data-id="${u.id}">Resend invite</button>
+             ${u.active
+               ?`<button class="btn btn-ghost btn-sm deactivateBtn" data-id="${u.id}">Deactivate</button>`
+               :`<button class="btn btn-ghost btn-sm reactivateBtn" data-id="${u.id}">Reactivate</button>`}`
           :`${u.active
               ?`<button class="btn btn-ghost btn-sm deactivateBtn" data-id="${u.id}">Deactivate</button>`
               :`<button class="btn btn-ghost btn-sm reactivateBtn" data-id="${u.id}">Reactivate</button>`}
@@ -847,18 +952,21 @@ function renderUsers(list){
       </table>
     </div>`;
 
-  document.getElementById('createUserBtn').addEventListener('click',async()=>{
+  document.getElementById('createUserBtn').addEventListener('click',async(ev)=>{
+    const btn=ev.currentTarget;
+    if(btn.disabled)return; // a double-click here creates two accounts and two invite emails
     const username=document.getElementById('newUserName').value.trim();
     const role=document.getElementById('newUserRole').value;
     const email=document.getElementById('newUserEmail').value.trim();
     const errEl=document.getElementById('createUserErr');
     errEl.hidden=true;
     if(!email){ errEl.textContent='Email is required.'; errEl.hidden=false; return; }
+    btn.disabled=true;
     try{
       const u=await window.api.createUser({username,role,email});
       if(!u.inviteEmailSent) toast(u.inviteEmailError||'Invite email could not be sent.');
       openUsers();
-    }catch(e){ errEl.textContent=e.message; errEl.hidden=false; }
+    }catch(e){ btn.disabled=false; errEl.textContent=e.message; errEl.hidden=false; }
   });
   usersBody.querySelectorAll('.resendInviteBtn').forEach(b=>b.addEventListener('click',async()=>{
     const id=parseInt(b.dataset.id,10);
@@ -917,7 +1025,9 @@ const auditBody=document.getElementById('auditBody');
 async function openAuditLog(){
   auditModal.hidden=false;
   auditBody.innerHTML='<div class="gen-status">Loading…</div>';
-  const [userList,actionList]=await Promise.all([window.api.listUsers(),window.api.listAuditActions()]);
+  let userList,actionList;
+  try{ [userList,actionList]=await Promise.all([window.api.listUsers(),window.api.listAuditActions()]); }
+  catch(e){ auditBody.innerHTML=errorBlock('Could not load the audit log: '+e.message); return; }
   auditBody.innerHTML=`
     <div class="toolbar" style="padding:0 0 14px;background:transparent;border:none;">
       <div class="toolbar-group"><label class="tb-label">User</label>
@@ -1033,28 +1143,64 @@ document.getElementById('selectAll').addEventListener('change',(e)=>{
   if(e.target.checked)visible.forEach(p=>selectedIds.add(p.id)); else selectedIds.clear();
   renderList(); updateBulkBar();
 });
+// Each row is its own request, so a failure part-way through used to abandon the loop with
+// no message at all: some prospects changed, some didn't, the bulk bar still said
+// "20 selected", and the screen still showed the old values. Now every row is attempted,
+// and whatever failed is named on screen.
 document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',async()=>{
+  if(b.disabled)return;
   const action=b.dataset.bulk; const ids=[...selectedIds];
   if(!ids.length)return;
-  if(action==='delete'){ if(!confirm(`Delete ${ids.length} prospect(s)?`))return; for(const id of ids)await window.api.deleteProspect(id); selectedIds.clear(); updateBulkBar(); loadProspects(); return; }
-  const prevStatuses={};
-  allProspects.filter(p=>ids.includes(p.id)).forEach(p=>{prevStatuses[p.id]=p.status;});
-  if(action==='dead'){
-    const reason=window.prompt('Why are these prospects dead? (optional — applies to all selected, helps the backup review later)');
-    if(reason&&reason.trim())for(const id of ids)await window.api.addNote(id,reason.trim());
-  }
-  for(const id of ids)await window.api.updateProspect(id,{status:action});
-  selectedIds.clear(); updateBulkBar(); loadProspects();
-  toastUndo(`${ids.length} prospect(s) moved to ${statusLabel(action)}`,async()=>{
-    for(const id of ids)await window.api.updateProspect(id,{status:prevStatuses[id]});
-    loadProspects();
-  });
+  const nameOf=(id)=>{ const p=allProspects.find(x=>x.id===id); return (p&&p.company_name)||`#${id}`; };
+  // Returns the ids that failed, each with the reason, so the caller can both report them
+  // and tell which rows actually changed.
+  const runAll=async(fn,list)=>{
+    const failed=[];
+    for(const id of (list||ids)){ try{ await fn(id); }catch(e){ failed.push({id,why:`${nameOf(id)} (${e.message})`}); } }
+    return failed;
+  };
+  const describe=(failed)=>failed.map(f=>f.why).join('; ');
+  b.disabled=true;
+  try{
+    if(action==='delete'){
+      if(!confirm(`Delete ${ids.length} prospect(s)?`))return;
+      const failed=await runAll(id=>window.api.deleteProspect(id));
+      selectedIds.clear(); updateBulkBar(); loadProspects();
+      if(failed.length)toast(`${failed.length} of ${ids.length} could not be deleted: ${describe(failed)}`,7000);
+      return;
+    }
+    const prevStatuses={};
+    allProspects.filter(p=>ids.includes(p.id)).forEach(p=>{prevStatuses[p.id]=p.status;});
+    if(action==='dead'){
+      const reason=window.prompt(DEAD_REASON_PROMPT_BULK);
+      if(reason&&reason.trim()){
+        const noteFailed=await runAll(id=>window.api.addNote(id,reason.trim()));
+        if(noteFailed.length)toast(`The reason note could not be saved on ${noteFailed.length} prospect(s)`,5000);
+      }
+    }
+    const failed=await runAll(id=>window.api.updateProspect(id,{status:action}));
+    const changed=ids.filter(id=>!failed.some(f=>f.id===id));
+    selectedIds.clear(); updateBulkBar(); loadProspects();
+    if(failed.length)toast(`${failed.length} of ${ids.length} could not be updated: ${describe(failed)}`,7000);
+    if(changed.length){
+      toastUndo(`${changed.length} prospect(s) moved to ${statusLabel(action)}`,async()=>{
+        const undoFailed=await runAll(id=>window.api.updateProspect(id,{status:prevStatuses[id]}),changed);
+        loadProspects();
+        if(undoFailed.length)toast(`${undoFailed.length} could not be reverted: ${describe(undoFailed)}`,7000);
+      });
+    }
+  } finally { b.disabled=false; }
 }));
 
 // live ingest
-window.api.onIngested((r)=>{ if(r.outcome==='ingested'){loadProspects();toast('New prospect added from research');} else if(r.outcome==='duplicate'){toast('Skipped a duplicate');} });
+window.api.onIngested((r)=>{ if(r.outcome==='ingested'){loadProspects();toast('New prospect added from research');} else if(r.outcome==='duplicate'){toast('Skipped a duplicate');} else if(r.outcome==='excluded'){toast(`Research file ${r.file?`"${r.file}" `:''}was skipped — that company is on the do-not-contact list`,7000);} });
 window.api.onReply((r)=>{ loadProspects(); if(r.company_name)toast(`New reply from ${r.company_name}`); });
-function toast(msg){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:100;opacity:0;transition:opacity .2s;';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},2200);}
+// A research file that never made it in. Held longer than a normal toast: this one needs acting on.
+window.api.onIngestFailed((r)=>{ toast(`Research file "${r.file}" was not imported — ${r.reason}`,7000); });
+// pointer-events:none matters as much as the fade: a faded-out toast is still a box
+// sitting over the bottom of the screen, and without it, clicks in that strip landed on an
+// invisible toast instead of the page underneath.
+function toast(msg,ms=2200){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:100;opacity:0;pointer-events:none;transition:opacity .2s;';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},ms);}
 
 // A bottom-right toast with an Undo button, for status/view changes: shows what happened
 // and gives a few seconds to catch a mistake and reverse it before it's gone.
@@ -1069,11 +1215,15 @@ function toastUndo(msg,onUndo,ms=6000){
   clearTimeout(t._timer);
   t.innerHTML=`<span>${esc(msg)}</span><button class="btn btn-sm" id="toastUndoBtn" style="flex-shrink:0;">Undo</button>`;
   t.style.opacity='1';
+  t.style.pointerEvents='auto';
+  const dismiss=()=>{ t.style.opacity='0'; t.style.pointerEvents='none'; clearTimeout(t._timer); };
   document.getElementById('toastUndoBtn').addEventListener('click',async()=>{
-    t.style.opacity='0'; clearTimeout(t._timer);
+    dismiss();
     await onUndo();
   });
-  t._timer=setTimeout(()=>{t.style.opacity='0';},ms);
+  // Faded out but still clickable, this Undo button used to stay armed indefinitely: a
+  // stray click on that corner minutes later silently reverted the last status change.
+  t._timer=setTimeout(dismiss,ms);
 }
 
 // Shown in place of a plain error when a send is blocked by the do-not-contact list (see
@@ -1095,7 +1245,7 @@ function renderExclusionBlock(container,exclusion,prospectId,onRetry){
     catch(err){ alert(err.message); }
   });
   document.getElementById('exclusionMarkDeadBtn').addEventListener('click',async()=>{
-    const reason=window.prompt('Why is this prospect dead? (optional — helps the backup review later)');
+    const reason=window.prompt(DEAD_REASON_PROMPT);
     if(reason&&reason.trim())await window.api.addNote(prospectId,reason.trim());
     await window.api.updateProspect(prospectId,{status:'dead'});
     emailModal.hidden=true; replyModal.hidden=true; loadProspects();

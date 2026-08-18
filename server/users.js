@@ -4,9 +4,9 @@
 // Stored as its own atomic JSON file (data/users.json), independent of the main prospect
 // database (server/db.js), which this feature does not touch.
 
-const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const store_ = require('./store');
 
 const MIN_PASSWORD_LENGTH = 8;
 const INVITE_TTL_MS = 48 * 60 * 60 * 1000;
@@ -20,21 +20,16 @@ function init(dataDir) {
 }
 
 function load() {
-  try {
-    store = JSON.parse(fs.readFileSync(usersPath, 'utf8'));
-    store.users = store.users || [];
-    store.nextId = store.nextId || (store.users.reduce((m, u) => Math.max(m, u.id), 0) + 1);
-    for (const u of store.users) if (u.email === undefined) u.email = ''; // forward-compat with pre-email accounts
-  } catch {
-    save(); // no file yet: write the empty store
-  }
+  const raw = store_.readJSON(usersPath); // throws on a corrupt/unreadable file
+  if (!raw) return save(); // genuinely no file yet: write the empty store
+  store = raw;
+  store.users = store.users || [];
+  store.nextId = store.nextId || store_.nextIdFrom(store.users);
+  for (const u of store.users) if (u.email === undefined) u.email = ''; // forward-compat with pre-email accounts
 }
 
-// Atomic save: write to a temp file then rename over the real one (matches db.js).
 function save() {
-  const tmp = usersPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8');
-  fs.renameSync(tmp, usersPath);
+  store_.writeJSON(usersPath, store);
 }
 
 function hashPassword(password) {
@@ -153,6 +148,7 @@ function acceptInvite(token, password) {
   u.pending = false;
   u.inviteToken = '';
   u.inviteExpiresAt = '';
+  u.pwChangedAt = new Date().toISOString(); // see auth.js: retires sessions issued before now
   save();
   return safe(u);
 }
@@ -169,36 +165,15 @@ function setEmail(id, email) {
   return safe(u);
 }
 
-// A single, no-password "test" account for handing the app to someone quickly. It has no
-// usable password (same empty-hash trick as createInvitedUser) and is instead reached via
-// a fixed random URL slug (see /api/auth/test-login/:slug in server.js). Idempotent: if
-// the account already exists (e.g. from a prior deploy), returns it and its existing slug
-// unchanged rather than minting a new one, so the URL you shared with someone keeps working.
-function ensureTestUser() {
-  let u = findByUsername('test');
-  if (u) return { user: safe(u), slug: u.testLoginSlug };
-  const slug = crypto.randomBytes(6).toString('base64url');
-  u = {
-    id: store.nextId++,
-    username: 'test',
-    usernameLower: 'test',
-    passwordHash: '',
-    role: 'admin',
-    email: '',
-    active: true,
-    testUser: true,
-    noLog: true,
-    testLoginSlug: slug,
-    createdAt: new Date().toISOString()
-  };
-  store.users.push(u);
-  save();
-  return { user: safe(u), slug };
-}
-
-function findByTestLoginSlug(slug) {
-  return store.users.find(u => u.testUser && u.testLoginSlug && u.testLoginSlug === slug) || null;
-}
+// REMOVED: ensureTestUser() / findByTestLoginSlug().
+// These created a permanent no-password account with role 'admin' and noLog: true, reached
+// through a fixed URL slug that GET /api/auth/test-login/:slug traded for a 30-day admin
+// session with no credentials. That route sat above the /api auth gate, the login rate
+// limiter did not cover it, and noLog meant anything done through the account left no audit
+// entry — and the slug travelled inside every emailed backup zip. Any existing 'test' row in
+// users.json is left in place (it cannot log in: verifyPassword rejects an empty hash, and
+// the route is gone), so no stored data changes. Deactivate it from the Users panel to hide
+// it from the list.
 
 function checkLogin(username, password) {
   const u = findByUsername(username);
@@ -234,6 +209,7 @@ function resetPassword(id, newPassword) {
   u.pending = false;
   u.inviteToken = '';
   u.inviteExpiresAt = '';
+  u.pwChangedAt = new Date().toISOString(); // see auth.js: retires sessions issued before now
   save();
   return safe(u);
 }
@@ -249,6 +225,5 @@ function safe(u) {
 module.exports = {
   init, hasAnyUser, createUser, checkLogin, findById, findByUsername,
   listUsers, setActive, setRole, setEmail, resetPassword, MIN_PASSWORD_LENGTH,
-  createInvitedUser, resendInvite, acceptInvite, findByInviteToken,
-  ensureTestUser, findByTestLoginSlug
+  createInvitedUser, resendInvite, acceptInvite, findByInviteToken
 };

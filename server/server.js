@@ -3,8 +3,9 @@
 // HTTP endpoint the browser UI calls with fetch(). The server holds the database, the
 // API key, the catalogs, and watches the research folder.
 //
-// It binds to 127.0.0.1 (localhost) only, so it is reachable only from this machine's
-// own browser and never exposed to the network or internet.
+// It binds to all interfaces (0.0.0.0) because it is deployed behind Railway's edge
+// proxy, so access control is the session cookie and the /api/* auth gate below — not
+// the network. Do not run it on an untrusted network without that gate.
 
 const express = require('express');
 const path = require('path');
@@ -30,21 +31,43 @@ const APP_DIR = path.join(__dirname, '..');
 const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(APP_DIR, 'data');
 const PORT = process.env.PORT || 3000;
 
+// If the volume is ever detached or renamed, the fallback above would quietly point at the
+// container's own filesystem: the app would boot looking empty, staff would re-enter data
+// into it, and every byte would vanish at the next redeploy. Refusing to start instead
+// makes the misconfiguration loud and leaves the real volume's data untouched on disk.
+// Only enforced on Railway — local dev has no volume and is meant to use APP_DIR/data.
+const ON_RAILWAY = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+if (ON_RAILWAY && !process.env.RAILWAY_VOLUME_MOUNT_PATH) {
+  console.error(
+    'REFUSING TO START: running on Railway but RAILWAY_VOLUME_MOUNT_PATH is not set.\n' +
+    'That means no persistent volume is attached, and anything written would be lost on the\n' +
+    'next redeploy. Attach the volume to this service in the Railway dashboard (Settings →\n' +
+    'Volumes) and redeploy. No existing data has been touched.'
+  );
+  process.exit(1);
+}
+
 // ---- Startup ----
-db.init(DATA_DIR);
+// The data directory is created here, before any module initializes, rather than as a side
+// effect of whichever init happened to run first. It used to be db.init() alone that made it,
+// which meant the order of the calls below was load-bearing and undocumented: moving config
+// ahead of db — the very thing the next comment asks for — would have had config.init()
+// writing into a directory that did not exist yet.
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// config first: db.js reads defaultFollowupDays out of it when creating a prospect.
+console.log(`Data directory: ${DATA_DIR}`);
 config.init(DATA_DIR);
+db.init(DATA_DIR);
 catalogs.init(DATA_DIR, APP_DIR);
 auth.init(DATA_DIR);
 users.init(DATA_DIR);
 audit.init(DATA_DIR);
 gmail.init(DATA_DIR);
+// Backfill for installations that were set up before setupCompleted existed: accounts are
+// already here, so record that setup happened and let the gate on /api/auth/setup work.
+if (users.hasAnyUser() && !config.get().setupCompleted) config.update({ setupCompleted: true });
 seedApprovedEmails();
-
-// One-time no-password "test" account, reached only via a fixed random URL (see
-// /api/auth/test-login/:slug below). Printed to the deploy log so it can be retrieved
-// from `railway logs` without exposing it anywhere in the UI.
-const testUserInfo = users.ensureTestUser();
-console.log(`Test-user login: /api/auth/test-login/${testUserInfo.slug}`);
 
 let watcher = null;
 startWatching();
@@ -55,8 +78,27 @@ const app = express();
 // would make the login rate limiter below lock out every user together instead of one
 // abusive IP. Railway is the only proxy this app ever sits behind (local dev has no
 // proxy in the chain at all, so this has no effect there).
-app.set('trust proxy', true);
+//
+// The value is 1, not true: `true` trusts the whole X-Forwarded-For chain, so a client
+// could send its own X-Forwarded-For header, express would believe it, and req.ip would
+// become attacker-chosen — a fresh "IP" per login attempt defeats the rate limiter
+// entirely. 1 trusts exactly one hop (Railway's proxy, which appends the real client
+// address) and ignores anything the client claims beyond it.
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '5mb' }));
+
+// Cookies get the Secure flag in production so the session token is never sent over
+// plain HTTP. Left off locally, where there is no TLS and Secure cookies would simply
+// be dropped, making login impossible.
+// Keyed on Railway's own platform variables rather than the volume path, so pointing a
+// local run at a scratch data directory (RAILWAY_VOLUME_MOUNT_PATH) doesn't switch Secure
+// on and lock the developer out of their own http://localhost.
+const COOKIE_SECURE = process.env.NODE_ENV === 'production'
+  || !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+function sessionCookie(token, maxAgeSeconds) {
+  return `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}; Path=/${COOKIE_SECURE ? '; Secure' : ''}`;
+}
+const SESSION_MAX_AGE = 30 * 24 * 60 * 60;
 
 // ---- Auth endpoints (these must be reachable without a token) ----
 // Login/logout are not audited: they don't create, modify, or delete app data (see the
@@ -64,31 +106,59 @@ app.use(express.json({ limit: '5mb' }));
 // DOES create data (the first user) — it audits itself manually since there's no session
 // yet to attribute the action to anything other than the account being created.
 
+// Resolves the session cookie to a live user record, or null. Every place that accepts a
+// session goes through here so they all apply the same three checks: a valid signature,
+// an account that still exists and is active, and — the reason this is a function rather
+// than two inline copies — a token issued before the account's password was last changed
+// is refused. Without that last check, resetting a password left every already-issued
+// cookie working, so the point of the reset (locking out whoever had the old password)
+// was silently lost.
+function userFromReq(req) {
+  const payload = auth.verifyToken(auth.tokenFromReq(req));
+  if (!payload) return null;
+  const user = users.findById(payload.uid);
+  if (!user || !user.active) return null;
+  if (user.pwChangedAt && payload.t < new Date(user.pwChangedAt).getTime()) return null;
+  return user;
+}
+
 // Tells the login page whether any account exists yet (first-run creates the admin), and
 // who (if anyone) the current request is authenticated as.
 app.get('/api/auth/status', (req, res) => {
-  const payload = auth.verifyToken(auth.tokenFromReq(req));
-  const user = payload && users.findById(payload.uid);
-  const authed = !!(user && user.active);
+  const user = userFromReq(req);
+  const authed = !!user;
   res.json({
-    usersExist: users.hasAnyUser(),
+    usersExist: users.hasAnyUser() || config.get().setupCompleted,
     authed,
     user: authed ? { id: user.id, username: user.username, role: user.role } : null
   });
 });
 
 // First run: create the initial account. It is always the admin. Only allowed once.
+//
+// Gated twice, on two different files. "No users exist" alone is a dangerous test: if
+// users.json is ever lost or emptied while the rest of the volume survives, this route
+// reopens and the next visitor — anyone on the internet — is handed a fresh admin
+// account. config.setupCompleted records that setup has already happened, so that case
+// fails closed and needs a deliberate hand-edit on the server to recover, rather than
+// silently granting the CRM to a stranger.
 app.post('/api/auth/setup', (q, res) => {
   if (users.hasAnyUser()) return res.status(400).json({ error: 'Setup already completed' });
+  if (config.get().setupCompleted) {
+    console.error('SETUP REFUSED: config says setup is complete but users.json has no accounts. ' +
+      'Restore users.json from a backup, or clear setupCompleted in config.json to re-run setup.');
+    return res.status(409).json({ error: 'This installation is already set up but its accounts are missing. Restore from a backup — contact your administrator.' });
+  }
   let user;
   try {
     user = users.createUser({ username: q.body && q.body.username, password: q.body && q.body.password, role: 'admin' });
   } catch (e) {
     return res.status(e.status || 400).json({ error: e.message });
   }
+  config.update({ setupCompleted: true });
   audit.log({ userId: user.id, username: user.username, action: 'user.create', detail: 'Initial admin account created on first run' });
   const token = auth.issueToken(user.id);
-  res.set('Set-Cookie', `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
+  res.set('Set-Cookie', sessionCookie(token, SESSION_MAX_AGE));
   res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
 });
 
@@ -110,7 +180,7 @@ app.post('/api/auth/accept-invite', (q, res) => {
     const u = users.acceptInvite(token, password);
     audit.log({ userId: u.id, username: u.username, action: 'user.invite.accept', detail: 'Password set via invitation link' });
     const sessToken = auth.issueToken(u.id);
-    res.set('Set-Cookie', `gs_session=${sessToken}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
+    res.set('Set-Cookie', sessionCookie(sessToken, SESSION_MAX_AGE));
     res.json({ ok: true, user: { id: u.id, username: u.username, role: u.role } });
   } catch (e) {
     res.status(e.status || 400).json({ error: e.message });
@@ -148,22 +218,12 @@ app.post('/api/auth/login', (q, res) => {
   }
   loginAttempts.delete(ip);
   const token = auth.issueToken(user.id);
-  res.set('Set-Cookie', `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
+  res.set('Set-Cookie', sessionCookie(token, SESSION_MAX_AGE));
   res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
 });
 
-// Logs in as the no-password test account via its fixed random URL slug. Not linked from
-// anywhere in the UI — this exists purely so it can be handed out as a direct link.
-app.get('/api/auth/test-login/:slug', (q, res) => {
-  const u = users.findByTestLoginSlug(q.params.slug);
-  if (!u || !u.active) return res.status(404).send('Not found');
-  const token = auth.issueToken(u.id);
-  res.set('Set-Cookie', `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}; Path=/`);
-  res.redirect('/');
-});
-
 app.post('/api/auth/logout', (_q, res) => {
-  res.set('Set-Cookie', 'gs_session=; HttpOnly; SameSite=Lax; Max-Age=0; Path=/');
+  res.set('Set-Cookie', sessionCookie('', 0));
   res.json({ ok: true });
 });
 
@@ -174,9 +234,8 @@ app.post('/api/auth/logout', (_q, res) => {
 // role change or deactivation takes effect on the user's very next request rather than
 // waiting for their token to expire or for them to log in again.
 app.use('/api', (req, res, next) => {
-  const payload = auth.verifyToken(auth.tokenFromReq(req));
-  const user = payload && users.findById(payload.uid);
-  if (!user || !user.active) return res.status(401).json({ error: 'Not authenticated' });
+  const user = userFromReq(req);
+  if (!user) return res.status(401).json({ error: 'Not authenticated' });
   req.user = user;
   next();
 });
@@ -255,6 +314,12 @@ function broadcast(event, data) {
   const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
   for (const res of clients) { try { res.write(payload); } catch {} }
 }
+// An idle SSE stream can go minutes without traffic, and proxies (Railway's edge included)
+// drop connections they think are dead. A comment line every 25s keeps the stream alive;
+// it is ignored by the EventSource client, so nothing in the browser has to handle it.
+setInterval(() => {
+  for (const res of clients) { try { res.write(': keep-alive\n\n'); } catch {} }
+}, 25 * 1000).unref();
 
 // ---- Watched folder ----
 function watchedDir() {
@@ -267,17 +332,43 @@ function watchedDir() {
 // mutating(). Attributed to a synthetic "system (folder watch)" actor — see the AUDIT
 // CONVENTION comment above.
 function tryIngestFile(filePath, attempt = 0) {
+  const name = path.basename(filePath);
   fs.readFile(filePath, 'utf8', (err, text) => {
-    if (err) return;
+    // A file that can't be read at all: retried like a partial write, then given up on
+    // loudly. Silence here meant a dossier could vanish with no trace anywhere.
+    if (err) {
+      if (attempt < 5) return setTimeout(() => tryIngestFile(filePath, attempt + 1), 400);
+      return reportIngestFailure(name, `could not be read (${err.code || err.message})`);
+    }
     let dossier;
     try { dossier = JSON.parse(text); }
-    catch { if (attempt < 5) return setTimeout(() => tryIngestFile(filePath, attempt + 1), 400); return; }
-    const result = db.ingestDossier(dossier, path.basename(filePath));
-    if (result.outcome === 'ingested') {
-      audit.log({ userId: null, username: 'system (folder watch)', action: 'prospect.ingest', prospectId: result.id, detail: path.basename(filePath) });
+    catch (e) {
+      // The usual cause is reading mid-write, which the retries cover. Past that, the file
+      // really is malformed and someone has to look at it.
+      if (attempt < 5) return setTimeout(() => tryIngestFile(filePath, attempt + 1), 400);
+      return reportIngestFailure(name, `is not valid JSON (${e.message})`);
     }
-    broadcast('ingested', result);
+    let result;
+    try {
+      result = db.ingestDossier(dossier, name);
+    } catch (e) {
+      return reportIngestFailure(name, `could not be ingested (${e.message})`);
+    }
+    if (result.outcome === 'ingested') {
+      audit.log({ userId: null, username: 'system (folder watch)', action: 'prospect.ingest', prospectId: result.id, detail: name });
+    }
+    // The filename travels with the result so a skipped file (duplicate, do-not-contact)
+    // can be named in the toast instead of appearing as an anonymous "skipped".
+    broadcast('ingested', { ...result, file: name });
   });
+}
+// One place so a dropped dossier always leaves three marks: stdout, the audit log, and a
+// toast in every open browser.
+function reportIngestFailure(name, why) {
+  const detail = `${name} ${why}`;
+  console.error('DOSSIER NOT INGESTED —', detail);
+  audit.log({ userId: null, username: 'system (folder watch)', action: 'prospect.ingest.failed', detail });
+  broadcast('ingest-failed', { file: name, reason: why });
 }
 function startWatching() {
   const dir = watchedDir();
@@ -303,7 +394,18 @@ function seedApprovedEmails() {
 // ---- API endpoints (each mirrors an old IPC handler) ----
 
 const ok = (res, data) => res.json(data);
-const fail = (res, e) => res.status(500).json({ error: String(e && e.message || e) });
+
+// Two kinds of error reach here. One is deliberate — a handler throwing with an .status set
+// ("Prospect not found", "Invalid backup frequency"); that message is written for the person
+// reading it, so it goes through as-is with its own code. The other is an unexpected throw,
+// whose message is an internal detail (a filesystem path, a JSON parse offset, a stack-shaped
+// string) that tells the user nothing and describes the server's insides. Those get logged in
+// full where they're useful — the server log — and a generic line in the response.
+const fail = (res, e) => {
+  if (e && e.status) return res.status(e.status).json({ error: e.message });
+  console.error('Unhandled server error:', (e && e.stack) || e);
+  return res.status(500).json({ error: 'Something went wrong on the server. If this keeps happening, check the server log.' });
+};
 
 app.get('/api/prospects', (_q, res) => { try { ok(res, db.listProspects()); } catch (e) { fail(res, e); } });
 
@@ -388,7 +490,13 @@ app.post('/api/prospects/upload', (q, res) => {
     const results = { ingested: 0, duplicate: 0, excluded: 0, errors: [] };
     for (const item of items) {
       try {
-        const r = db.ingestDossier(item.dossier, item.filename || 'upload.json');
+        // A file that parsed as valid JSON but isn't a dossier object (null, an array, a
+        // bare string) used to reach ingestDossier and surface as "Cannot read properties
+        // of null (reading 'uei')" next to the filename — true, but not something the
+        // person who dropped the file can act on.
+        const d = item && item.dossier;
+        if (!d || typeof d !== 'object' || Array.isArray(d)) throw new Error('Not a dossier — the file is valid JSON but does not contain a company record');
+        const r = db.ingestDossier(d, item.filename || 'upload.json');
         if (r.outcome === 'ingested') {
           results.ingested++;
           broadcast('ingested', r);
@@ -438,7 +546,9 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
     res.locals.audit = { prospectId: id, detail: `${kind} — tokens in ${(usage && usage.input_tokens) || 0} / out ${(usage && usage.output_tokens) || 0}` };
     return { ok: true, draft, usage };
   } catch (e) {
-    res.locals.skipAudit = true;
+    // Same reasoning as the failed sends: a draft that never came back is worth a line in
+    // the log, otherwise a run of Claude failures is invisible.
+    res.locals.audit = { prospectId: id, detail: `Draft generation FAILED — ${String(e && e.message || e)}` };
     return res.json({ ok: false, error: String(e && e.message || e) });
   }
 }));
@@ -486,8 +596,11 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
       references: hasThread ? priorIds.join(' ') : undefined
     });
   } catch (e) {
+    // A failed send is recorded, not swallowed. Without this the only trace of a failure
+    // was a 502 in one browser tab, which is why "sending is unreliable" could never be
+    // pinned down: no history of how often it fails, for whom, or with what Gmail error.
     res.status(502).json({ error: 'Could not send via Gmail: ' + e.message });
-    res.locals.skipAudit = true;
+    res.locals.audit = { prospectId: id, detail: `Gmail send FAILED to ${to} — ${e.message}` };
     return;
   }
 
@@ -497,8 +610,10 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
     date_sent: new Date().toISOString().slice(0, 10),
     gmail_thread_id: p.gmail_thread_id || sendResult.gmailThreadId || ''
   };
-  if (isFollowup) patch.followup_count = (p.followup_count || 0) + 1;
-  if (sendResult.gmailMessageId) patch.gmail_message_ids = JSON.stringify([...priorIds, sendResult.gmailMessageId]);
+  // Both of these are applied against the live record inside db.updateProspect, not
+  // computed from `p` — which was read before the multi-second Gmail send above.
+  if (isFollowup) patch.incFollowupCount = true;
+  if (sendResult.gmailMessageId) patch.appendMessageId = sendResult.gmailMessageId;
   db.updateProspect(id, patch);
   db.addNote(id, `Sent ${isFollowup ? 'follow-up' : 'outreach'} email to ${to}: "${subject}"`, isFollowup ? 'followup' : 'outreach');
   if (saveToLibrary) {
@@ -579,7 +694,9 @@ app.post('/api/prospects/:id/reply/generate', mutating('prospect.reply.draft.gen
     res.locals.audit = { prospectId: id, detail: `Reply draft generated — tokens in ${(usage && usage.input_tokens) || 0} / out ${(usage && usage.output_tokens) || 0}` };
     return { ok: true, draft, usage };
   } catch (e) {
-    res.locals.skipAudit = true;
+    // Same reasoning as the failed sends: a draft that never came back is worth a line in
+    // the log, otherwise a run of Claude failures is invisible.
+    res.locals.audit = { prospectId: id, detail: `Reply draft generation FAILED — ${String(e && e.message || e)}` };
     return res.json({ ok: false, error: String(e && e.message || e) });
   }
 }));
@@ -608,14 +725,16 @@ app.post('/api/prospects/:id/reply/send', mutating('prospect.reply.send', async 
       threadId: p.gmail_thread_id, inReplyTo: priorIds[priorIds.length - 1], references: priorIds.join(' ')
     });
   } catch (e) {
+    // Recorded rather than swallowed, for the same reason as the outreach send above.
     res.status(502).json({ error: 'Could not send via Gmail: ' + e.message });
-    res.locals.skipAudit = true;
+    res.locals.audit = { prospectId: id, detail: `Gmail reply send FAILED to ${toClean} — ${e.message}` };
     return;
   }
 
   const shouldSave = saveToLibrary !== false;
-  const newIds = sendResult.gmailMessageId ? [...priorIds, sendResult.gmailMessageId] : priorIds;
-  db.updateProspect(id, { status: 'replied', gmail_message_ids: JSON.stringify(newIds) });
+  const patch = { status: 'replied' };
+  if (sendResult.gmailMessageId) patch.appendMessageId = sendResult.gmailMessageId;
+  db.updateProspect(id, patch);
   db.addNote(id, `Sent reply to ${toClean}: "${subjClean}"`, 'reply');
   if (shouldSave) {
     const dossierContact = (p.dossier.contacts || []).find(c => c.email === toClean);
@@ -642,42 +761,71 @@ app.post('/api/prospects/:id/dormant', requireAdmin, mutating('prospect.dormant.
   return { ok: true };
 }));
 
+// "Ana Muñoz <ana@agency.gov>" → "ana@agency.gov". A bare address passes through.
+function addressOf(from) {
+  const m = String(from || '').match(/<([^>]+)>/);
+  return (m ? m[1] : String(from || '')).trim().toLowerCase();
+}
+
 // Polls only prospects with a Gmail thread on file and not dead — one cheap metadata-only
 // Gmail call per active thread, not a global inbox scan. At this app's scale (a bounded
 // number of active outreach threads, not thousands) this is well within Gmail's API
 // quota. Runs only when Gmail is connected; skips the cycle otherwise, no error surfaced.
+// The calls are awaited one at a time, so with enough threads a run can outlast the
+// 3-minute interval; the flag keeps the ticks from stacking runs on top of each other.
+let pollRunning = false;
 async function pollForReplies() {
-  if (!gmail.isConnected()) return;
-  const candidates = db.listProspects().filter(p => p.gmail_thread_id && p.status !== 'dead');
-  for (const p of candidates) {
-    try {
-      const messages = await gmail.getThreadReplies(p.gmail_thread_id);
-      const sentIds = new Set(JSON.parse(p.gmail_message_ids || '[]'));
-      const incoming = messages.filter(m => !sentIds.has(m.id));
-      if (!incoming.length) continue;
-      const latest = incoming[incoming.length - 1];
-      if (latest.id === p.last_reply_message_id) continue; // already surfaced
-      db.recordReply(p.id, {
-        messageId: latest.id, from: latest.from, snippet: latest.snippet,
-        at: latest.internalDate ? new Date(Number(latest.internalDate)).toISOString() : new Date().toISOString()
-      });
-      audit.log({ userId: null, username: 'system (reply poll)', action: 'prospect.reply.detected', prospectId: p.id, detail: `From ${latest.from}` });
-      broadcast('reply', { id: p.id, company_name: p.company_name });
-    } catch (e) {
-      console.warn(`Reply poll failed for prospect ${p.id}:`, e.message);
+  if (pollRunning || !gmail.isConnected()) return;
+  // Every thread also contains the messages we sent. They cannot be identified by id: the
+  // ids stored on a prospect are RFC Message-ID *header* values, while Gmail returns
+  // resource ids here — two different namespaces, so the old id filter never matched and
+  // each of our own sends was recorded as an incoming reply three minutes later. Filter on
+  // the sender instead, which means the poll can't run until we know our own address.
+  const ours = gmail.connectedEmail().trim().toLowerCase();
+  if (!ours) {
+    console.warn('Reply poll skipped: the connected Gmail address is unknown, so our own sent messages cannot be told apart from replies. Reconnect Gmail in Settings.');
+    return;
+  }
+  pollRunning = true;
+  try {
+    const candidates = db.listProspects().filter(p => p.gmail_thread_id && p.status !== 'dead');
+    for (const p of candidates) {
+      try {
+        const messages = await gmail.getThreadReplies(p.gmail_thread_id);
+        const incoming = messages.filter(m => addressOf(m.from) !== ours);
+        if (!incoming.length) continue;
+        const latest = incoming[incoming.length - 1];
+        if (latest.id === p.last_reply_message_id) continue; // already surfaced
+        db.recordReply(p.id, {
+          messageId: latest.id, from: latest.from, snippet: latest.snippet,
+          at: latest.internalDate ? new Date(Number(latest.internalDate)).toISOString() : new Date().toISOString()
+        });
+        audit.log({ userId: null, username: 'system (reply poll)', action: 'prospect.reply.detected', prospectId: p.id, detail: `From ${latest.from}` });
+        broadcast('reply', { id: p.id, company_name: p.company_name });
+      } catch (e) {
+        console.warn(`Reply poll failed for prospect ${p.id}:`, e.message);
+      }
     }
+  } finally {
+    pollRunning = false;
   }
 }
-setInterval(pollForReplies, 3 * 60 * 1000);
+setInterval(() => { pollForReplies().catch(e => console.warn('Reply poll failed:', e.message)); }, 3 * 60 * 1000);
 
-// Independent of Gmail — a plain date check, same cadence.
+// Independent of Gmail — a plain date check, same cadence. Wrapped because everything in
+// here is synchronous file I/O: before the process-level handlers below existed, one failed
+// write in a timer took the whole server down.
 function checkDormantReturns() {
-  const today = new Date().toISOString().slice(0, 10);
-  for (const id of db.listDormantDue(today)) {
-    db.returnFromDormant(id);
-    db.addNote(id, 'Returned from dormant', 'dormant');
-    audit.log({ userId: null, username: 'system (dormant check)', action: 'prospect.dormant.return', prospectId: id, detail: `Returned on ${today}` });
-    broadcast('dormant-return', { id });
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    for (const id of db.listDormantDue(today)) {
+      db.returnFromDormant(id);
+      db.addNote(id, 'Returned from dormant', 'dormant');
+      audit.log({ userId: null, username: 'system (dormant check)', action: 'prospect.dormant.return', prospectId: id, detail: `Returned on ${today}` });
+      broadcast('dormant-return', { id });
+    }
+  } catch (e) {
+    console.warn('Dormant-return check failed:', e.message);
   }
 }
 setInterval(checkDormantReturns, 3 * 60 * 1000);
@@ -695,17 +843,26 @@ app.get('/api/users/ccable', (_q, res) => {
 });
 
 // Config
-app.get('/api/config', (_q, res) => {
+// Readable by any signed-in user, but only the two fields the drafting flow actually
+// needs. The rest — the API key's tail, the server's watch-folder path, and the backup
+// and digest schedule state — is operational detail that only admins see, and that only
+// admins can change through the routes below.
+app.get('/api/config', (q, res) => {
   const c = config.get();
-  ok(res, {
-    hasApiKey: config.hasApiKey(), keyTail: c.anthropicApiKey ? c.anthropicApiKey.slice(-4) : '',
-    draftModel: c.draftModel, defaultFollowupDays: c.defaultFollowupDays, watchFolder: watchedDir(),
+  const body = { hasApiKey: config.hasApiKey(), defaultFollowupDays: c.defaultFollowupDays };
+  if (q.user && q.user.role === 'admin') Object.assign(body, {
+    isAdmin: true,
+    keyTail: c.anthropicApiKey ? c.anthropicApiKey.slice(-4) : '',
+    draftModel: c.draftModel, watchFolder: watchedDir(),
     backupFrequency: c.backupFrequency, lastBackupAt: c.lastBackupAt,
     digestRecipientIds: c.digestRecipientIds || [], lastDigestWeekKey: c.lastDigestWeekKey
   });
+  ok(res, body);
 });
 
-app.post('/api/config/key', mutating('config.apiKey.update', (q, res) => {
+// The Anthropic key is app-wide: whoever sets it sets it for every user, and a wrong or
+// hostile value silently redirects every draft. Admin-only.
+app.post('/api/config/key', requireAdmin, mutating('config.apiKey.update', (q, res) => {
   config.update({ anthropicApiKey: q.body.key });
   res.locals.audit = { detail: 'API key updated' }; // never log the key itself
   return { ok: true, hasApiKey: config.hasApiKey() };
@@ -727,25 +884,52 @@ app.post('/api/config/google', requireAdmin, mutating('config.google.update', (q
   return { ok: true, hasGoogleCreds: config.hasGoogleCreds() };
 }));
 
-app.post('/api/config', mutating('config.update', (q, res) => {
-  config.update(q.body || {});
-  if ('watchFolder' in (q.body || {})) restartWatching();
-  const safeBody = { ...(q.body || {}) };
-  delete safeBody.anthropicApiKey; // defensive: this route isn't meant to carry secrets, but never log them if it does
-  delete safeBody.googleClientSecret;
-  res.locals.audit = { detail: JSON.stringify(safeBody) };
+// Every key here is app-wide (the watch folder, the default follow-up gap, the draft
+// model), so the same reasoning as /api/config/key applies.
+//
+// The whitelist below is narrower than config.update()'s: that one only rejects keys the
+// app never reads, which still left this route able to write the two secrets and the
+// internal bookkeeping keys (setupCompleted, lastBackupAt, lastDigestWeekKey) that belong
+// to the dedicated routes and the schedulers. Those have their own validation and their
+// own audit lines; a hand-written body reaching them through here would bypass both.
+const CONFIG_POST_KEYS = new Set(['draftModel', 'clerkPhrase', 'defaultFollowupDays', 'watchFolder']);
+
+app.post('/api/config', requireAdmin, mutating('config.update', (q, res) => {
+  const patch = {};
+  for (const [k, v] of Object.entries(q.body || {})) if (CONFIG_POST_KEYS.has(k)) patch[k] = v;
+  config.update(patch);
+  if ('watchFolder' in patch) restartWatching();
+  res.locals.audit = { detail: JSON.stringify(patch) };
   return { ok: true, watchFolder: watchedDir() };
 }));
 
-app.get('/api/watched/path', (_q, res) => ok(res, { path: watchedDir() }));
+app.get('/api/watched/path', requireAdmin, (_q, res) => ok(res, { path: watchedDir() }));
 
 // Catalogs
-app.get('/api/catalog/:which', (q, res) => ok(res, { text: q.params.which === 'services' ? catalogs.readServices() : catalogs.readFirmFacts() }));
+// The firm facts and service catalog are the raw material of every draft the app writes,
+// so both reading and rewriting them is admin-only. `which` is validated against an
+// explicit list rather than falling through to firm-and-people on anything unrecognized:
+// a typo'd path used to silently read (or overwrite) the wrong catalog.
+const CATALOGS = {
+  services: [catalogs.readServices, catalogs.writeServices],
+  firm: [catalogs.readFirmFacts, catalogs.writeFirmFacts],
+  'firm-and-people': [catalogs.readFirmFacts, catalogs.writeFirmFacts] // matches the filename on disk
+};
 
-app.post('/api/catalog/:which', mutating('catalog.update', (q, res) => {
+app.get('/api/catalog/:which', requireAdmin, (q, res) => {
+  const entry = CATALOGS[q.params.which];
+  if (!entry) return res.status(404).json({ error: 'Unknown catalog' });
+  ok(res, { text: entry[0]() });
+});
+
+app.post('/api/catalog/:which', requireAdmin, mutating('catalog.update', (q, res) => {
   const which = q.params.which;
-  which === 'services' ? catalogs.writeServices(q.body.text) : catalogs.writeFirmFacts(q.body.text);
-  res.locals.audit = { detail: `${which} catalog updated (${(q.body.text || '').length} chars)` };
+  const entry = CATALOGS[which];
+  if (!entry) { res.status(404).json({ error: 'Unknown catalog' }); res.locals.skipAudit = true; return; }
+  const text = (q.body || {}).text;
+  if (typeof text !== 'string') { res.status(400).json({ error: 'text must be a string' }); res.locals.skipAudit = true; return; }
+  entry[1](text);
+  res.locals.audit = { detail: `${which} catalog updated (${text.length} chars)` };
   return { ok: true };
 }));
 
@@ -957,15 +1141,30 @@ app.post('/api/config/backup-schedule', requireAdmin, mutating('config.backup.up
 // needing special-case handling. lastBackupAt persists in config.json, so the schedule
 // survives restarts.
 const BACKUP_INTERVAL_MS = { daily: 24 * 60 * 60 * 1000, '3days': 3 * 24 * 60 * 60 * 1000, weekly: 7 * 24 * 60 * 60 * 1000 };
+// The watermark (lastBackupAt) is only written once a send succeeds, so a run that takes
+// longer than the 5-minute check interval would otherwise be started again by the next
+// tick — and again by the one after that, each rebuilding the whole zip and holding it in
+// memory. One flag, cleared in a finally, is enough to make the checks skip a run in flight.
+let backupRunning = false;
+// A failing backup used to be retried every 5 minutes forever — rebuilding and
+// re-compressing the entire data directory each time, for a cause (no Gmail creds, a file
+// too big, a Google outage) that five minutes never fixes. Back off instead: 15 min, then
+// 1 h, then 6 h between attempts, reset the moment one succeeds.
+const BACKUP_RETRY_BACKOFF_MS = [15 * 60 * 1000, 60 * 60 * 1000, 6 * 60 * 60 * 1000];
+let backupFailures = 0;
+let backupRetryAfter = 0;
 async function checkScheduledBackup() {
+  if (backupRunning) return;
+  if (Date.now() < backupRetryAfter) return;
   const cfg = config.get();
   const intervalMs = BACKUP_INTERVAL_MS[cfg.backupFrequency];
   if (!intervalMs) return; // 'off'
   const last = cfg.lastBackupAt ? new Date(cfg.lastBackupAt).getTime() : Date.now();
   if (Date.now() - last < intervalMs) return;
   if (!gmail.isConnected()) { console.warn('Scheduled backup is due but Gmail is not connected; will retry next check.'); return; }
+  backupRunning = true;
   try {
-    const { buffer, filename } = backup.buildBackupZip(DATA_DIR);
+    const { buffer, filename, skipped } = backup.buildBackupZip(DATA_DIR);
     await gmail.sendAttachmentEmail({
       to: 'marcos@govspringlegal.com',
       subject: `GovSpring Prospecting backup — ${filename}`,
@@ -973,12 +1172,22 @@ async function checkScheduledBackup() {
       attachment: { filename, contentType: 'application/zip', data: buffer }
     });
     config.update({ lastBackupAt: new Date().toISOString() });
-    audit.log({ userId: null, username: 'system (scheduled backup)', action: 'backup.scheduled', detail: filename });
+    backupFailures = 0;
+    backupRetryAfter = 0;
+    const note = skipped && skipped.length ? ` (${skipped.length} file(s) skipped: ${skipped.join(', ')})` : '';
+    audit.log({ userId: null, username: 'system (scheduled backup)', action: 'backup.scheduled', detail: filename + note });
   } catch (e) {
-    console.warn('Scheduled backup failed:', e.message);
+    const waitMs = BACKUP_RETRY_BACKOFF_MS[Math.min(backupFailures, BACKUP_RETRY_BACKOFF_MS.length - 1)];
+    backupFailures++;
+    backupRetryAfter = Date.now() + waitMs;
+    const retryIn = `next attempt in ${Math.round(waitMs / 60000)} min`;
+    console.warn('Scheduled backup failed:', e.message, `— ${retryIn}`);
+    audit.log({ userId: null, username: 'system (scheduled backup)', action: 'backup.failed', detail: `${e.message} (attempt ${backupFailures}, ${retryIn})` });
+  } finally {
+    backupRunning = false;
   }
 }
-setInterval(checkScheduledBackup, 5 * 60 * 1000);
+setInterval(() => { checkScheduledBackup().catch(e => console.warn('Scheduled backup check failed:', e.message)); }, 5 * 60 * 1000);
 
 // Admin-only removal, used from a blocked-send screen's "remove and send" action. Not a
 // general exclusions-management surface — that's out of scope for this feature.
@@ -1029,26 +1238,43 @@ app.post('/api/admin/digest/send-now', requireAdmin, mutating('digest.sent', asy
 // during daylight saving. lastDigestWeekKey persists in config.json, so neither a restart
 // nor a missed week can cause a double-send; a week where Gmail was disconnected the whole
 // time is logged once as missed and not retried into the following week.
+//
+// The week key is written only when the digest actually goes out, or once the retry window
+// below has closed. Writing it unconditionally meant one blip at 06:00 — a Gmail hiccup, a
+// redeploy mid-send — cancelled the entire week silently.
+const DIGEST_RETRY_UNTIL_HOUR = 12; // NY time; after this the week is recorded as missed
+let digestRunning = false;          // a slow send must not be started again by the next tick
 async function checkDigestSchedule() {
+  if (digestRunning) return;
   const now = new Date();
   const ny = digest.nyParts(now);
   if (ny.weekday !== 'Mon' || ny.hour < 6) return;
   const weekKey = digest.nyWeekKey(now);
   if (config.get().lastDigestWeekKey === weekKey) return;
+  const windowClosed = ny.hour >= DIGEST_RETRY_UNTIL_HOUR;
+
   if (!gmail.isConnected()) {
-    audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: 'Gmail is not connected; the Monday digest could not be sent.' });
-  } else {
-    try {
-      const { to, subject } = await sendDigest();
-      audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.sent', detail: `Sent to ${to} — ${subject}` });
-    } catch (e) {
-      audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: `Send failed: ${e.message}` });
-    }
+    if (!windowClosed) { console.warn('Monday digest: Gmail is not connected; will retry at the next check.'); return; }
+    audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: 'Gmail was not connected between 06:00 and 12:00; the Monday digest could not be sent.' });
+    config.update({ lastDigestWeekKey: weekKey });
+    return;
   }
-  config.update({ lastDigestWeekKey: weekKey });
+
+  digestRunning = true;
+  try {
+    const { to, subject } = await sendDigest();
+    audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.sent', detail: `Sent to ${to} — ${subject}` });
+    config.update({ lastDigestWeekKey: weekKey });
+  } catch (e) {
+    if (!windowClosed) { console.warn('Monday digest send failed; will retry at the next check:', e.message); return; }
+    audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: `Send kept failing until 12:00: ${e.message}` });
+    config.update({ lastDigestWeekKey: weekKey });
+  } finally {
+    digestRunning = false;
+  }
 }
-setInterval(checkDigestSchedule, 15 * 60 * 1000);
-checkDigestSchedule();
+setInterval(() => { checkDigestSchedule().catch(e => console.warn('Digest check failed:', e.message)); }, 15 * 60 * 1000);
+checkDigestSchedule().catch(e => console.warn('Digest check failed at startup:', e.message));
 
 // ---- Admin: audit log ----
 // Supports three views admins need: (1) who did a given action — filter by action, read
@@ -1068,6 +1294,13 @@ app.get('/api/admin/audit', requireAdmin, (q, res) => {
   catch (e) { fail(res, e); }
 });
 app.get('/api/admin/audit/actions', requireAdmin, (_q, res) => { try { ok(res, audit.distinctActions()); } catch (e) { fail(res, e); } });
+
+// An unknown /api path is a bug, not a page. Without this it fell through to the catch-all
+// below and returned index.html with status 200, so a typo'd or removed endpoint looked to
+// the browser like a successful call whose JSON just failed to parse.
+// Registered with app.use, not app.all: app.all would add a route layer that the audit
+// coverage self-check below then reports as an unaudited state-changing endpoint.
+app.use('/api', (_q, res) => res.status(404).json({ error: 'Unknown endpoint' }));
 
 // Fallback to the UI for any other route.
 app.get('*', (_q, res) => res.sendFile(path.join(APP_DIR, 'public', 'index.html')));
@@ -1099,16 +1332,43 @@ function checkAuditCoverage() {
 }
 checkAuditCoverage();
 
-// Bind to 0.0.0.0 so the app is reachable both locally (localhost) and over your private
-// Tailscale network from your other devices. It is NOT on the public internet: Tailscale is
-// a private encrypted network only your signed-in devices can join, and the password gates
-// access on top of that. If you ever want to lock it to this machine only, change the host
-// below back to '127.0.0.1'.
+// ---- Process-level safety nets ----
+// Node makes an unhandled promise rejection fatal by default (v15+), so one rejected
+// promise anywhere — a Gmail call in an interval, a digest send — would take the whole
+// server down and log nothing useful. These log the real error and keep serving; a crash
+// on Railway means every user is signed out of a working app for no reason.
+process.on('unhandledRejection', (reason) => {
+  console.error('UNHANDLED REJECTION — the server is staying up. Cause:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION — the server is staying up. Cause:', err);
+});
+
+// Bind to 0.0.0.0 so Railway's proxy can reach the container (and, on a local run, so the
+// app is reachable from another device on the same private network). Access control is the
+// session cookie and the /api gate above, not the bind address.
 const HOST = process.env.HOST || '0.0.0.0';
-app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, HOST, () => {
   console.log('');
   console.log('  GovSpring Prospecting is running.');
-  console.log('  On this computer:      http://localhost:' + PORT);
-  console.log('  From your other devices (via Tailscale): http://<this-machine-tailscale-address>:' + PORT);
+  // The Tailscale line here was left over from the desktop build; this deploys on Railway
+  // now, and the team reaches it at the service's public domain.
+  if (ON_RAILWAY) console.log('  Public URL: whatever domain is attached to this Railway service');
+  else console.log('  On this computer:      http://localhost:' + PORT);
+  console.log(`  Secure session cookies: ${COOKIE_SECURE ? 'on' : 'off (no TLS expected)'}`);
   console.log('');
 });
+
+// Railway sends SIGTERM on every redeploy and then SIGKILLs after a grace period. Closing
+// the listener first lets in-flight requests finish, so a redeploy landing mid-save can't
+// cut a write off part-way; the watcher is closed too so it doesn't hold the process open.
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    console.log(`${sig} received — shutting down.`);
+    server.close(() => {
+      if (watcher) watcher.close().catch(() => {});
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 8000).unref(); // don't hang forever on a stuck socket
+  });
+}

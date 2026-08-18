@@ -8,6 +8,10 @@
   },
   "author": "",
   "license": "UNLICENSED",
+  "//engines": "The real floor is Node 15.7, where 'base64url' encoding arrived: the session token (auth.js), the password and invite-token code (users.js) and six places in gmail.js all depend on it. Nothing pinned the version before this, so Railway picked a Nixpacks default — a silent bump below the floor would break every session token and lock the whole team out with no obvious cause. 20 is the nearest maintained LTS above it.",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "express": "^4.21.0",
     "chokidar": "^3.6.0"

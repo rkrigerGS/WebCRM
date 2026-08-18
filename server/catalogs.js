@@ -6,6 +6,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const store = require('./store');
 
 let dirs = null;
 
@@ -45,18 +47,14 @@ function init(userDataDir, appDir) {
 let templatesPath;
 let templateStore = { templates: [], nextId: 1 };
 function loadTemplates() {
-  try {
-    templateStore = JSON.parse(fs.readFileSync(templatesPath, 'utf8'));
-    templateStore.templates = templateStore.templates || [];
-    templateStore.nextId = templateStore.nextId || (templateStore.templates.reduce((m, t) => Math.max(m, t.id), 0) + 1);
-  } catch {
-    saveTemplates();
-  }
+  const raw = store.readJSON(templatesPath); // throws on a corrupt/unreadable file
+  if (!raw) return saveTemplates(); // genuinely no file yet: write the empty store
+  templateStore = raw;
+  templateStore.templates = templateStore.templates || [];
+  templateStore.nextId = templateStore.nextId || store.nextIdFrom(templateStore.templates);
 }
 function saveTemplates() {
-  const tmp = templatesPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(templateStore, null, 2), 'utf8');
-  fs.renameSync(tmp, templatesPath);
+  store.writeJSON(templatesPath, templateStore);
 }
 const MAX_TEMPLATES = 300;
 
@@ -68,12 +66,22 @@ function readServices() {
   return safeRead(path.join(dirs.userCatalogs, 'services.md'));
 }
 
+// Atomic: a crash part-way through a save must not leave a truncated catalog behind,
+// since these files are the raw material every draft is built from.
 function writeFirmFacts(text) {
-  fs.writeFileSync(path.join(dirs.userCatalogs, 'firm-and-people.md'), text, 'utf8');
+  store.writeText(path.join(dirs.userCatalogs, 'firm-and-people.md'), text);
 }
 
 function writeServices(text) {
-  fs.writeFileSync(path.join(dirs.userCatalogs, 'services.md'), text, 'utf8');
+  store.writeText(path.join(dirs.userCatalogs, 'services.md'), text);
+}
+
+// Library filenames were Date.now() plus the company name, so two approvals for the same
+// company inside one millisecond — one user double-clicking Save, or two users approving
+// at once — produced the same filename and the second silently overwrote the first. The
+// random suffix makes each save its own file; ordering by the timestamp prefix still works.
+function uniqueStamp() {
+  return `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 }
 
 // The approved-email library: each approved final email is saved as a small JSON file.
@@ -89,8 +97,8 @@ function listApprovedEmails() {
 function saveApprovedEmail(record) {
   // record: { company_name, recipient, services, final_text, first_draft, saved_at }
   const safe = (record.company_name || 'unknown').replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
-  const fname = `${Date.now()}_${safe}.json`;
-  fs.writeFileSync(path.join(dirs.approvedDir, fname), JSON.stringify(record, null, 2), 'utf8');
+  const fname = `${uniqueStamp()}_${safe}.json`;
+  store.writeJSON(path.join(dirs.approvedDir, fname), record);
   return fname;
 }
 
@@ -110,8 +118,8 @@ function listReplyEmails() {
 // every panel open, so the panel stays fast.
 function saveReplyEmail(record) {
   const safeName = (record.company_name || 'unknown').replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
-  const fname = `${Date.now()}_${safeName}.json`;
-  fs.writeFileSync(path.join(dirs.replyDir, fname), JSON.stringify(record, null, 2), 'utf8');
+  const fname = `${uniqueStamp()}_${safeName}.json`;
+  store.writeJSON(path.join(dirs.replyDir, fname), record);
   addTemplatesFromText(record.final_text || '', record.company_name || '', record.recipient_name || '');
   return fname;
 }

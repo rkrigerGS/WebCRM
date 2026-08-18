@@ -3,8 +3,8 @@
 // Lives as a plain JSON file in the app's user-data directory, separate from the
 // database, so it is easy to inspect and never travels in the export bundle.
 
-const fs = require('fs');
 const path = require('path');
+const store = require('./store');
 
 let configPath;
 let cache = null;
@@ -20,7 +20,8 @@ const DEFAULTS = {
   backupFrequency: 'off',        // 'off' | 'daily' | '3days' | 'weekly' (see server/backup.js)
   lastBackupAt: '',              // ISO timestamp of the last scheduled backup sent, or '' if never
   digestRecipientIds: [],        // additional user ids to CC on the Monday digest, beyond Marcos (always included) — see server/digest.js
-  lastDigestWeekKey: ''          // NY-local date (YYYY-MM-DD) of the Monday last sent or logged-as-missed, so a restart never double-sends or loses the week
+  lastDigestWeekKey: '',         // NY-local date (YYYY-MM-DD) of the Monday last sent or logged-as-missed, so a restart never double-sends or loses the week
+  setupCompleted: false          // set once the first admin exists; a second gate on /api/auth/setup (see server.js)
 };
 
 function init(userDataDir) {
@@ -30,23 +31,29 @@ function init(userDataDir) {
 }
 
 function load() {
-  try {
-    cache = { ...DEFAULTS, ...JSON.parse(fs.readFileSync(configPath, 'utf8')) };
-  } catch {
-    cache = { ...DEFAULTS };
-    save();
-  }
+  const raw = store.readJSON(configPath); // throws on a corrupt/unreadable file
+  cache = { ...DEFAULTS, ...(raw || {}) };
+  if (!raw) save(); // genuinely no file yet: write the defaults
   return cache;
 }
 
 function get() { return cache || load(); }
 
 function save() {
-  fs.writeFileSync(configPath, JSON.stringify(cache, null, 2), 'utf8');
+  store.writeJSON(configPath, cache);
 }
 
+// Only keys that exist in DEFAULTS can be written. Callers reach this from request
+// handlers, and without the filter an arbitrary request body could add fields the app
+// never reads but that persist forever, or set an internal bookkeeping key by hand.
+// This is a shape guard, not an access control — the routes that expose update() are
+// admin-gated separately in server.js.
+const ALLOWED_KEYS = new Set(Object.keys(DEFAULTS));
+
 function update(patch) {
-  cache = { ...get(), ...patch };
+  const clean = {};
+  for (const [k, v] of Object.entries(patch || {})) if (ALLOWED_KEYS.has(k)) clean[k] = v;
+  cache = { ...get(), ...clean };
   save();
   return cache;
 }

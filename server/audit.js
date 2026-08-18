@@ -3,12 +3,12 @@
 // "AUDIT CONVENTION" comment above it) so this file is the single source of truth for who
 // did what, to which prospect, and when. Visible to admins only (enforced in server.js).
 
-const fs = require('fs');
 const path = require('path');
+const store_ = require('./store');
 
 let logPath;
 let store = { entries: [], nextId: 1 };
-const MAX_ENTRIES = 50000; // matches the spirit of db.js's ingest_log cap, sized larger since audit entries are far more frequent
+const MAX_ENTRIES = 50000; // oldest entries roll off past this, so the log can't grow without bound
 
 function init(dataDir) {
   logPath = path.join(dataDir, 'audit-log.json');
@@ -16,20 +16,15 @@ function init(dataDir) {
 }
 
 function load() {
-  try {
-    store = JSON.parse(fs.readFileSync(logPath, 'utf8'));
-    store.entries = store.entries || [];
-    store.nextId = store.nextId || (store.entries.reduce((m, e) => Math.max(m, e.id), 0) + 1);
-  } catch {
-    save(); // no file yet: write the empty store
-  }
+  const raw = store_.readJSON(logPath); // throws on a corrupt/unreadable file
+  if (!raw) return save(); // genuinely no file yet: write the empty store
+  store = raw;
+  store.entries = store.entries || [];
+  store.nextId = store.nextId || store_.nextIdFrom(store.entries);
 }
 
-// Atomic save: write to a temp file then rename over the real one (matches db.js).
 function save() {
-  const tmp = logPath + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), 'utf8');
-  fs.renameSync(tmp, logPath);
+  store_.writeJSON(logPath, store);
 }
 
 // userId is null for actions with no logged-in actor (e.g. the folder watcher).

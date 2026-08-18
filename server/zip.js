@@ -38,6 +38,17 @@ function dosDateTime(date) {
 // itself calls this directly, so it defaults to the current time).
 function createZip(entries, now) {
   now = now || new Date();
+  // The end-of-central-directory record stores the entry count in 16 bits, so 65,535 is a
+  // hard ceiling for a non-zip64 archive. Without this check the writeUInt16LE below
+  // throws a bare ERR_OUT_OF_RANGE that says nothing about what to do — and the scheduled
+  // backup would then fail silently every night forever.
+  const MAX_ENTRIES = 0xFFFF;
+  if (entries.length > MAX_ENTRIES) {
+    throw new Error(
+      `Backup contains ${entries.length} files, over the ${MAX_ENTRIES}-file limit of the zip format used here. ` +
+      `Archive or delete old files under the data directory (approved-emails and watched-dossiers grow without limit) and try again.`
+    );
+  }
   const { time, date } = dosDateTime(now);
   const localParts = [];
   const centralParts = [];
@@ -49,11 +60,16 @@ function createZip(entries, now) {
     const crc = crc32(dataBuf);
     const compressed = zlib.deflateRawSync(dataBuf);
     const method = 8; // deflate
+    // General-purpose bit 11 declares the filename as UTF-8. Without it, extractors read
+    // names as CP437 and any non-ASCII character (reachable through watched-dossiers/,
+    // whose names come from whatever the research tool wrote) produces a mangled name or
+    // an outright extraction failure. Names here are always written UTF-8, so set it.
+    const flags = 0x800;
 
     const localHeader = Buffer.alloc(30);
     localHeader.writeUInt32LE(0x04034b50, 0);   // local file header signature
     localHeader.writeUInt16LE(20, 4);           // version needed to extract
-    localHeader.writeUInt16LE(0, 6);            // general purpose flag
+    localHeader.writeUInt16LE(flags, 6);        // general purpose flag (bit 11 = UTF-8 name)
     localHeader.writeUInt16LE(method, 8);
     localHeader.writeUInt16LE(time, 10);
     localHeader.writeUInt16LE(date, 12);
@@ -69,7 +85,7 @@ function createZip(entries, now) {
     centralHeader.writeUInt32LE(0x02014b50, 0); // central directory signature
     centralHeader.writeUInt16LE(20, 4);         // version made by
     centralHeader.writeUInt16LE(20, 6);         // version needed to extract
-    centralHeader.writeUInt16LE(0, 8);          // general purpose flag
+    centralHeader.writeUInt16LE(flags, 8);      // general purpose flag (bit 11 = UTF-8 name)
     centralHeader.writeUInt16LE(method, 10);
     centralHeader.writeUInt16LE(time, 12);
     centralHeader.writeUInt16LE(date, 14);
