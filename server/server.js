@@ -11,6 +11,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const chokidar = require('chokidar');
 
 const db = require('./db');
@@ -21,6 +22,7 @@ const auth = require('./auth');
 const users = require('./users');
 const audit = require('./audit');
 const gmail = require('./gmail');
+const calendarAvailability = require('./calendar');
 const backup = require('./backup');
 const digest = require('./digest');
 
@@ -55,6 +57,56 @@ if (ON_RAILWAY && !process.env.RAILWAY_VOLUME_MOUNT_PATH) {
 // writing into a directory that did not exist yet.
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
+// ---- Live-update fan-out and background-failure reporting ----
+// Declared here, above the init() calls, because gmail.init() below is handed reportIssue
+// as its failure hook. These were originally defined further down next to the /api/events
+// route; that left `recentIssues` in its temporal dead zone at the moment gmail.init() ran,
+// so the first background failure reported during startup would have thrown a
+// ReferenceError instead of a toast. The route registration itself stays down there, after
+// the session gate — moving it up here would put it in front of authentication.
+const clients = new Set(); // open SSE responses, each tagged with the viewer's role
+function broadcast(event, data, adminOnly = false) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of clients) {
+    if (adminOnly && !res.__isAdmin) continue;
+    try { res.write(payload); } catch {}
+  }
+}
+
+// Background failures (Gmail polling, digest, backup, OAuth, calendar) used to only reach
+// console.warn — invisible unless someone happened to be tailing the server log. Every call
+// site now also broadcasts a short reference code an admin can see as a toast and read back
+// to whoever is debugging it, so "the connection isn't working" turns into "ref 4f2a91".
+//
+// The broadcast is adminOnly. err.message routinely contains exactly what audit finding L1
+// says must not reach a browser — absolute paths, JSON parse offsets, Google's verbatim
+// error text including cloud project ids. Gating it on the client (a role check before
+// rendering the toast) is not access control: the payload is in the browser either way and
+// readable in devtools. So the filter lives in broadcast(), server-side.
+//
+// Same scope+message re-suppresses for 30 minutes so a 3-minute poll loop doesn't retoast
+// the identical failure every cycle; it still logs a fresh ref each time so the server log
+// has a trail even while the UI stays quiet. Scopes must therefore be COARSE — one scope
+// per failing subsystem, not per record — or a single root cause that affects N records
+// produces N toasts and defeats the suppression entirely.
+const ISSUE_REBROADCAST_MS = 30 * 60 * 1000;
+const MAX_TRACKED_ISSUES = 200; // bound the map; scopes are coarse, so this is far above real use
+const recentIssues = new Map(); // scope -> { message, at }
+function reportIssue(scope, err, logDetail) {
+  const message = (err && err.message) || String(err);
+  const ref = crypto.randomBytes(3).toString('hex');
+  console.error(`[${ref}] ${scope}:`, (err && err.stack) || err);
+  if (logDetail) console.error(`[${ref}] context: ${logDetail}`);
+  const prev = recentIssues.get(scope);
+  if (prev && prev.message === message && Date.now() - prev.at < ISSUE_REBROADCAST_MS) return ref;
+  if (recentIssues.size >= MAX_TRACKED_ISSUES && !recentIssues.has(scope)) {
+    recentIssues.delete(recentIssues.keys().next().value); // oldest insertion first
+  }
+  recentIssues.set(scope, { message, at: Date.now() });
+  broadcast('issue', { ref, scope, message }, true);
+  return ref;
+}
+
 // config first: db.js reads defaultFollowupDays out of it when creating a prospect.
 console.log(`Data directory: ${DATA_DIR}`);
 config.init(DATA_DIR);
@@ -63,7 +115,7 @@ catalogs.init(DATA_DIR, APP_DIR);
 auth.init(DATA_DIR);
 users.init(DATA_DIR);
 audit.init(DATA_DIR);
-gmail.init(DATA_DIR);
+gmail.init(DATA_DIR, (scope, err) => reportIssue(scope, err));
 // Backfill for installations that were set up before setupCompleted existed: accounts are
 // already here, so record that setup happened and let the gate on /api/auth/setup work.
 if (users.hasAnyUser() && !config.get().setupCompleted) config.update({ setupCompleted: true });
@@ -303,17 +355,19 @@ app.use(express.static(path.join(APP_DIR, 'public')));
 // ---- Live updates via Server-Sent Events ----
 // When a dossier is ingested, the server pushes an event so the browser refreshes live,
 // the same way the desktop app updated when a batch landed.
-const clients = new Set();
+// `clients`, broadcast() and reportIssue() are defined near the top of this file, ahead of
+// the init() calls that need reportIssue. Only the route lives here, where the session gate
+// above already applies.
 app.get('/api/events', (req, res) => {
   res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   res.flushHeaders();
+  // Recorded per connection so broadcast() can withhold admin-only events (see reportIssue).
+  // A role change mid-session is not reflected until the stream reconnects, which a reload does.
+  res.__isAdmin = !!(req.user && req.user.role === 'admin');
   clients.add(res);
   req.on('close', () => clients.delete(res));
 });
-function broadcast(event, data) {
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of clients) { try { res.write(payload); } catch {} }
-}
+
 // An idle SSE stream can go minutes without traffic, and proxies (Railway's edge included)
 // drop connections they think are dead. A comment line every 25s keeps the stream alive;
 // it is ignored by the EventSource client, so nothing in the browser has to handle it.
@@ -403,8 +457,8 @@ const ok = (res, data) => res.json(data);
 // full where they're useful — the server log — and a generic line in the response.
 const fail = (res, e) => {
   if (e && e.status) return res.status(e.status).json({ error: e.message });
-  console.error('Unhandled server error:', (e && e.stack) || e);
-  return res.status(500).json({ error: 'Something went wrong on the server. If this keeps happening, check the server log.' });
+  const ref = reportIssue('request', e);
+  return res.status(500).json({ error: `Something went wrong on the server (ref ${ref}). If this keeps happening, report that code.`, ref });
 };
 
 app.get('/api/prospects', (_q, res) => { try { ok(res, db.listProspects()); } catch (e) { fail(res, e); } });
@@ -521,6 +575,25 @@ app.get('/api/prospects/:id/questions', (q, res) => {
   } catch (e) { fail(res, e); }
 });
 
+// Open only to logged-in users, same as the questions/generate endpoints below — drafting
+// isn't admin-gated, so offering real times shouldn't be either. Not wrapped in mutating():
+// this reads Marcos's calendar, it doesn't change any app state.
+// Two different outcomes share the "no slots" shape, and they must not look alike: Gmail or
+// the Calendar grant simply not being set up yet is an expected state with a self-explanatory
+// message, while anything else is a real failure that needs a ref code and a logged stack.
+// Previously both collapsed into {connected:false, reason}, so a broken calendar was
+// indistinguishable from an unconfigured one and produced no ref and no server-log entry.
+app.get('/api/calendar/availability', (_q, res) => {
+  calendarAvailability.getAvailableSlots()
+    .then(slots => ok(res, { connected: true, slots }))
+    .catch(e => {
+      if (e && e.notConnected) return ok(res, { connected: false, reason: e.message, slots: [] });
+      const ref = reportIssue('calendar.availability', e);
+      // The raw message stays server-side (audit finding L1); the ref is what gets reported back.
+      ok(res, { connected: false, failed: true, ref, reason: `Calendar lookup failed (ref ${ref}).`, slots: [] });
+    });
+});
+
 // Every successful generation is audited — including regenerates and follow-up drafts —
 // since each call spends Claude API tokens even when nothing is persisted to the prospect
 // record yet (that only happens on the very first draft; see `persisted` below).
@@ -538,7 +611,8 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
     const { draft, usage } = await emailEngine.generateDraft({
       dossier: p.dossier, chosenIssue, chosenServices: a.services || [],
       personalNote: a.personalNote || null, isFollowup: !!a.isFollowup,
-      priorEmailText: a.priorEmailText || p.final_sent || p.first_draft || ''
+      priorEmailText: a.priorEmailText || p.final_sent || p.first_draft || '',
+      chosenSlots: Array.isArray(a.chosenSlots) ? a.chosenSlots.filter(s => typeof s === 'string').slice(0, 5) : []
     });
     let persisted = false;
     if (!a.isFollowup && !p.first_draft) { db.updateProspect(id, { first_draft: draft }); persisted = true; }
@@ -548,8 +622,12 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
   } catch (e) {
     // Same reasoning as the failed sends: a draft that never came back is worth a line in
     // the log, otherwise a run of Claude failures is invisible.
-    res.locals.audit = { prospectId: id, detail: `Draft generation FAILED — ${String(e && e.message || e)}` };
-    return res.json({ ok: false, error: String(e && e.message || e) });
+    // This handler catches its own errors, so mutating()'s catch (and therefore fail()) never
+    // sees them — without the explicit reportIssue here a failed generation produced no ref
+    // code at all, which is the one case the reference-code feature was asked for by name.
+    const ref = reportIssue('draft.generate', e, `prospect ${id}`);
+    res.locals.audit = { prospectId: id, detail: `Draft generation FAILED — ${String(e && e.message || e)} (ref ${ref})` };
+    return res.json({ ok: false, error: String(e && e.message || e), ref });
   }
 }));
 
@@ -696,8 +774,9 @@ app.post('/api/prospects/:id/reply/generate', mutating('prospect.reply.draft.gen
   } catch (e) {
     // Same reasoning as the failed sends: a draft that never came back is worth a line in
     // the log, otherwise a run of Claude failures is invisible.
-    res.locals.audit = { prospectId: id, detail: `Reply draft generation FAILED — ${String(e && e.message || e)}` };
-    return res.json({ ok: false, error: String(e && e.message || e) });
+    const ref = reportIssue('reply.draft.generate', e, `prospect ${id}`); // see the outreach-draft catch above
+    res.locals.audit = { prospectId: id, detail: `Reply draft generation FAILED — ${String(e && e.message || e)} (ref ${ref})` };
+    return res.json({ ok: false, error: String(e && e.message || e), ref });
   }
 }));
 
@@ -783,7 +862,7 @@ async function pollForReplies() {
   // the sender instead, which means the poll can't run until we know our own address.
   const ours = gmail.connectedEmail().trim().toLowerCase();
   if (!ours) {
-    console.warn('Reply poll skipped: the connected Gmail address is unknown, so our own sent messages cannot be told apart from replies. Reconnect Gmail in Settings.');
+    reportIssue('gmail.replyPoll', new Error('Reply poll skipped: the connected Gmail address is unknown, so our own sent messages cannot be told apart from replies. Reconnect Gmail in Settings.'));
     return;
   }
   pollRunning = true;
@@ -803,14 +882,19 @@ async function pollForReplies() {
         audit.log({ userId: null, username: 'system (reply poll)', action: 'prospect.reply.detected', prospectId: p.id, detail: `From ${latest.from}` });
         broadcast('reply', { id: p.id, company_name: p.company_name });
       } catch (e) {
-        console.warn(`Reply poll failed for prospect ${p.id}:`, e.message);
+        // One coarse scope, deliberately not per-prospect: the usual cause here is global
+        // (the Gmail API disabled for the project, a revoked grant), which fails identically
+        // for every prospect in the loop. A per-prospect scope gave the identical message a
+        // distinct dedup key each time, so one root cause produced one toast per prospect
+        // every cycle and grew recentIssues with the prospect count. The id goes to the log.
+        reportIssue('gmail.replyPoll', e, `prospect ${p.id}`);
       }
     }
   } finally {
     pollRunning = false;
   }
 }
-setInterval(() => { pollForReplies().catch(e => console.warn('Reply poll failed:', e.message)); }, 3 * 60 * 1000);
+setInterval(() => { pollForReplies().catch(e => reportIssue('gmail.replyPoll', e)); }, 3 * 60 * 1000);
 
 // Independent of Gmail — a plain date check, same cadence. Wrapped because everything in
 // here is synchronous file I/O: before the process-level handlers below existed, one failed
@@ -825,7 +909,7 @@ function checkDormantReturns() {
       broadcast('dormant-return', { id });
     }
   } catch (e) {
-    console.warn('Dormant-return check failed:', e.message);
+    reportIssue('dormantReturn', e);
   }
 }
 setInterval(checkDormantReturns, 3 * 60 * 1000);
@@ -1071,8 +1155,8 @@ app.get('/api/admin/gmail/callback', requireAdmin, async (req, res) => {
     audit.log({ userId: req.user.id, username: req.user.username, action: 'gmail.connect', detail: `Connected as ${gmail.getStatus().email}` });
     res.redirect('/?gmail=connected');
   } catch (e) {
-    console.warn('Gmail OAuth callback failed:', e.message);
-    res.redirect('/?gmail=error');
+    const ref = reportIssue('gmail.oauthCallback', e);
+    res.redirect('/?gmail=error&ref=' + ref);
   }
 });
 
@@ -1161,7 +1245,7 @@ async function checkScheduledBackup() {
   if (!intervalMs) return; // 'off'
   const last = cfg.lastBackupAt ? new Date(cfg.lastBackupAt).getTime() : Date.now();
   if (Date.now() - last < intervalMs) return;
-  if (!gmail.isConnected()) { console.warn('Scheduled backup is due but Gmail is not connected; will retry next check.'); return; }
+  if (!gmail.isConnected()) { reportIssue('backup.scheduled', new Error('Scheduled backup is due but Gmail is not connected; will retry next check.')); return; }
   backupRunning = true;
   try {
     const { buffer, filename, skipped } = backup.buildBackupZip(DATA_DIR);
@@ -1181,13 +1265,13 @@ async function checkScheduledBackup() {
     backupFailures++;
     backupRetryAfter = Date.now() + waitMs;
     const retryIn = `next attempt in ${Math.round(waitMs / 60000)} min`;
-    console.warn('Scheduled backup failed:', e.message, `— ${retryIn}`);
-    audit.log({ userId: null, username: 'system (scheduled backup)', action: 'backup.failed', detail: `${e.message} (attempt ${backupFailures}, ${retryIn})` });
+    const ref = reportIssue('backup.scheduled', e);
+    audit.log({ userId: null, username: 'system (scheduled backup)', action: 'backup.failed', detail: `${e.message} (attempt ${backupFailures}, ${retryIn}, ref ${ref})` });
   } finally {
     backupRunning = false;
   }
 }
-setInterval(() => { checkScheduledBackup().catch(e => console.warn('Scheduled backup check failed:', e.message)); }, 5 * 60 * 1000);
+setInterval(() => { checkScheduledBackup().catch(e => reportIssue('backup.scheduled', e)); }, 5 * 60 * 1000);
 
 // Admin-only removal, used from a blocked-send screen's "remove and send" action. Not a
 // general exclusions-management surface — that's out of scope for this feature.
@@ -1254,7 +1338,7 @@ async function checkDigestSchedule() {
   const windowClosed = ny.hour >= DIGEST_RETRY_UNTIL_HOUR;
 
   if (!gmail.isConnected()) {
-    if (!windowClosed) { console.warn('Monday digest: Gmail is not connected; will retry at the next check.'); return; }
+    if (!windowClosed) { reportIssue('digest.schedule', new Error('Monday digest: Gmail is not connected; will retry at the next check.')); return; }
     audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: 'Gmail was not connected between 06:00 and 12:00; the Monday digest could not be sent.' });
     config.update({ lastDigestWeekKey: weekKey });
     return;
@@ -1266,15 +1350,16 @@ async function checkDigestSchedule() {
     audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.sent', detail: `Sent to ${to} — ${subject}` });
     config.update({ lastDigestWeekKey: weekKey });
   } catch (e) {
-    if (!windowClosed) { console.warn('Monday digest send failed; will retry at the next check:', e.message); return; }
-    audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: `Send kept failing until 12:00: ${e.message}` });
+    if (!windowClosed) { reportIssue('digest.schedule', e); return; }
+    const ref = reportIssue('digest.schedule', e);
+    audit.log({ userId: null, username: 'system (digest schedule)', action: 'digest.missed', detail: `Send kept failing until 12:00: ${e.message} (ref ${ref})` });
     config.update({ lastDigestWeekKey: weekKey });
   } finally {
     digestRunning = false;
   }
 }
-setInterval(() => { checkDigestSchedule().catch(e => console.warn('Digest check failed:', e.message)); }, 15 * 60 * 1000);
-checkDigestSchedule().catch(e => console.warn('Digest check failed at startup:', e.message));
+setInterval(() => { checkDigestSchedule().catch(e => reportIssue('digest.schedule', e)); }, 15 * 60 * 1000);
+checkDigestSchedule().catch(e => reportIssue('digest.schedule', e));
 
 // ---- Admin: audit log ----
 // Supports three views admins need: (1) who did a given action — filter by action, read

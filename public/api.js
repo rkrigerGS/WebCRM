@@ -54,6 +54,7 @@ window.api = {
   uploadDossiers: (dossiers)  => sendJSON('/api/prospects/upload', 'POST', { dossiers }),
 
   emailQuestions: (id)        => getJSON('/api/prospects/' + id + '/questions'),
+  calendarAvailability: ()    => getJSON('/api/calendar/availability'),
   emailGenerate:  (id, ans)   => sendJSON('/api/prospects/' + id + '/generate', 'POST', ans),
   emailSaveFinal: (id, t, m)  => sendJSON('/api/prospects/' + id + '/saveFinal', 'POST', { finalText: t, meta: m }),
 
@@ -91,6 +92,10 @@ window.api = {
   // can be shown differently from a success.
   onIngestFailed: (cb) => onServerEvent('ingest-failed', cb),
   onReply: (cb) => { onServerEvent('reply', cb); onServerEvent('dormant-return', cb); },
+  // Background failures (Gmail polling, digest, backup, OAuth, calendar) — {ref, scope, message}.
+  // The message carries raw internal detail (paths, Google's verbatim errors), so the server
+  // only writes this event to admin streams; non-admin sessions never receive it at all.
+  onIssue: (cb) => onServerEvent('issue', cb),
 
   authStatus: ()                     => getJSON('/api/auth/status'),
   authLogout: ()                     => sendJSON('/api/auth/logout', 'POST'),

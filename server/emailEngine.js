@@ -112,7 +112,7 @@ function detectPersonalHooks(dossier) {
 
 // ---- Step 2: assemble the prompt and call the API ----
 
-function buildDraftPrompt({ dossier, chosenIssue, chosenServices, personalNote, isFollowup, priorEmailText }) {
+function buildDraftPrompt({ dossier, chosenIssue, chosenServices, personalNote, isFollowup, priorEmailText, chosenSlots }) {
   const firm = catalogs.readFirmFacts();
   const servicesCatalog = catalogs.readServices();
   const approved = catalogs.listApprovedEmails();
@@ -132,7 +132,7 @@ NON-NEGOTIABLE STYLE RULES:
 - Warm, congratulatory, never pushy or alarmist. Open by recognizing something specific and real about the prospect's actual work or contract.
 - Bridge naturally from that specific fact to the chosen legal service(s), using the firm's real vocabulary.
 - NO em dashes anywhere. NO en dashes except in numeric ranges. Use periods, commas, or semicolons.
-- Always include the free-consultation offer and the scheduling/availability block, taken verbatim from the boilerplate.
+- Always include the free-consultation offer and a scheduling/availability sentence. By default use the scheduling/availability block verbatim from the boilerplate. If specific open times are given below instead, replace only the "I'm available next week" phrasing with those times (still naturally worded, still followed by the scheduling link and phone number from the boilerplate) — everything else in the block stays as written.
 - Always end with the CC line and the signature block, verbatim from the boilerplate.
 - Frame legal help as keeping regulations from slowing operations down, protecting margin and schedule. Not crisis response.
 - Only state facts about the prospect that appear in the dossier provided. Never invent a contract, an award, a name, or a detail.
@@ -155,6 +155,10 @@ ${exemplars}`;
     ? `Include a brief, natural personal touch: ${personalNote}. Keep it light and genuine, one sentence at most.`
     : `Do not add a personal anecdote.`;
 
+  const slotsText = (chosenSlots && chosenSlots.length)
+    ? `Specific open times to offer instead of "I'm available next week" (from Marcos's actual calendar): ${chosenSlots.join('; ')}. Weave these into the scheduling sentence naturally, e.g. "I'm free ${chosenSlots[0]}${chosenSlots.length > 1 ? ' or ' + chosenSlots[chosenSlots.length - 1] : ''}" — do not list more than these options.`
+    : '';
+
   const followupText = isFollowup
     ? `This is a FOLLOW-UP to a prior email that received no reply. Keep it short (under 120 words), reference that you reached out previously without being pushy, add light new value or a gentle nudge, and keep the same scheduling block and signature. Prior email was:\n\n${priorEmailText || '(not available)'}`
     : '';
@@ -176,6 +180,8 @@ ${issueText}
 Services to pitch (1 to 2): ${chosenServices.join('; ') || '(choose the most fitting from the catalog)'}
 
 ${personalText}
+
+${slotsText}
 
 ${followupText}
 

@@ -25,7 +25,23 @@ function load() {
   store = raw;
   store.users = store.users || [];
   store.nextId = store.nextId || store_.nextIdFrom(store.users);
-  for (const u of store.users) if (u.email === undefined) u.email = ''; // forward-compat with pre-email accounts
+  let healed = false;
+  for (const u of store.users) {
+    if (u.email === undefined) u.email = ''; // forward-compat with pre-email accounts
+    // Self-heal: `pending` and passwordHash must agree — every code path that sets a
+    // password (acceptInvite, resetPassword, admin direct-password create) also clears
+    // pending, so a row that is both pending and has a usable hash means the two fields
+    // drifted (e.g. a hand-edited data file). The hash is the actual source of truth for
+    // whether someone can log in; the badge should follow it, not a separate flag that
+    // can get stuck stale after the person already finished setting up their account.
+    if (u.pending && u.passwordHash) {
+      u.pending = false;
+      u.inviteToken = '';
+      u.inviteExpiresAt = '';
+      healed = true;
+    }
+  }
+  if (healed) save();
 }
 
 function save() {

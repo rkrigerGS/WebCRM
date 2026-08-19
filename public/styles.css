@@ -58,6 +58,7 @@ body { background: var(--paper); color: var(--text); font-family: var(--sans); f
   padding: 8px 10px; border-radius: 6px; cursor: pointer; margin-bottom: 1px;
 }
 .view-item:hover { background: var(--ink-2); }
+.view-item.dragging { opacity: 0.4; }
 .view-item.active { background: var(--ink-3); }
 .view-item.active .view-label { color: var(--gold); font-weight: 600; }
 .view-count {
@@ -77,18 +78,7 @@ body { background: var(--paper); color: var(--text); font-family: var(--sans); f
   display: flex; align-items: center; justify-content: space-between;
   height: 54px; padding: 0 20px; background: var(--card); border-bottom: 1px solid var(--line);
 }
-.tabs { display: flex; gap: 4px; }
-.tab {
-  font: inherit; font-size: 14px; background: transparent; border: none;
-  color: var(--text-soft); padding: 8px 14px; cursor: pointer; border-radius: 6px;
-  position: relative;
-}
-.tab:hover { color: var(--text); }
-.tab.active { color: var(--ink); font-weight: 600; }
-.tab.active::after {
-  content: ''; position: absolute; left: 14px; right: 14px; bottom: -1px; height: 2px;
-  background: var(--gold);
-}
+.view-title { font: inherit; font-size: 17px; font-weight: 600; color: var(--ink); margin: 0; }
 #searchBox {
   font: inherit; padding: 7px 12px; width: 300px;
   border: 1px solid var(--line); border-radius: 6px; background: var(--paper);

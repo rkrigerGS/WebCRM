@@ -19,7 +19,13 @@ const config = require('./config');
 const store = require('./store');
 const audit = require('./audit');
 
-const SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
+// calendar.readonly rides on the same OAuth grant as Gmail — one Google account, one
+// consent screen, one token. calendar.js reuses ensureAccessToken()/requestJSON() below
+// to call the Calendar API; it never gets its own connect flow. An already-connected
+// account only has the gmail.modify grant until it's reconnected once (prompt: 'consent'
+// below forces the combined consent screen on every connect), so isConnected() alone
+// isn't enough to know calendar access is usable — see hasCalendarAccess().
+const SCOPE = 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.readonly';
 const LABEL_NAME = 'WebApp Outreach';
 const TOKEN_REFRESH_SKEW_MS = 2 * 60 * 1000; // refresh 2 minutes before actual expiry
 const REQUEST_TIMEOUT_MS = 20000;            // see requestJSON()
@@ -27,9 +33,11 @@ const REQUEST_TIMEOUT_MS = 20000;            // see requestJSON()
 let tokenPath;
 let token = null; // { refreshToken, accessToken, accessTokenExpiry, email, labelId } | null
 let loadError = ''; // non-empty when the token file exists but could not be read
+let onIssue = () => {}; // (scope, err) => ref — wired to server.js's reportIssue so background failures reach a toast
 
-function init(dataDir) {
+function init(dataDir, issueReporter) {
   tokenPath = path.join(dataDir, 'gmail-token.json');
+  if (issueReporter) onIssue = issueReporter;
   load();
 }
 
@@ -68,6 +76,15 @@ function isConnected() {
   return !!(token && token.refreshToken) && config.hasGoogleCreds();
 }
 
+// The calendar.readonly scope was added after gmail.modify was already in production use,
+// so an account connected before this shipped only has the mail grant until someone hits
+// Disconnect/Connect again — Google's `prompt: 'consent'` then re-shows the combined
+// screen. Checked against the scope string Google actually returned on token exchange,
+// not just "is calendar.js reachable," since the token can be old.
+function hasCalendarAccess() {
+  return !!(token && token.scope && token.scope.includes('calendar'));
+}
+
 function getStatus() {
   return {
     connected: isConnected(),
@@ -75,6 +92,7 @@ function getStatus() {
     // Distinguishes "never connected" from "connected, but the Google client credentials
     // are gone" — the second is fixed in Settings, not by reconnecting.
     needsCreds: !!(token && token.refreshToken) && !config.hasGoogleCreds(),
+    calendarConnected: isConnected() && hasCalendarAccess(),
     loadError
   };
 }
@@ -215,7 +233,8 @@ async function exchangeCode(code, redirectUri) {
     accessToken: json.access_token,
     accessTokenExpiry: Date.now() + (json.expires_in * 1000),
     email: '',
-    labelId: ''
+    labelId: '',
+    scope: json.scope || '' // Google's actually-granted scopes; see hasCalendarAccess()
   };
   save();
   // Fetch and store the connected account's address so Settings can show it.
@@ -227,7 +246,7 @@ async function exchangeCode(code, redirectUri) {
     token.email = profile.emailAddress || '';
     save();
   } catch (e) {
-    console.warn('Gmail connected, but could not fetch the account profile:', e.message);
+    onIssue('gmail.profileFetch', e);
   }
 }
 
@@ -263,7 +282,7 @@ async function ensureAccessToken({ force = false } = {}) {
       // audit trail with Google's own explanation so there is something to look at
       // afterwards besides one line of stdout.
       const why = e.body.error_description || e.body.error || '';
-      console.error('GMAIL DISCONNECTED — Google rejected the refresh token:', why);
+      onIssue('gmail.disconnected', new Error(`Google rejected the refresh token: ${why}`));
       try {
         audit.log({ userId: null, username: 'system (gmail)', action: 'gmail.revoked', detail: why });
       } catch { /* never let audit failure mask the real error */ }
@@ -486,5 +505,8 @@ function connectedEmail() {
 module.exports = {
   init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail,
   sendAttachmentEmail, sendInviteEmail, sendStandaloneEmail, getThreadReplies, getMessageBody,
-  connectedEmail
+  connectedEmail, hasCalendarAccess,
+  // Exposed so calendar.js can make its own read-only Calendar API calls through the same
+  // connection — same token, same refresh-on-401 handling, no second OAuth client.
+  ensureAccessToken, requestJSON
 };

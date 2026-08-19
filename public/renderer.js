@@ -611,7 +611,7 @@ async function openReplyReview(id){
 // ---- Email generation flow ----
 let flowState=null;
 async function openEmailFlow(prospectId,dossier,isFollowup){
-  flowState={prospectId,dossier,isFollowup,issueId:null,services:[],personalNote:null};
+  flowState={prospectId,dossier,isFollowup,issueId:null,services:[],personalNote:null,slots:[],selectedSlots:[]};
   emailModalTitle.textContent=isFollowup?'Draft follow-up':'Generate email';
   emailModal.hidden=false;
   const cfg=await window.api.getConfig();
@@ -621,7 +621,13 @@ async function openEmailFlow(prospectId,dossier,isFollowup){
     return;
   }
   if(isFollowup){ runGeneration(); return; }
-  const q=await window.api.emailQuestions(prospectId);
+  const [q,avail]=await Promise.all([window.api.emailQuestions(prospectId),window.api.calendarAvailability().catch(()=>({connected:false,failed:true,slots:[]}))]);
+  flowState.slots=avail.connected?avail.slots:[];
+  flowState.calendarConnected=avail.connected;
+  // A real lookup failure must not read as "Calendar isn't set up" — that sent an admin to
+  // Settings to fix something that was already configured. Carries the ref when there is one.
+  flowState.calendarFailed=!!avail.failed;
+  flowState.calendarRef=avail.ref||'';
   renderQuestions(q);
 }
 
@@ -629,15 +635,28 @@ function renderQuestions(q){
   const issueOpts=q.issueOptions.map(o=>`<div class="opt" data-kind="issue" data-id="${o.id}"><div class="opt-title">${esc(o.label)}</div>${o.detail?`<div class="opt-detail">${esc(shorten(o.detail,140))}</div>`:''}</div>`).join('');
   const svcOpts=q.serviceOptions.map(o=>`<div class="opt" data-kind="service" data-id="${esc(o.id)}"><span class="opt-title">${esc(o.label)}</span><span class="opt-tags">${o.suggested?'<span class="tag tag-suggested">suggested</span>':''}${o.proven?'<span class="tag tag-proven">proven</span>':''}</span></div>`).join('');
   const personalBlock=(q.personalHooks&&q.personalHooks.length)?`<div class="q-block"><div class="q-label">Personal touch (optional)</div><div class="q-hint">Catalog hooks that may fit this prospect. Pick any to weave in, or none.</div>${q.personalHooks.map(h=>`<div class="opt" data-kind="hook" data-id="${esc(h.id)}"><div class="opt-title">${esc(h.label)}</div><div class="opt-detail">${esc(h.suggestion)}</div></div>`).join('')}</div>`:'';
+  const slotsBlock=flowState.calendarConnected
+    ?(flowState.slots.length
+      ?`<div class="q-block"><div class="q-label">Offer specific open times (optional)</div><div class="q-hint">From Marcos's calendar. Pick up to 3 to include instead of the generic "available next week" line.</div>${flowState.slots.map(s=>`<div class="opt" data-kind="slot" data-iso="${esc(s.startISO)}"><span class="opt-title">${esc(s.label)}</span></div>`).join('')}</div>`
+      :`<div class="q-block"><div class="q-hint">No open business-hours slots found in the next few days on Marcos's calendar.</div></div>`)
+    :(flowState.calendarFailed
+      ?`<div class="q-block"><div class="q-hint">Could not read Marcos's calendar just now, so specific open times aren't available for this draft.${flowState.calendarRef?` Reference code: ${esc(flowState.calendarRef)}.`:''} The draft will use the usual "available next week" wording.</div></div>`
+      :`<div class="q-block"><div class="q-hint">Connect Google Calendar in Settings to offer specific open times here.</div></div>`);
   emailModalBody.innerHTML=`
     <div class="q-block"><div class="q-label">1. Which issue should the email lead with?</div><div class="q-hint">Pulled from this prospect's research.</div>${issueOpts}</div>
     <div class="q-block"><div class="q-label">2. Which services should we pitch?</div><div class="q-hint">Choose one or two. Suggested ones match their issues.</div>${svcOpts}</div>
     ${personalBlock}
+    ${slotsBlock}
     <div class="modal-actions"><button class="btn" id="genBtn" disabled>Generate draft</button><span class="usage-note">Two questions, then a draft.</span></div>`;
   emailModalBody.querySelectorAll('.opt[data-kind="issue"]').forEach(el=>el.addEventListener('click',()=>{emailModalBody.querySelectorAll('.opt[data-kind="issue"]').forEach(x=>x.classList.remove('selected'));el.classList.add('selected');flowState.issueId=el.dataset.id;updateGen();}));
   emailModalBody.querySelectorAll('.opt[data-kind="service"]').forEach(el=>el.addEventListener('click',()=>{const id=el.dataset.id;const i=flowState.services.indexOf(id);if(i>=0){flowState.services.splice(i,1);el.classList.remove('selected');}else{if(flowState.services.length>=2)return;flowState.services.push(id);el.classList.add('selected');}updateGen();}));
   flowState.hooks=[];
   emailModalBody.querySelectorAll('.opt[data-kind="hook"]').forEach(el=>el.addEventListener('click',()=>{const id=el.dataset.id;const i=flowState.hooks.indexOf(id);if(i>=0){flowState.hooks.splice(i,1);el.classList.remove('selected');}else{flowState.hooks.push(id);el.classList.add('selected');}}));
+  emailModalBody.querySelectorAll('.opt[data-kind="slot"]').forEach(el=>el.addEventListener('click',()=>{
+    const iso=el.dataset.iso;const i=flowState.selectedSlots.indexOf(iso);
+    if(i>=0){flowState.selectedSlots.splice(i,1);el.classList.remove('selected');}
+    else{if(flowState.selectedSlots.length>=3)return;flowState.selectedSlots.push(iso);el.classList.add('selected');}
+  }));
   document.getElementById('genBtn').addEventListener('click',()=>{
     const chosen=(q.personalHooks||[]).filter(h=>flowState.hooks.includes(h.id)).map(h=>h.suggestion);
     flowState.personalNote=chosen.length?chosen.join(' '):null;
@@ -649,13 +668,15 @@ function updateGen(){const b=document.getElementById('genBtn');if(b)b.disabled=!
 async function runGeneration(){
   emailModalBody.innerHTML=`<div class="gen-status">Writing the draft in Marcos's voice…</div>`;
   let res;
-  try{ res=await window.api.emailGenerate(flowState.prospectId,{issueId:flowState.issueId,services:flowState.services,personalNote:flowState.personalNote,isFollowup:flowState.isFollowup}); }
+  const chosenSlots=(flowState.selectedSlots||[]).map(iso=>{const s=(flowState.slots||[]).find(x=>x.startISO===iso);return s?s.label:null;}).filter(Boolean);
+  try{ res=await window.api.emailGenerate(flowState.prospectId,{issueId:flowState.issueId,services:flowState.services,personalNote:flowState.personalNote,isFollowup:flowState.isFollowup,chosenSlots}); }
   catch(e){
     emailModalBody.innerHTML=errorBlock("Couldn't generate: "+e.message)+`<div class="modal-actions"><button class="btn btn-ghost" id="backBtn">Back</button></div>`;
     document.getElementById('backBtn').addEventListener('click',()=>openEmailFlow(flowState.prospectId,flowState.dossier,flowState.isFollowup));
     return;
   }
-  if(!res.ok){ emailModalBody.innerHTML=`<div class="error-note">Couldn't generate: ${esc(res.error)}</div><div class="modal-actions"><button class="btn btn-ghost" id="backBtn">Back</button></div>`; document.getElementById('backBtn').addEventListener('click',()=>openEmailFlow(flowState.prospectId,flowState.dossier,flowState.isFollowup)); return; }
+  // res.ref is the server-side reference code for this failure — shown so it can be reported.
+  if(!res.ok){ emailModalBody.innerHTML=`<div class="error-note">Couldn't generate: ${esc(res.error)}${res.ref?` (ref ${esc(res.ref)})`:''}</div><div class="modal-actions"><button class="btn btn-ghost" id="backBtn">Back</button></div>`; document.getElementById('backBtn').addEventListener('click',()=>openEmailFlow(flowState.prospectId,flowState.dossier,flowState.isFollowup)); return; }
   renderDraft(res.draft,res.usage);
 }
 
@@ -763,6 +784,13 @@ async function openSettings(){
         ${gmailStatus.connected
           ?`<button class="btn btn-ghost btn-sm" id="gmailDisconnectBtn">Disconnect</button>`
           :`<button class="btn btn-sm" id="gmailConnectBtn" ${gmailStatus.hasCreds?'':'disabled title="Add a Google Client ID and Secret below first"'}>Connect Gmail</button>`}
+      </div>
+      <div class="key-status ${gmailStatus.calendarConnected?'key-set':'key-unset'}" style="margin-top:8px;">
+        ${gmailStatus.calendarConnected
+          ?'Calendar: connected — real open times can be offered in drafts.'
+          :(gmailStatus.connected
+            ?'Calendar: not yet granted. Disconnect and reconnect Gmail to add Calendar access (same account, no separate login).'
+            :'Calendar: connects together with Gmail above.')}
       </div></div>
     <div class="settings-field"><label>Google OAuth client</label>
       <div class="hint">From Google Cloud Console &rarr; APIs &amp; Services &rarr; Credentials. Needed once, before connecting.</div>
@@ -1126,11 +1154,56 @@ async function handleFiles(fileList){
   }catch(e){ result.innerHTML=`<span style="color:var(--red)">Upload failed: ${esc(e.message)}</span>`; }
 }
 
-// ---- Sidebar views, tabs, toolbar wiring ----
+// ---- Sidebar views, toolbar wiring ----
+const viewTitleEl=document.getElementById('viewTitle');
 document.querySelectorAll('.view-item[data-view]').forEach(b=>b.addEventListener('click',()=>{
   document.querySelectorAll('.view-item[data-view]').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active'); currentView=b.dataset.view; renderList();
+  b.classList.add('active'); currentView=b.dataset.view;
+  if(viewTitleEl)viewTitleEl.textContent=b.querySelector('.view-label').textContent;
+  renderList();
 }));
+
+// ---- Reorderable views (sidebar "Views" section) ----
+// Order is a personal display preference, not app data — kept in localStorage per browser
+// rather than synced through the server, same trust boundary as sort/filter choices.
+const VIEW_ORDER_KEY='viewOrder';
+(function initViewReorder(){
+  const container=document.querySelector('.sidebar-section'); // first section = Views
+  const items=[...container.querySelectorAll('.view-item[data-view]')];
+  let saved;
+  try{ saved=JSON.parse(localStorage.getItem(VIEW_ORDER_KEY)||'null'); }catch{ saved=null; }
+  if(Array.isArray(saved)){
+    const byView=new Map(items.map(el=>[el.dataset.view,el]));
+    const heading=container.querySelector('.sidebar-heading');
+    for(const v of saved){ const el=byView.get(v); if(el){ container.appendChild(el); byView.delete(v); } }
+    for(const el of byView.values()) container.appendChild(el); // any view not in the saved order goes last
+    if(heading)container.insertBefore(heading,container.firstChild);
+  }
+  items.forEach(el=>{
+    el.draggable=true;
+    el.addEventListener('dragstart',(e)=>{ e.dataTransfer.setData('text/plain',el.dataset.view); el.classList.add('dragging'); });
+    // Saved on dragend, not on drop. dragover already moved the element, but 'drop' only
+    // fires when the pointer is released over a target that called preventDefault — i.e. over
+    // another view item. Releasing on the "Views" heading, in the gap below the list, outside
+    // the sidebar, or cancelling with Escape skipped the save entirely, leaving the new order
+    // on screen but the old one in localStorage, so it silently reverted on the next reload.
+    // dragend always fires, however the drag ended.
+    el.addEventListener('dragend',()=>{
+      el.classList.remove('dragging');
+      const order=[...container.querySelectorAll('.view-item[data-view]')].map(x=>x.dataset.view);
+      localStorage.setItem(VIEW_ORDER_KEY,JSON.stringify(order));
+    });
+    el.addEventListener('dragover',(e)=>{
+      e.preventDefault();
+      const dragging=container.querySelector('.view-item.dragging');
+      if(!dragging||dragging===el)return;
+      const rect=el.getBoundingClientRect();
+      const before=(e.clientY-rect.top)<rect.height/2;
+      container.insertBefore(dragging,before?el:el.nextSibling);
+    });
+    el.addEventListener('drop',(e)=>e.preventDefault()); // keep the browser from treating the payload as a navigation
+  });
+})();
 ['filterFit','filterState','filterAgency','filterDesignation','sortBy'].forEach(id=>document.getElementById(id).addEventListener('change',renderList));
 searchEl.addEventListener('input',renderList);
 document.getElementById('closeDetail').addEventListener('click',()=>{detailPane.hidden=true;selectedId=null;renderList();});
@@ -1195,6 +1268,11 @@ document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',a
 // live ingest
 window.api.onIngested((r)=>{ if(r.outcome==='ingested'){loadProspects();toast('New prospect added from research');} else if(r.outcome==='duplicate'){toast('Skipped a duplicate');} else if(r.outcome==='excluded'){toast(`Research file ${r.file?`"${r.file}" `:''}was skipped — that company is on the do-not-contact list`,7000);} });
 window.api.onReply((r)=>{ loadProspects(); if(r.company_name)toast(`New reply from ${r.company_name}`); });
+// Background connection/generation failures (Gmail polling, digest, backup, OAuth) surfaced
+// with a short reference code — admin-only, since fixing these means opening Settings.
+// Only admin sessions are sent this event (the server filters it), so no role check is needed
+// here — the earlier client-side check was never access control, just display gating.
+window.api.onIssue((r)=>{ toast(`${r.message} (ref ${r.ref})`,10000); });
 // A research file that never made it in. Held longer than a normal toast: this one needs acting on.
 window.api.onIngestFailed((r)=>{ toast(`Research file "${r.file}" was not imported — ${r.reason}`,7000); });
 // pointer-events:none matters as much as the fade: a faded-out toast is still a box
@@ -1260,7 +1338,7 @@ function checkGmailRedirect(){
   const g=params.get('gmail');
   if(!g)return;
   if(g==='connected'){ toast('Gmail connected.'); openSettings(); }
-  else if(g==='error'){ toast('Could not connect Gmail. Check the Client ID/Secret and try again.'); openSettings(); }
+  else if(g==='error'){ const ref=params.get('ref'); toast(`Could not connect Gmail. Check the Client ID/Secret and try again.${ref?` (ref ${ref})`:''}`,8000); openSettings(); }
   history.replaceState(null,'',location.pathname);
 }
 
