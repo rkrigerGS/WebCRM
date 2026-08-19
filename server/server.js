@@ -165,13 +165,28 @@ const SESSION_MAX_AGE = 30 * 24 * 60 * 60;
 // is refused. Without that last check, resetting a password left every already-issued
 // cookie working, so the point of the reset (locking out whoever had the old password)
 // was silently lost.
+// ---- Dev auto-login (local sandboxes only) ----
+// NOT the removed test-login backdoor (see the comment in users.js): this has no URL, no
+// hidden account, and no way to turn on remotely. It only activates when the person who
+// starts the server sets DEV_AUTOLOGIN=<existing username> in the environment, and it is
+// hard-refused whenever the production markers are present (same COOKIE_SECURE detection
+// as above — NODE_ENV=production or any RAILWAY_* variable), so it cannot ship live.
+const DEV_AUTOLOGIN = String(process.env.DEV_AUTOLOGIN || '').trim();
+const devAutologinAllowed = !!DEV_AUTOLOGIN && !COOKIE_SECURE;
+if (DEV_AUTOLOGIN && COOKIE_SECURE) console.error('DEV_AUTOLOGIN is set but this looks like production — ignoring it.');
+if (devAutologinAllowed) console.error(`DEV_AUTOLOGIN: every request without a session runs as "${DEV_AUTOLOGIN}" — local development only.`);
+
 function userFromReq(req) {
   const payload = auth.verifyToken(auth.tokenFromReq(req));
-  if (!payload) return null;
-  const user = users.findById(payload.uid);
-  if (!user || !user.active) return null;
-  if (user.pwChangedAt && payload.t < new Date(user.pwChangedAt).getTime()) return null;
-  return user;
+  if (payload) {
+    const user = users.findById(payload.uid);
+    if (user && user.active && !(user.pwChangedAt && payload.t < new Date(user.pwChangedAt).getTime())) return user;
+  }
+  if (devAutologinAllowed) {
+    const u = users.findByUsername(DEV_AUTOLOGIN);
+    if (u && u.active && !u.pending) return u;
+  }
+  return null;
 }
 
 // Tells the login page whether any account exists yet (first-run creates the admin), and
@@ -277,6 +292,61 @@ app.post('/api/auth/login', (q, res) => {
 app.post('/api/auth/logout', (_q, res) => {
   res.set('Set-Cookie', sessionCookie('', 0));
   res.json({ ok: true });
+});
+
+// ---- Forgot password (pre-session, like the invite flow) ----
+// Anti-enumeration: the response is identical whether or not the identifier matched an
+// account, and the lookup + email send happen after the response is already written.
+// Rate limited per IP with the same window/threshold as login, since every request can
+// trigger an outbound email through the connected Gmail account.
+const forgotAttempts = new Map(); // ip -> { count, firstAt }
+app.post('/api/auth/forgot', (q, res) => {
+  const now = Date.now();
+  let e = forgotAttempts.get(q.ip);
+  if (!e || now - e.firstAt > LOGIN_WINDOW_MS) e = { count: 0, firstAt: now };
+  e.count++;
+  forgotAttempts.set(q.ip, e);
+  if (e.count > LOGIN_MAX_ATTEMPTS) return res.status(429).json({ error: 'Too many reset requests. Try again later.' });
+  const identifier = (q.body && q.body.identifier) || '';
+  const link = (token) => `${q.protocol}://${q.get('host')}/?reset=${token}`;
+  res.json({ ok: true }); // always the same answer — never confirms whether an account exists
+  let result = null;
+  try { result = users.startPasswordReset(identifier); } catch { return; }
+  if (!result) return;
+  audit.log({ userId: result.user.id, username: result.user.username, action: 'user.password.forgot', detail: 'Password reset link requested from the login page' });
+  if (!gmail.isConnected()) {
+    console.error(`Password reset requested for "${result.user.username}" but Gmail is not connected — no email sent. An admin can reset the password from the Users panel instead.`);
+    return;
+  }
+  gmail.sendInviteEmail({
+    to: result.email,
+    subject: 'Reset your GovSpring Prospecting password',
+    bodyText: `Hi ${result.user.username},\n\nA password reset was requested for your GovSpring Prospecting account. Use this link within 1 hour to choose a new password:\n\n${link(result.resetToken)}\n\nIf you didn't request this, you can ignore this email — your password is unchanged.`
+  }).catch(err2 => console.error('Password reset email failed:', err2.message));
+});
+
+// Mirrors /api/auth/invite-status: lets the reset page show a clear error before the
+// user even types a new password.
+app.get('/api/auth/reset-status', (q, res) => {
+  const u = users.findByResetToken(q.query.token || '');
+  if (!u) return res.json({ valid: false, reason: 'Invalid or already-used reset link.' });
+  if (new Date(u.resetExpiresAt).getTime() < Date.now()) return res.json({ valid: false, reason: 'This reset link has expired. Request a new one from the login page.' });
+  res.json({ valid: true, username: u.username });
+});
+
+// Pre-session, like /api/auth/accept-invite — sets the new password via the one-time
+// emailed link and logs the user in immediately after. Audits itself inline.
+app.post('/api/auth/reset-password', (q, res) => {
+  try {
+    const { token, password } = q.body || {};
+    const u = users.completePasswordReset(token, password);
+    audit.log({ userId: u.id, username: u.username, action: 'user.password.reset', detail: 'Password changed via emailed reset link' });
+    const sessToken = auth.issueToken(u.id);
+    res.set('Set-Cookie', sessionCookie(sessToken, SESSION_MAX_AGE));
+    res.json({ ok: true, user: { id: u.id, username: u.username, role: u.role } });
+  } catch (e) {
+    res.status(e.status || 400).json({ error: e.message });
+  }
 });
 
 // ---- Gate: every /api/* route below this line requires a valid session ----

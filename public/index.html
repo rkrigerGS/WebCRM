@@ -3,6 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f4f0">
+  <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#161617">
   <title>GovSpring Prospecting</title>
   <link rel="stylesheet" href="styles.css">
 </head>
@@ -13,11 +16,36 @@
       <div class="login-tag">Prospecting</div>
       <div id="loginMsg" class="login-msg"></div>
       <input type="text" id="loginUser" class="login-input" placeholder="Username" autocomplete="username" />
-      <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;">
-        <input type="password" id="loginPw" class="login-input" placeholder="Password" autocomplete="current-password" style="margin-bottom:0;flex:1;" />
-        <button type="button" class="btn btn-ghost btn-sm" id="loginPwToggle" aria-label="Show password" style="width:auto;padding:5px 10px;flex-shrink:0;">Show</button>
+      <div class="input-row">
+        <input type="password" id="loginPw" class="login-input" placeholder="Password" autocomplete="current-password" />
+        <button type="button" class="btn btn-ghost btn-sm" id="loginPwToggle" aria-label="Show password">Show</button>
       </div>
       <button class="btn" id="loginBtn">Enter</button>
+      <button type="button" class="link-btn" id="forgotLink" hidden>Forgot password?</button>
+    </div>
+  </div>
+
+  <div class="login-gate" id="forgotGate" hidden>
+    <div class="login-card">
+      <img src="assets/logo.svg" alt="GovSpring Legal" class="login-logo" />
+      <div class="login-tag">Prospecting</div>
+      <div id="forgotMsg" class="login-msg"></div>
+      <input type="text" id="forgotId" class="login-input" placeholder="Username or email" autocomplete="username" />
+      <button class="btn" id="forgotBtn">Email me a reset link</button>
+      <button type="button" class="link-btn" id="forgotBack">Back to log in</button>
+    </div>
+  </div>
+
+  <div class="login-gate" id="resetGate" hidden>
+    <div class="login-card">
+      <img src="assets/logo.svg" alt="GovSpring Legal" class="login-logo" />
+      <div class="login-tag">Prospecting</div>
+      <div id="resetMsg" class="login-msg"></div>
+      <div class="input-row" id="resetFormRow">
+        <input type="password" id="resetPw" class="login-input" placeholder="Choose a new password" autocomplete="new-password" />
+        <button type="button" class="btn btn-ghost btn-sm" id="resetPwToggle" aria-label="Show password">Show</button>
+      </div>
+      <button class="btn" id="resetBtn">Set new password and log in</button>
     </div>
   </div>
 
@@ -26,9 +54,9 @@
       <img src="assets/logo.svg" alt="GovSpring Legal" class="login-logo" />
       <div class="login-tag">Prospecting</div>
       <div id="inviteMsg" class="login-msg"></div>
-      <div style="display:flex;gap:6px;align-items:center;margin-bottom:12px;" id="inviteFormRow">
-        <input type="password" id="invitePw" class="login-input" placeholder="Choose a password" autocomplete="new-password" style="margin-bottom:0;flex:1;" />
-        <button type="button" class="btn btn-ghost btn-sm" id="invitePwToggle" aria-label="Show password" style="width:auto;padding:5px 10px;flex-shrink:0;">Show</button>
+      <div class="input-row" id="inviteFormRow">
+        <input type="password" id="invitePw" class="login-input" placeholder="Choose a password" autocomplete="new-password" />
+        <button type="button" class="btn btn-ghost btn-sm" id="invitePwToggle" aria-label="Show password">Show</button>
       </div>
       <button class="btn" id="inviteBtn">Set password and log in</button>
     </div>

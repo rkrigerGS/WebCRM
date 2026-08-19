@@ -10,6 +10,7 @@ const store_ = require('./store');
 
 const MIN_PASSWORD_LENGTH = 8;
 const INVITE_TTL_MS = 48 * 60 * 60 * 1000;
+const RESET_TTL_MS = 60 * 60 * 1000; // reset links are short-lived: 1 hour
 
 let usersPath;
 let store = { users: [], nextId: 1 };
@@ -169,6 +170,41 @@ function acceptInvite(token, password) {
   return safe(u);
 }
 
+// ---- Self-service password reset ("forgot password" on the login page) ----
+// Same one-time-token pattern as invites, but shorter-lived and only for accounts that
+// can already log in (active, not pending, hash set) AND have an email on file to send
+// the link to. Returns null rather than throwing when nothing matches, so the route can
+// give the same generic answer either way (no account enumeration).
+function startPasswordReset(identifier) {
+  const clean = String(identifier || '').trim().toLowerCase();
+  if (!clean) return null;
+  const u = store.users.find(x =>
+    x.active && !x.pending && x.passwordHash &&
+    (x.usernameLower === clean || (x.email && x.email.toLowerCase() === clean)));
+  if (!u || !u.email) return null;
+  u.resetToken = crypto.randomBytes(24).toString('base64url');
+  u.resetExpiresAt = new Date(Date.now() + RESET_TTL_MS).toISOString();
+  save();
+  return { user: safe(u), resetToken: u.resetToken, email: u.email };
+}
+
+function findByResetToken(token) {
+  return store.users.find(u => u.resetToken && u.resetToken === token) || null;
+}
+
+function completePasswordReset(token, password) {
+  const u = findByResetToken(token);
+  if (!u) throw err(400, 'Invalid or already-used reset link');
+  if (new Date(u.resetExpiresAt).getTime() < Date.now()) throw err(400, 'This reset link has expired. Request a new one from the login page.');
+  if (!password || password.length < MIN_PASSWORD_LENGTH) throw err(400, `Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+  u.passwordHash = hashPassword(password);
+  u.resetToken = '';
+  u.resetExpiresAt = '';
+  u.pwChangedAt = new Date().toISOString(); // see auth.js: retires sessions issued before now
+  save();
+  return safe(u);
+}
+
 // Used for the CC picker on the send screen — set (or cleared) by an admin from the
 // Users panel. Not self-service; keeps the change scoped to what the feature needs.
 function setEmail(id, email) {
@@ -225,6 +261,8 @@ function resetPassword(id, newPassword) {
   u.pending = false;
   u.inviteToken = '';
   u.inviteExpiresAt = '';
+  u.resetToken = ''; // an admin reset also voids any outstanding self-service reset link
+  u.resetExpiresAt = '';
   u.pwChangedAt = new Date().toISOString(); // see auth.js: retires sessions issued before now
   save();
   return safe(u);
@@ -234,12 +272,13 @@ function resetPassword(id, newPassword) {
 // (a live, single-use credential — same trust boundary as a password) — pending/
 // inviteExpiresAt are safe to show (they're what the Users panel needs to offer "resend").
 function safe(u) {
-  const { passwordHash, usernameLower, inviteToken, testLoginSlug, ...rest } = u;
+  const { passwordHash, usernameLower, inviteToken, resetToken, testLoginSlug, ...rest } = u;
   return rest;
 }
 
 module.exports = {
   init, hasAnyUser, createUser, checkLogin, findById, findByUsername,
   listUsers, setActive, setRole, setEmail, resetPassword, MIN_PASSWORD_LENGTH,
-  createInvitedUser, resendInvite, acceptInvite, findByInviteToken
+  createInvitedUser, resendInvite, acceptInvite, findByInviteToken,
+  startPasswordReset, findByResetToken, completePasswordReset
 };

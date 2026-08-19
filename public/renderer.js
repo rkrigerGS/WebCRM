@@ -1278,7 +1278,7 @@ window.api.onIngestFailed((r)=>{ toast(`Research file "${r.file}" was not import
 // pointer-events:none matters as much as the fade: a faded-out toast is still a box
 // sitting over the bottom of the screen, and without it, clicks in that strip landed on an
 // invisible toast instead of the page underneath.
-function toast(msg,ms=2200){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;z-index:100;opacity:0;pointer-events:none;transition:opacity .2s;';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},ms);}
+function toast(msg,ms=2200){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--on-dark);padding:10px 18px;border-radius:var(--radius-full);font-size:13px;font-weight:500;z-index:100;box-shadow:var(--shadow-lg);opacity:0;pointer-events:none;transition:opacity var(--duration-base) var(--ease);';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},ms);}
 
 // A bottom-right toast with an Undo button, for status/view changes: shows what happened
 // and gives a few seconds to catch a mistake and reverse it before it's gone.
@@ -1287,7 +1287,7 @@ function toastUndo(msg,onUndo,ms=6000){
   if(!t){
     t=document.createElement('div');
     t.id='toastUndo';
-    t.style.cssText='position:fixed;bottom:20px;right:20px;background:var(--ink);color:#fff;padding:10px 14px;border-radius:8px;font-size:13px;z-index:100;display:flex;align-items:center;gap:12px;box-shadow:0 8px 24px rgba(0,0,0,0.25);opacity:0;transition:opacity .2s;';
+    t.style.cssText='position:fixed;bottom:24px;right:24px;background:var(--ink);color:var(--on-dark);padding:10px 12px 10px 16px;border-radius:var(--radius-lg);font-size:13px;font-weight:500;z-index:100;display:flex;align-items:center;gap:12px;box-shadow:var(--shadow-lg);opacity:0;transition:opacity var(--duration-base) var(--ease);';
     document.body.appendChild(t);
   }
   clearTimeout(t._timer);
@@ -1341,6 +1341,17 @@ function checkGmailRedirect(){
   else if(g==='error'){ const ref=params.get('ref'); toast(`Could not connect Gmail. Check the Client ID/Secret and try again.${ref?` (ref ${ref})`:''}`,8000); openSettings(); }
   history.replaceState(null,'',location.pathname);
 }
+
+// Escape closes the topmost open modal through its own Close button, so the exact same
+// cleanup runs as a mouse close (e.g. emailModalClose also strips the modal-wide class).
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const closeIds = ['replyModalClose', 'emailModalClose', 'settingsClose', 'usersClose', 'auditClose'];
+  for (const id of closeIds) {
+    const btn = document.getElementById(id);
+    if (btn && !btn.closest('.modal-backdrop').hidden) { btn.click(); return; }
+  }
+});
 
 // Wait for the login gate to authenticate before loading any data (API calls need the session).
 if (window.__authed) { applyRoleUI(); loadProspects(); checkGmailRedirect(); }
