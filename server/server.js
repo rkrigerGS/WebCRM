@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const chokidar = require('chokidar');
 
 const db = require('./db');
+const store_ = require('./store');
 const config = require('./config');
 const catalogs = require('./catalogs');
 const emailEngine = require('./emailEngine');
@@ -229,9 +230,31 @@ app.post('/api/auth/setup', (q, res) => {
   res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
 });
 
+// These two pre-auth status endpoints answer "is this token valid" for anyone who asks,
+// which makes them an oracle for brute-forcing live invite/reset tokens. The tokens are
+// 24 random bytes so guessing is not realistic, but there is no reason to allow unlimited
+// probing either: cap per-IP lookups per window (generous enough that a human retrying a
+// mangled link never hits it).
+const STATUS_PROBE_MAX = 30;
+const statusProbeAttempts = new Map(); // ip -> { count, firstAt }
+function statusProbeLimited(req, res) {
+  const now = Date.now();
+  for (const [ip, e] of statusProbeAttempts) if (now - e.firstAt > LOGIN_WINDOW_MS) statusProbeAttempts.delete(ip);
+  let e = statusProbeAttempts.get(req.ip);
+  if (!e || now - e.firstAt > LOGIN_WINDOW_MS) e = { count: 0, firstAt: now };
+  e.count++;
+  statusProbeAttempts.set(req.ip, e);
+  if (e.count > STATUS_PROBE_MAX) {
+    res.status(429).json({ valid: false, reason: 'Too many attempts. Try again later.' });
+    return true;
+  }
+  return false;
+}
+
 // Lets the pre-auth invite-acceptance page (see auth-client.js) show a clear error before
 // the user even types a password, rather than only on submit.
 app.get('/api/auth/invite-status', (q, res) => {
+  if (statusProbeLimited(q, res)) return;
   const u = users.findByInviteToken(q.query.token || '');
   if (!u) return res.json({ valid: false, reason: 'Invalid or already-used invitation link.' });
   if (new Date(u.inviteExpiresAt).getTime() < Date.now()) return res.json({ valid: false, reason: 'This invitation link has expired. Ask an admin to resend it.' });
@@ -258,16 +281,25 @@ app.post('/api/auth/accept-invite', (q, res) => {
 // In-memory only (no persistence needed, no new dependency): 5 failed attempts from one
 // IP within a 15-minute window locks that IP out for the remainder of that window. A
 // correct password at any point before the 5th failure succeeds normally and clears the
-// entry. No cleanup of stale entries — at this app's scale (1-2 users) the map never
-// grows large enough for that to matter.
+// entry.
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_ATTEMPTS = 5;
 const loginAttempts = new Map(); // ip -> { count, firstFailureAt, lockedUntil }
+// Entries whose window has fully passed are dead weight; without this sweep the maps grow
+// one entry per distinct IP forever (a scanner walking the login endpoint from many
+// addresses would slowly leak memory). Swept on each request to the guarded routes.
+function pruneAttempts(map, now) {
+  for (const [ip, e] of map) {
+    const start = e.firstFailureAt || e.firstAt || 0;
+    if (now - start > LOGIN_WINDOW_MS && !(e.lockedUntil && now < e.lockedUntil)) map.delete(ip);
+  }
+}
 
 // Log in with a username and password.
 app.post('/api/auth/login', (q, res) => {
   const ip = q.ip;
   const now = Date.now();
+  pruneAttempts(loginAttempts, now);
   const entry = loginAttempts.get(ip);
   if (entry && entry.lockedUntil && now < entry.lockedUntil) {
     const minutesLeft = Math.ceil((entry.lockedUntil - now) / 60000);
@@ -302,6 +334,7 @@ app.post('/api/auth/logout', (_q, res) => {
 const forgotAttempts = new Map(); // ip -> { count, firstAt }
 app.post('/api/auth/forgot', (q, res) => {
   const now = Date.now();
+  pruneAttempts(forgotAttempts, now);
   let e = forgotAttempts.get(q.ip);
   if (!e || now - e.firstAt > LOGIN_WINDOW_MS) e = { count: 0, firstAt: now };
   e.count++;
@@ -328,6 +361,7 @@ app.post('/api/auth/forgot', (q, res) => {
 // Mirrors /api/auth/invite-status: lets the reset page show a clear error before the
 // user even types a new password.
 app.get('/api/auth/reset-status', (q, res) => {
+  if (statusProbeLimited(q, res)) return;
   const u = users.findByResetToken(q.query.token || '');
   if (!u) return res.json({ valid: false, reason: 'Invalid or already-used reset link.' });
   if (new Date(u.resetExpiresAt).getTime() < Date.now()) return res.json({ valid: false, reason: 'This reset link has expired. Request a new one from the login page.' });
@@ -446,9 +480,21 @@ setInterval(() => {
 }, 25 * 1000).unref();
 
 // ---- Watched folder ----
+// The configured watch folder is confined to the data directory. An arbitrary server path
+// here would let an admin (or anyone who obtained an admin session) point the ingester at
+// /etc or another service's files and read their contents back through ingest-failure
+// toasts and dossier fields. Nothing legitimate needs that: on Railway only the volume
+// (DATA_DIR) persists anyway. Checked both where the value is set (POST /api/config) and
+// here, so a hand-edited config.json cannot bypass it either.
+function safeWatchFolder(configured) {
+  if (!configured || typeof configured !== 'string') return null;
+  const resolved = path.resolve(DATA_DIR, configured);
+  if (resolved !== DATA_DIR && !resolved.startsWith(DATA_DIR + path.sep)) return null;
+  return resolved;
+}
 function watchedDir() {
-  const configured = config.get().watchFolder;
-  if (configured && fs.existsSync(configured)) return configured;
+  const safe = safeWatchFolder(config.get().watchFolder);
+  if (safe && fs.existsSync(safe)) return safe;
   return path.join(DATA_DIR, 'watched-dossiers');
 }
 // Dossiers dropped into the watched folder are ingested without an HTTP request (no
@@ -501,8 +547,12 @@ function startWatching() {
   watcher.on('add', p => { if (p.toLowerCase().endsWith('.json')) tryIngestFile(p); });
   console.log('Watching for dossiers in', dir);
 }
-function restartWatching() {
-  if (watcher) { watcher.close(); watcher = null; }
+// close() is awaited so the old watcher's fd is fully released before the new one starts.
+// The old fire-and-forget close left a window where both watchers were live and one file
+// drop could be ingested twice (the content-hash dedup in db.js is a backstop, not a
+// license to race).
+async function restartWatching() {
+  if (watcher) { await watcher.close(); watcher = null; }
   startWatching();
 }
 
@@ -563,18 +613,28 @@ function blockIfExcluded(req, res, id) {
   return true;
 }
 
+// 'dormant' is deliberately absent: it is only reachable through its dedicated route,
+// which also requires the return date that makes a dormant prospect ever come back.
+const PATCHABLE_STATUSES = new Set(['new', 'sent', 'replied', 'signed', 'dead']);
+
 app.patch('/api/prospects/:id', mutating('prospect.update', (q, res) => {
   const id = +q.params.id;
-  const result = db.updateProspect(id, q.body || {});
-  res.locals.audit = { prospectId: id, detail: JSON.stringify(q.body || {}) };
+  const body = q.body || {};
+  if ('status' in body && !PATCHABLE_STATUSES.has(body.status)) {
+    const e = new Error(`Invalid status "${String(body.status)}"`); e.status = 400; throw e;
+  }
+  if (!db.getProspect(id)) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  const result = db.updateProspect(id, body);
+  res.locals.audit = { prospectId: id, detail: JSON.stringify(body) };
   return result;
 }));
 
 app.delete('/api/prospects/:id', mutating('prospect.delete', (q, res) => {
   const id = +q.params.id;
   const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
   const result = db.deleteProspect(id);
-  res.locals.audit = { prospectId: id, detail: p ? `Deleted "${p.company_name}"` : '' };
+  res.locals.audit = { prospectId: id, detail: `Deleted "${p.company_name}"` };
   return result;
 }));
 
@@ -682,7 +742,9 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
       dossier: p.dossier, chosenIssue, chosenServices: a.services || [],
       personalNote: a.personalNote || null, isFollowup: !!a.isFollowup,
       priorEmailText: a.priorEmailText || p.final_sent || p.first_draft || '',
-      chosenSlots: Array.isArray(a.chosenSlots) ? a.chosenSlots.filter(s => typeof s === 'string').slice(0, 5) : []
+      // Length-capped: these strings go straight into the drafting prompt, so a free-form
+      // body must not be able to smuggle paragraphs of instructions through a "slot".
+      chosenSlots: Array.isArray(a.chosenSlots) ? a.chosenSlots.filter(s => typeof s === 'string').slice(0, 5).map(s => s.slice(0, 80)) : []
     });
     let persisted = false;
     if (!a.isFollowup && !p.first_draft) { db.updateProspect(id, { first_draft: draft }); persisted = true; }
@@ -700,6 +762,15 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
     return res.json({ ok: false, error: String(e && e.message || e), ref });
   }
 }));
+
+// A corrupt gmail_message_ids field (hand-edited data, a bad restore) must degrade to
+// "no prior ids" — an unthreaded send — not crash the send route with a parse error.
+function priorMessageIds(p) {
+  try {
+    const ids = JSON.parse(p.gmail_message_ids || '[]');
+    return Array.isArray(ids) ? ids : [];
+  } catch { return []; }
+}
 
 // Saving a final email now actually sends it via Gmail (channel 'email' — the only
 // channel this endpoint is ever called with; "log outreach sent elsewhere" is the
@@ -732,7 +803,7 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
   }
 
   const isFollowup = !!(meta && meta.isFollowup);
-  const priorIds = JSON.parse(p.gmail_message_ids || '[]');
+  const priorIds = priorMessageIds(p);
   const hasThread = isFollowup && p.gmail_thread_id && priorIds.length;
 
   let sendResult;
@@ -747,22 +818,28 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
     // A failed send is recorded, not swallowed. Without this the only trace of a failure
     // was a 502 in one browser tab, which is why "sending is unreliable" could never be
     // pinned down: no history of how often it fails, for whom, or with what Gmail error.
+    // Logged under its own action name (not 'prospect.email.send') so the weekly digest's
+    // sent-count, which counts that action, doesn't count failures as sends.
     res.status(502).json({ error: 'Could not send via Gmail: ' + e.message });
-    res.locals.audit = { prospectId: id, detail: `Gmail send FAILED to ${to} — ${e.message}` };
+    audit.log({ userId: q.user.id, username: q.user.username, action: 'prospect.email.send.failed', prospectId: id, detail: `Gmail send FAILED to ${to} — ${e.message}` });
+    res.locals.skipAudit = true;
     return;
   }
 
-  // Only reached once the Gmail send has actually succeeded.
+  // Only reached once the Gmail send has actually succeeded. The thread id is re-read from
+  // the live record, not from `p` — which was read before the multi-second Gmail send above
+  // and could miss a thread id another request recorded in the meantime.
+  const fresh = db.getProspect(id);
   const patch = {
     final_sent: finalText, status: 'sent', channel: 'email',
-    date_sent: new Date().toISOString().slice(0, 10),
-    gmail_thread_id: p.gmail_thread_id || sendResult.gmailThreadId || ''
+    date_sent: store_.todayNY(),
+    gmail_thread_id: (fresh && fresh.gmail_thread_id) || sendResult.gmailThreadId || ''
   };
   // Both of these are applied against the live record inside db.updateProspect, not
-  // computed from `p` — which was read before the multi-second Gmail send above.
+  // computed from `p`.
   if (isFollowup) patch.incFollowupCount = true;
   if (sendResult.gmailMessageId) patch.appendMessageId = sendResult.gmailMessageId;
-  db.updateProspect(id, patch);
+  db.updateProspect(id, patch, { internal: true });
   db.addNote(id, `Sent ${isFollowup ? 'follow-up' : 'outreach'} email to ${to}: "${subject}"`, isFollowup ? 'followup' : 'outreach');
   if (saveToLibrary) {
     catalogs.saveApprovedEmail({
@@ -866,7 +943,7 @@ app.post('/api/prospects/:id/reply/send', mutating('prospect.reply.send', async 
   if (!p.gmail_thread_id) { res.status(400).json({ error: 'This prospect has no Gmail thread to reply on.' }); res.locals.skipAudit = true; return; }
   if (!gmail.isConnected()) { res.status(409).json({ error: 'Gmail is not connected. Ask an admin to connect it in Settings.' }); res.locals.skipAudit = true; return; }
 
-  const priorIds = JSON.parse(p.gmail_message_ids || '[]');
+  const priorIds = priorMessageIds(p);
   let sendResult;
   try {
     sendResult = await gmail.sendEmail({
@@ -874,16 +951,18 @@ app.post('/api/prospects/:id/reply/send', mutating('prospect.reply.send', async 
       threadId: p.gmail_thread_id, inReplyTo: priorIds[priorIds.length - 1], references: priorIds.join(' ')
     });
   } catch (e) {
-    // Recorded rather than swallowed, for the same reason as the outreach send above.
+    // Recorded rather than swallowed, and under its own action name so the digest's
+    // reply-count doesn't count failures — same reasoning as the outreach send above.
     res.status(502).json({ error: 'Could not send via Gmail: ' + e.message });
-    res.locals.audit = { prospectId: id, detail: `Gmail reply send FAILED to ${toClean} — ${e.message}` };
+    audit.log({ userId: q.user.id, username: q.user.username, action: 'prospect.reply.send.failed', prospectId: id, detail: `Gmail reply send FAILED to ${toClean} — ${e.message}` });
+    res.locals.skipAudit = true;
     return;
   }
 
   const shouldSave = saveToLibrary !== false;
   const patch = { status: 'replied' };
   if (sendResult.gmailMessageId) patch.appendMessageId = sendResult.gmailMessageId;
-  db.updateProspect(id, patch);
+  db.updateProspect(id, patch, { internal: true });
   db.addNote(id, `Sent reply to ${toClean}: "${subjClean}"`, 'reply');
   if (shouldSave) {
     const dossierContact = (p.dossier.contacts || []).find(c => c.email === toClean);
@@ -916,6 +995,15 @@ function addressOf(from) {
   return (m ? m[1] : String(from || '')).trim().toLowerCase();
 }
 
+// Delivery-failure bounces and auto-responders come from the prospect's thread but are not
+// replies. Left unfiltered they set awaiting_reply_review and status machinery in motion as
+// if a human had answered — the reviewer then drafts a reply to mailer-daemon. Matched on
+// the sender's local part, the stable convention across mail systems.
+function isAutomatedSender(from) {
+  const local = addressOf(from).split('@')[0];
+  return /^(mailer-daemon|postmaster|no-?reply|donotreply|do-not-reply|autoreply|auto-reply|bounce[s]?)$/.test(local);
+}
+
 // Polls only prospects with a Gmail thread on file and not dead — one cheap metadata-only
 // Gmail call per active thread, not a global inbox scan. At this app's scale (a bounded
 // number of active outreach threads, not thousands) this is well within Gmail's API
@@ -941,7 +1029,7 @@ async function pollForReplies() {
     for (const p of candidates) {
       try {
         const messages = await gmail.getThreadReplies(p.gmail_thread_id);
-        const incoming = messages.filter(m => addressOf(m.from) !== ours);
+        const incoming = messages.filter(m => addressOf(m.from) !== ours && !isAutomatedSender(m.from));
         if (!incoming.length) continue;
         const latest = incoming[incoming.length - 1];
         if (latest.id === p.last_reply_message_id) continue; // already surfaced
@@ -971,7 +1059,9 @@ setInterval(() => { pollForReplies().catch(e => reportIssue('gmail.replyPoll', e
 // write in a timer took the whole server down.
 function checkDormantReturns() {
   try {
-    const today = new Date().toISOString().slice(0, 10);
+    // NY wall-clock date, not UTC: the return dates admins pick are NY dates, and the UTC
+    // day starts at 7-8pm NY time, which returned prospects an evening early.
+    const today = store_.todayNY();
     for (const id of db.listDormantDue(today)) {
       db.returnFromDormant(id);
       db.addNote(id, 'Returned from dormant', 'dormant');
@@ -1048,11 +1138,16 @@ app.post('/api/config/google', requireAdmin, mutating('config.google.update', (q
 // own audit lines; a hand-written body reaching them through here would bypass both.
 const CONFIG_POST_KEYS = new Set(['draftModel', 'clerkPhrase', 'defaultFollowupDays', 'watchFolder']);
 
-app.post('/api/config', requireAdmin, mutating('config.update', (q, res) => {
+app.post('/api/config', requireAdmin, mutating('config.update', async (q, res) => {
   const patch = {};
   for (const [k, v] of Object.entries(q.body || {})) if (CONFIG_POST_KEYS.has(k)) patch[k] = v;
+  if ('watchFolder' in patch && patch.watchFolder) {
+    const safe = safeWatchFolder(patch.watchFolder);
+    if (!safe) { const e = new Error('The watch folder must be inside the data directory.'); e.status = 400; throw e; }
+    patch.watchFolder = safe;
+  }
   config.update(patch);
-  if ('watchFolder' in patch) restartWatching();
+  if ('watchFolder' in patch) await restartWatching();
   res.locals.audit = { detail: JSON.stringify(patch) };
   return { ok: true, watchFolder: watchedDir() };
 }));
@@ -1210,9 +1305,26 @@ app.get('/api/admin/gmail/status', requireAdmin, (_q, res) => {
   catch (e) { fail(res, e); }
 });
 
+// CSRF protection for the OAuth flow: /connect mints a random state, stores it in a
+// short-lived HttpOnly cookie scoped to these two routes, and sends it to Google; the
+// callback only accepts a code accompanied by the matching state. Without it, an attacker
+// could deep-link an admin to the callback with a code for the ATTACKER'S Google account,
+// silently swapping which mailbox the CRM sends and polls through.
+const OAUTH_STATE_COOKIE_PATH = '/api/admin/gmail';
+function oauthStateCookie(value, maxAgeSeconds) {
+  return `gs_oauth_state=${value}; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}; Path=${OAUTH_STATE_COOKIE_PATH}${COOKIE_SECURE ? '; Secure' : ''}`;
+}
+function cookieValue(req, name) {
+  const m = String(req.headers.cookie || '').match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
+  return m ? m[1] : '';
+}
+
 app.get('/api/admin/gmail/connect', requireAdmin, (req, res) => {
-  try { res.redirect(gmail.getAuthUrl(gmailRedirectUri(req))); }
-  catch (e) { res.status(400).send(String(e.message || e)); }
+  try {
+    const state = crypto.randomBytes(16).toString('hex');
+    res.set('Set-Cookie', oauthStateCookie(state, 600));
+    res.redirect(gmail.getAuthUrl(gmailRedirectUri(req), state));
+  } catch (e) { res.status(400).send(String(e.message || e)); }
 });
 
 // OAuth redirect target — see the AUDIT CONVENTION exception list above for why this
@@ -1220,7 +1332,13 @@ app.get('/api/admin/gmail/connect', requireAdmin, (req, res) => {
 // screen, still carrying the admin's session cookie from when they clicked Connect.
 app.get('/api/admin/gmail/callback', requireAdmin, async (req, res) => {
   try {
+    const expected = cookieValue(req, 'gs_oauth_state');
+    res.set('Set-Cookie', oauthStateCookie('', 0)); // one-time use either way
     if (req.query.error) return res.redirect('/?gmail=error');
+    if (!expected || req.query.state !== expected) {
+      const ref = reportIssue('gmail.oauthCallback', new Error('OAuth state mismatch — the callback was not started from this app\'s Connect button. Connection refused.'));
+      return res.redirect('/?gmail=error&ref=' + ref);
+    }
     await gmail.exchangeCode(req.query.code, gmailRedirectUri(req));
     audit.log({ userId: req.user.id, username: req.user.username, action: 'gmail.connect', detail: `Connected as ${gmail.getStatus().email}` });
     res.redirect('/?gmail=connected');
@@ -1313,7 +1431,11 @@ async function checkScheduledBackup() {
   const cfg = config.get();
   const intervalMs = BACKUP_INTERVAL_MS[cfg.backupFrequency];
   if (!intervalMs) return; // 'off'
-  const last = cfg.lastBackupAt ? new Date(cfg.lastBackupAt).getTime() : Date.now();
+  // No watermark yet means the schedule was just turned on (the route stamps "now", so
+  // this is belt-and-braces): wait a full interval. An unparseable watermark (hand-edited
+  // config) means the backup is due NOW — for a backup, running early is the safe failure.
+  const lastMs = cfg.lastBackupAt ? new Date(cfg.lastBackupAt).getTime() : Date.now();
+  const last = Number.isFinite(lastMs) ? lastMs : 0;
   if (Date.now() - last < intervalMs) return;
   if (!gmail.isConnected()) { reportIssue('backup.scheduled', new Error('Scheduled backup is due but Gmail is not connected; will retry next check.')); return; }
   backupRunning = true;
@@ -1464,7 +1586,12 @@ app.get('*', (_q, res) => res.sendFile(path.join(APP_DIR, 'public', 'index.html'
 // Walks the registered routes and flags any POST/PATCH/PUT/DELETE /api/* route that
 // wasn't wired through mutating(). The four routes documented as exceptions in the AUDIT
 // CONVENTION comment above are expected to fail this check and are excluded on purpose.
-const AUDIT_EXEMPT_ROUTES = new Set(['/api/auth/setup', '/api/auth/login', '/api/auth/logout', '/api/prospects/upload', '/api/admin/gmail/callback', '/api/auth/accept-invite']);
+const AUDIT_EXEMPT_ROUTES = new Set([
+  '/api/auth/setup', '/api/auth/login', '/api/auth/logout', '/api/prospects/upload',
+  '/api/admin/gmail/callback', '/api/auth/accept-invite',
+  // Pre-session like setup/accept-invite; both audit themselves inline.
+  '/api/auth/forgot', '/api/auth/reset-password'
+]);
 function checkAuditCoverage() {
   try {
     const offenders = [];
@@ -1520,6 +1647,10 @@ const server = app.listen(PORT, HOST, () => {
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {
     console.log(`${sig} received — shutting down.`);
+    // SSE streams never end on their own, so server.close() would otherwise always wait
+    // out the 8-second kill timer below while browsers hold their event streams open.
+    for (const res of clients) { try { res.end(); } catch {} }
+    clients.clear();
     server.close(() => {
       if (watcher) watcher.close().catch(() => {});
       process.exit(0);

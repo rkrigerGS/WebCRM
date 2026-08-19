@@ -20,7 +20,9 @@ function load() {
   if (!raw) return save(); // genuinely no file yet: write the empty store
   store = raw;
   store.entries = store.entries || [];
-  store.nextId = store.nextId || store_.nextIdFrom(store.entries);
+  // Take the max so a stored counter that lags the records (hand-edited/restored file)
+  // can never mint a duplicate entry id.
+  store.nextId = Math.max(Number(store.nextId) || 1, store_.nextIdFrom(store.entries));
 }
 
 function save() {

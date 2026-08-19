@@ -201,7 +201,10 @@ function requireCreds() {
 
 // ---- OAuth: authorize URL + code exchange ----
 
-function getAuthUrl(redirectUri) {
+// `state` is the anti-CSRF token minted by the /connect route (server.js) — Google echoes
+// it back to the callback, which rejects any mismatch. Without it, a forged callback URL
+// could silently connect an attacker's mailbox as the app's sending account.
+function getAuthUrl(redirectUri, state) {
   const { clientId } = requireCreds();
   const params = new URLSearchParams({
     client_id: clientId,
@@ -210,7 +213,8 @@ function getAuthUrl(redirectUri) {
     scope: SCOPE,
     access_type: 'offline',
     prompt: 'consent',
-    login_hint: 'marcos@govspringlegal.com'
+    login_hint: 'marcos@govspringlegal.com',
+    ...(state ? { state } : {})
   });
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 }
@@ -258,6 +262,18 @@ async function ensureAccessToken({ force = false } = {}) {
   if (!force && token.accessToken && token.accessTokenExpiry && Date.now() < token.accessTokenExpiry - TOKEN_REFRESH_SKEW_MS) {
     return token.accessToken;
   }
+  // Concurrent callers landing here together (the reply poll, a user's send, a calendar
+  // lookup) share one refresh rather than racing several token exchanges at once — the
+  // slower duplicates would overwrite a fresher token with a staler response for no gain.
+  if (!refreshInFlight) {
+    refreshInFlight = refreshAccessToken().finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
+
+let refreshInFlight = null; // Promise<string> while a refresh is running, else null
+
+async function refreshAccessToken() {
   const { clientId, clientSecret } = requireCreds();
   const body = new URLSearchParams({
     refresh_token: token.refreshToken, client_id: clientId, client_secret: clientSecret,
@@ -508,5 +524,5 @@ module.exports = {
   connectedEmail, hasCalendarAccess,
   // Exposed so calendar.js can make its own read-only Calendar API calls through the same
   // connection — same token, same refresh-on-401 handling, no second OAuth client.
-  ensureAccessToken, requestJSON
+  ensureAccessToken, requestJSON, callGmail
 };

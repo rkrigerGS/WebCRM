@@ -25,14 +25,25 @@ function readJSON(file) {
       `overwrite it with an empty store — fix the permissions or restore from a backup.`
     );
   }
+  let parsed;
   try {
-    return JSON.parse(text);
+    parsed = JSON.parse(text);
   } catch (e) {
     throw new Error(
       `${file} is not valid JSON (${e.message}). Refusing to start rather than ` +
       `overwrite it with an empty store — restore from a backup.`
     );
   }
+  // Every store's root is a plain object. Valid JSON like `null`, `[]`, or `"x"` would
+  // pass parsing, then blow up (or worse, be silently normalized over) deep inside a
+  // store's load() — same data-loss shape the ENOENT/parse guards above exist to prevent.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(
+      `${file} does not contain a JSON object at the top level. Refusing to start rather ` +
+      `than overwrite it with an empty store — restore from a backup.`
+    );
+  }
+  return parsed;
 }
 
 // Writes to a temp file in the same directory, flushes it to disk, then renames over
@@ -65,4 +76,14 @@ function nextIdFrom(records) {
   return (records || []).reduce((m, r) => Math.max(m, Number(r && r.id) || 0), 0) + 1;
 }
 
-module.exports = { readJSON, writeJSON, writeText, nextIdFrom };
+// Today's date (YYYY-MM-DD) in the business's timezone, New York — shared by every
+// "today" stamp (date_sent, activity dates, dormant-return checks). The old
+// toISOString().slice(0,10) stamps were UTC, which after 7/8pm ET is already tomorrow:
+// follow-up gaps ran a day short and dormant returns fired an evening early.
+function todayNY() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
+  }).format(new Date());
+}
+
+module.exports = { readJSON, writeJSON, writeText, nextIdFrom, todayNY };

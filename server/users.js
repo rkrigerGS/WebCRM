@@ -25,7 +25,9 @@ function load() {
   if (!raw) return save(); // genuinely no file yet: write the empty store
   store = raw;
   store.users = store.users || [];
-  store.nextId = store.nextId || store_.nextIdFrom(store.users);
+  // Take the max so a stored counter that lags the records (hand-edited/restored file)
+  // can never mint a duplicate user id.
+  store.nextId = Math.max(Number(store.nextId) || 1, store_.nextIdFrom(store.users));
   let healed = false;
   for (const u of store.users) {
     if (u.email === undefined) u.email = ''; // forward-compat with pre-email accounts
@@ -227,9 +229,17 @@ function setEmail(id, email) {
 // the route is gone), so no stored data changes. Deactivate it from the Users panel to hide
 // it from the list.
 
+// Hashed once at startup purely as a timing decoy: a login attempt against an unknown,
+// inactive, or still-pending username costs the same scrypt work as one against a real
+// account, so response time can't be used to probe which usernames exist.
+const TIMING_DECOY_HASH = hashPassword(crypto.randomBytes(16).toString('hex'));
+
 function checkLogin(username, password) {
   const u = findByUsername(username);
-  if (!u || !u.active) return null;
+  if (!u || !u.active || !u.passwordHash) {
+    verifyPassword(password, TIMING_DECOY_HASH);
+    return null;
+  }
   if (!verifyPassword(password, u.passwordHash)) return null;
   return safe(u);
 }

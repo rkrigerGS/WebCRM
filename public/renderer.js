@@ -224,13 +224,25 @@ async function loadProspects(){
 function field(k,v,link){ if(!v)return''; const href=link?safeUrl(v):''; const val=href?`<a href="${esc(href)}" target="_blank" rel="noreferrer">${esc(v)}</a>`:esc(v); return `<div class="field"><span class="field-key">${k}:</span> <span class="field-val">${val}</span></div>`; }
 function litLine(l,t){ if(!t)return''; const cls=/NEEDS CHECKING/i.test(t)?'needs-check':''; return `<div class="field"><span class="field-key">${l}:</span> <span class="field-val ${cls}">${esc(t)}</span></div>`; }
 
+// Corrupt persisted activity JSON must render as an empty log, not throw and blank the pane.
+function parseActivity(raw){ try{ const a=JSON.parse(raw||'[]'); return Array.isArray(a)?a:[]; }catch{ return []; } }
+
+// Two rows clicked in quick succession race their fetches: without the sequence check, the
+// slower (first) response could land last and paint the WRONG prospect under the highlight
+// of the second. Only the latest openDetail call is allowed to touch the pane.
+let detailSeq=0;
 async function openDetail(id){
+  const seq=++detailSeq;
   selectedId=id; renderList();
   let p;
   // If the row is gone (deleted by someone else) or the request fails, close the pane
   // instead of leaving the previous prospect's details on screen under a new highlight.
   try{ p=await window.api.getProspect(id); }
-  catch(e){ detailPane.hidden=true; selectedId=null; renderList(); toast('Could not open this prospect: '+e.message,6000); loadProspects(); return; }
+  catch(e){
+    if(seq!==detailSeq)return;
+    detailPane.hidden=true; selectedId=null; renderList(); toast('Could not open this prospect: '+e.message,6000); loadProspects(); return;
+  }
+  if(seq!==detailSeq)return;
   if(!p)return;
   const d=p.dossier||{};
   const hasApproved=!!(p.final_sent);
@@ -244,7 +256,7 @@ async function openDetail(id){
   const contract=d.current_contract||{};
   const lit=d.prior_litigation||{};
   const issues=Array.isArray(d.issue_spotting)?d.issue_spotting:[];
-  const activity=p.activity?JSON.parse(p.activity):[];
+  const activity=parseActivity(p.activity);
 
   document.getElementById('detailBody').innerHTML=`
     <div class="section">
@@ -402,9 +414,13 @@ function openEditContact(id,c){
   const f=(k,v)=>`<div class="settings-field"><label>${k}</label><input class="field-input" id="ec_${k}" value="${esc(v||'')}"></div>`;
   emailModalBody.innerHTML=`${f('website',c.website)}${f('email',c.email)}${f('phone',c.phone)}${f('linkedin',c.linkedin)}
     <div class="modal-actions"><button class="btn" id="ecSave">Save</button></div>`;
-  document.getElementById('ecSave').addEventListener('click',async()=>{
+  document.getElementById('ecSave').addEventListener('click',async(e)=>{
+    const btn=e.currentTarget;
+    if(btn.disabled)return;
+    btn.disabled=true;
     const patch={website:val('ec_website'),email:val('ec_email'),phone:val('ec_phone'),linkedin:val('ec_linkedin')};
-    await window.api.editContact(id,patch);
+    try{ await window.api.editContact(id,patch); }
+    catch(err){ btn.disabled=false; toast('Contact not saved: '+err.message,6000); return; }
     emailModal.hidden=true; openDetail(id);
   });
   function val(x){return document.getElementById(x).value.trim();}
@@ -483,12 +499,16 @@ document.getElementById('replyModalClose').addEventListener('click',()=>replyMod
 
 function parseEmailAddress(raw){ const m=(raw||'').match(/<([^>]+)>/); return m?m[1]:(raw||'').trim(); }
 
+// Same stale-response protection as openDetail: only the most recent open call may render.
+let replySeq=0;
 async function openReplyReview(id){
+  const seq=++replySeq;
   replyModal.hidden=false;
   replyModalBody.innerHTML='<div class="gen-status">Loading…</div>';
   let p;
   try{ p=await window.api.getProspect(id); }
-  catch(e){ replyModalBody.innerHTML=errorBlock('Could not load this prospect: '+e.message); return; }
+  catch(e){ if(seq!==replySeq)return; replyModalBody.innerHTML=errorBlock('Could not load this prospect: '+e.message); return; }
+  if(seq!==replySeq)return;
   if(!p){replyModal.hidden=true;return;}
   const d=p.dossier||{};
   const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
@@ -496,8 +516,9 @@ async function openReplyReview(id){
     window.api.getReplyContext(id).catch(e=>({replyText:'',error:e.message})),
     window.api.getReplyTemplates(id).catch(()=>[])
   ]);
+  if(seq!==replySeq)return;
   replyModalTitle.textContent=`${d.company_name||p.company_name} — Reply`;
-  const activity=p.activity?JSON.parse(p.activity):[];
+  const activity=parseActivity(p.activity);
   const defaultTo=parseEmailAddress(p.last_reply_from);
   const defaultSubject=`Re: ${d.company_name||p.company_name}`;
 
@@ -582,11 +603,21 @@ async function openReplyReview(id){
       errEl.textContent=e.message; errEl.hidden=false;
     }
   });
-  document.getElementById('replyMarkRepliedBtn').addEventListener('click',async()=>{
+  document.getElementById('replyMarkRepliedBtn').addEventListener('click',async(e)=>{
+    const btn=e.currentTarget;
+    if(btn.disabled)return;
+    btn.disabled=true;
     const prevStatus=p.status;
-    await window.api.updateProspect(id,{status:'replied'});
+    // Guarded like the detail pane's status change: a failed save must not close the modal
+    // as if the move had taken.
+    try{ await window.api.updateProspect(id,{status:'replied'}); }
+    catch(err){ btn.disabled=false; toast('Status not changed: '+err.message,6000); return; }
     replyModal.hidden=true; loadProspects();
-    toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('replied')}`,async()=>{await window.api.updateProspect(id,{status:prevStatus});loadProspects();});
+    toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('replied')}`,async()=>{
+      try{ await window.api.updateProspect(id,{status:prevStatus}); }
+      catch(err){ toast('Could not undo: '+err.message,6000); return; }
+      loadProspects();
+    });
   });
   const dormantBtn=document.getElementById('replyMarkDormantBtn');
   if(dormantBtn)dormantBtn.addEventListener('click',async()=>{
@@ -595,16 +626,31 @@ async function openReplyReview(id){
     try{
       await window.api.setDormant(id,returnDate);
       replyModal.hidden=true; loadProspects();
-      toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('dormant')}`,async()=>{await window.api.updateProspect(id,{status:p.status});loadProspects();});
+      toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('dormant')}`,async()=>{
+        try{ await window.api.updateProspect(id,{status:p.status}); }
+        catch(err){ toast('Could not undo: '+err.message,6000); return; }
+        loadProspects();
+      });
     }catch(e){alert(e.message);}
   });
-  document.getElementById('replyMarkDeadBtn').addEventListener('click',async()=>{
+  document.getElementById('replyMarkDeadBtn').addEventListener('click',async(e)=>{
+    const btn=e.currentTarget;
+    if(btn.disabled)return;
+    btn.disabled=true;
     const reason=window.prompt(DEAD_REASON_PROMPT);
-    if(reason&&reason.trim())await window.api.addNote(id,reason.trim());
+    if(reason&&reason.trim()){
+      try{ await window.api.addNote(id,reason.trim()); }
+      catch(err){ toast('The reason note could not be saved: '+err.message,6000); }
+    }
     const prevStatus=p.status;
-    await window.api.updateProspect(id,{status:'dead'});
+    try{ await window.api.updateProspect(id,{status:'dead'}); }
+    catch(err){ btn.disabled=false; toast('Status not changed: '+err.message,6000); return; }
     replyModal.hidden=true; loadProspects();
-    toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('dead')}`,async()=>{await window.api.updateProspect(id,{status:prevStatus});loadProspects();});
+    toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('dead')}`,async()=>{
+      try{ await window.api.updateProspect(id,{status:prevStatus}); }
+      catch(err){ toast('Could not undo: '+err.message,6000); return; }
+      loadProspects();
+    });
   });
 }
 
@@ -614,7 +660,9 @@ async function openEmailFlow(prospectId,dossier,isFollowup){
   flowState={prospectId,dossier,isFollowup,issueId:null,services:[],personalNote:null,slots:[],selectedSlots:[]};
   emailModalTitle.textContent=isFollowup?'Draft follow-up':'Generate email';
   emailModal.hidden=false;
-  const cfg=await window.api.getConfig();
+  let cfg;
+  try{ cfg=await window.api.getConfig(); }
+  catch(e){ emailModalBody.innerHTML=errorBlock('Could not load settings: '+e.message); return; }
   if(!cfg.hasApiKey){
     emailModalBody.innerHTML=`<div class="error-note">No Anthropic API key is set. Add it in Settings to generate drafts.</div><div class="modal-actions"><button class="btn" id="goSettings">Open Settings</button></div>`;
     document.getElementById('goSettings').addEventListener('click',()=>{emailModal.hidden=true;openSettings();});
@@ -743,7 +791,9 @@ document.getElementById('emailModalClose').addEventListener('click',()=>{emailMo
 const settingsModal=document.getElementById('settingsModal');
 const settingsBody=document.getElementById('settingsBody');
 async function openSettings(){
-  const cfg=await window.api.getConfig();
+  let cfg;
+  try{ cfg=await window.api.getConfig(); }
+  catch(e){ toast('Could not open Settings: '+e.message,6000); return; }
   const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
   let gmailStatus={connected:false,email:'',hasCreds:false};
   let digestCandidates=[];
@@ -1351,6 +1401,23 @@ document.addEventListener('keydown', (e) => {
     const btn = document.getElementById(id);
     if (btn && !btn.closest('.modal-backdrop').hidden) { btn.click(); return; }
   }
+});
+
+// Keep Tab inside the topmost open modal. Without this, tabbing past the last control
+// lands on the page underneath — invisible behind the backdrop but still activatable
+// with Enter, so a keyboard user could unknowingly click a hidden button.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Tab') return;
+  const openModal = [...document.querySelectorAll('.modal-backdrop')].find(m => !m.hidden);
+  if (!openModal) return;
+  const focusables = [...openModal.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')]
+    .filter(el => !el.disabled && el.offsetParent !== null);
+  if (!focusables.length) return;
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  const inside = openModal.contains(document.activeElement);
+  if (!inside) { e.preventDefault(); first.focus(); return; }
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
 });
 
 // Wait for the login gate to authenticate before loading any data (API calls need the session).

@@ -8,6 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const store_ = require('./store');
 
 let dbPath;
@@ -27,7 +28,10 @@ function load() {
   // Ensure all expected top-level keys exist (forward-compatible with older files).
   store.prospects = store.prospects || [];
   store.exclusions = store.exclusions || [];
-  store.nextId = store.nextId || store_.nextIdFrom(store.prospects);
+  // Never trust a stored nextId that lags behind the records (a hand-edited or restored
+  // file): a low counter would hand out an id that already exists, and every lookup/update
+  // on the duplicated id would hit whichever record happens to sit first in the array.
+  store.nextId = Math.max(Number(store.nextId) || 1, store_.nextIdFrom(store.prospects));
 }
 
 function save() {
@@ -81,19 +85,37 @@ function blankProspect() {
 // layer block (see server.js's blockIfExcluded) can tell the user precisely which rule
 // matched and let an admin remove that exact rule.
 function isExcluded(dossier) {
-  const uei = dossier.uei || '';
-  const name = (dossier.company_name || '').toUpperCase();
+  const uei = str(dossier.uei);
+  const name = str(dossier.company_name).toUpperCase();
   for (const r of store.exclusions) {
+    if (!r.value) continue; // an empty name_contains rule would match every company
     if (r.match_type === 'uei' && uei && r.value === uei) return r;
-    if (r.match_type === 'name_contains' && name.includes((r.value || '').toUpperCase())) return r;
+    if (r.match_type === 'name_contains' && name.includes(String(r.value).toUpperCase())) return r;
   }
   return null;
 }
 
+// Topline fields are copied straight out of externally-authored dossier JSON, and several
+// downstream paths call .localeCompare/.toUpperCase/.includes on them — one dossier with
+// `"company_name": {…}` would make listProspects() throw on every call from then on. A
+// string passes through as-is, a finite number is stringified, anything else becomes ''.
+function str(v) {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v);
+  return '';
+}
+
 function ingestDossier(dossier, filename) {
-  const uei = dossier.uei || null;
+  const uei = str(dossier.uei) || null;
 
   if (uei && store.prospects.some(p => p.uei === uei)) {
+    return { outcome: 'duplicate', uei };
+  }
+  // Dossiers without a UEI have no natural dedup key, so the same file re-ingested (e.g.
+  // the watcher re-scanning the folder on every restart) piled up as a new prospect each
+  // time. Hash the dossier content instead and skip exact re-imports.
+  const contentHash = crypto.createHash('sha256').update(JSON.stringify(dossier)).digest('hex');
+  if (!uei && store.prospects.some(p => !p.uei && p.content_hash === contentHash)) {
     return { outcome: 'duplicate', uei };
   }
   const excludedBy = isExcluded(dossier);
@@ -107,12 +129,13 @@ function ingestDossier(dossier, filename) {
   const p = blankProspect();
   p.id = store.nextId++;
   p.uei = uei;
-  p.company_name = dossier.company_name || '(unnamed)';
-  p.city_state = dossier.city_state || '';
-  p.industry = dossier.industry || '';
+  p.company_name = str(dossier.company_name) || '(unnamed)';
+  p.city_state = str(dossier.city_state);
+  p.industry = str(dossier.industry);
   p.fit_score = Number.isNaN(score) ? null : score;
-  p.designations = dossier.designations || '';
+  p.designations = str(dossier.designations);
   p.dossier_json = JSON.stringify(dossier);
+  p.content_hash = contentHash;
   store.prospects.push(p);
   save();
   return { outcome: 'ingested', uei, id: p.id };
@@ -161,12 +184,20 @@ function getProspect(id) {
 }
 
 function deleteProspect(id) {
+  const before = store.prospects.length;
   store.prospects = store.prospects.filter(p => p.id !== id);
+  if (store.prospects.length === before) return { deleted: false }; // nothing matched; no ghost success
   save();
   return { deleted: true };
 }
 
-function updateProspect(id, fields) {
+// opts.internal marks a call made by server code itself (the Gmail send paths), as opposed
+// to one relaying a request body. Gmail threading state and the read-modify-write ops are
+// only honored on internal calls: they are bookkeeping the send path maintains, and letting
+// a PATCH body set gmail_thread_id/gmail_message_ids would let any user silently detach a
+// prospect from its real thread (breaking reply polling) or point it at another one.
+function updateProspect(id, fields, opts = {}) {
+  const internal = !!opts.internal;
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { updated: false };
   // Capture the status a prospect had right before being marked dead, on the actual
@@ -188,8 +219,8 @@ function updateProspect(id, fields) {
   // function maintains itself (above), and letting a request body set it would let a
   // client rewrite where the dead-pile review restores a prospect to.
   const allowed = ['status', 'channel', 'first_draft', 'final_sent', 'date_sent',
-    'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity',
-    'gmail_thread_id', 'gmail_message_ids'];
+    'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity'];
+  if (internal) allowed.push('gmail_thread_id', 'gmail_message_ids');
   for (const k of allowed) if (k in fields) p[k] = fields[k];
 
   // Read-modify-write operations, applied here against the live record rather than from a
@@ -197,9 +228,10 @@ function updateProspect(id, fields) {
   // Gmail API for several seconds, then writes — long enough for a second send to land in
   // between, and a caller-computed `followup_count: n + 1` or a rebuilt message-id array
   // would then silently discard the other one's increment.
-  if (fields.incFollowupCount) p.followup_count = (Number(p.followup_count) || 0) + 1;
-  if (fields.appendMessageId) {
-    const ids = safeParse(p.gmail_message_ids, []);
+  if (internal && fields.incFollowupCount) p.followup_count = (Number(p.followup_count) || 0) + 1;
+  if (internal && fields.appendMessageId) {
+    const parsed = safeParse(p.gmail_message_ids, []);
+    const ids = Array.isArray(parsed) ? parsed : []; // a corrupt/non-array field is rebuilt, not thrown on
     if (!ids.includes(fields.appendMessageId)) ids.push(fields.appendMessageId);
     p.gmail_message_ids = JSON.stringify(ids);
   }
@@ -212,14 +244,27 @@ function updateProspect(id, fields) {
 // kind is optional and purely presentational (the reply-review screen's history timeline
 // uses it to distinguish sent-email/status entries from plain notes) — entries written
 // before this existed simply have no kind, and render exactly as they always have.
+// Notes are stored inside the prospect record itself, so both are bounded: one pasted
+// email chain as a "note", or years of activity, would otherwise grow every save of the
+// whole database. 2000 chars keeps any real note intact; 500 entries is years of activity.
+const NOTE_MAX_CHARS = 2000;
+const ACTIVITY_MAX_ENTRIES = 500;
+
+function appendActivity(p, entry) {
+  const parsed = safeParse(p.activity, []);
+  const log = Array.isArray(parsed) ? parsed : [];
+  log.push(entry);
+  if (log.length > ACTIVITY_MAX_ENTRIES) log.splice(0, log.length - ACTIVITY_MAX_ENTRIES);
+  p.activity = JSON.stringify(log);
+}
+
 function addNote(id, text, kind) {
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { ok: false };
-  const log = safeParse(p.activity, []);
-  const entry = { date: new Date().toISOString().slice(0, 10), text };
+  const clean = String(text || '').slice(0, NOTE_MAX_CHARS);
+  const entry = { date: store_.todayNY(), text: clean };
   if (kind) entry.kind = kind;
-  log.push(entry);
-  p.activity = JSON.stringify(log);
+  appendActivity(p, entry);
   p.updated_at = new Date().toISOString();
   save();
   return { ok: true };
@@ -281,10 +326,8 @@ function listDormantDue(today) {
 function logExternal(id, { channel, text }) {
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { ok: false };
-  const log = safeParse(p.activity, []);
-  const today = new Date().toISOString().slice(0, 10);
-  log.push({ date: today, text: `Outreach via ${channel}: ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}` });
-  p.activity = JSON.stringify(log);
+  const today = store_.todayNY();
+  appendActivity(p, { date: today, text: `Outreach via ${channel}: ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}` });
   p.status = 'sent';
   p.channel = channel;
   p.date_sent = today;

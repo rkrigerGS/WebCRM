@@ -59,6 +59,16 @@ function createZip(entries, now) {
     const dataBuf = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data, 'utf8');
     const crc = crc32(dataBuf);
     const compressed = zlib.deflateRawSync(dataBuf);
+    // Same reasoning as MAX_ENTRIES above: sizes and offsets are stored in 32 bits in a
+    // non-zip64 archive. Past 4 GiB the writeUInt32LE calls below would either throw a
+    // bare ERR_OUT_OF_RANGE or silently truncate — either way a corrupt backup.
+    const MAX_UINT32 = 0xFFFFFFFF;
+    if (dataBuf.length >= MAX_UINT32 || compressed.length >= MAX_UINT32 || offset >= MAX_UINT32) {
+      throw new Error(
+        `Backup file "${entry.name}" (or the archive so far) exceeds the 4 GiB limit of the zip format used here. ` +
+        `Archive or delete old files under the data directory and try again.`
+      );
+    }
     const method = 8; // deflate
     // General-purpose bit 11 declares the filename as UTF-8. Without it, extractors read
     // names as CP437 and any non-ASCII character (reachable through watched-dossiers/,
@@ -106,6 +116,9 @@ function createZip(entries, now) {
   }
 
   const centralDirStart = offset;
+  if (centralDirStart >= 0xFFFFFFFF) {
+    throw new Error('Backup archive exceeds the 4 GiB limit of the zip format used here. Archive or delete old files under the data directory and try again.');
+  }
   const centralDirBuf = Buffer.concat(centralParts);
 
   const end = Buffer.alloc(22);

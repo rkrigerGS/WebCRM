@@ -89,8 +89,9 @@ async function getAvailableSlots() {
     end: nyWallClockToUTC(y, month, d, BUSINESS_END_HOUR, 0)
   }));
 
-  const accessToken = await gmail.ensureAccessToken();
-  const freeBusy = await gmail.requestJSON({
+  // callGmail (not a bare ensureAccessToken + requestJSON) so a 401 from a token Google
+  // invalidated early gets the same forced-refresh-and-retry every Gmail call gets.
+  const freeBusy = await gmail.callGmail(accessToken => ({
     hostname: 'www.googleapis.com', path: '/calendar/v3/freeBusy', method: 'POST',
     headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
     body: {
@@ -98,7 +99,7 @@ async function getAvailableSlots() {
       timeMax: dayWindows[dayWindows.length - 1].end.toISOString(),
       items: [{ id: 'primary' }]
     }
-  });
+  }));
   // Google reports a per-calendar failure inside the 200 response rather than as an HTTP
   // error: calendars.primary carries an errors[] and an empty busy[]. Reading .busy straight
   // off it turned "we could not see the calendar" into "the whole week is free".
