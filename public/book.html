@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<!-- Public booking page for emailed time-slot links (/book/<token>). Self-contained on
+     purpose: no session, no app scripts, no styles.css — it must expose nothing but what
+     the /book/<token>/data endpoint returns for the token in the URL. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>Schedule a call — GovSpring Legal</title>
+<style>
+  :root {
+    --bg: #f5f5f7; --card: #ffffff; --text: #1d1d1f; --text-2: #86868b;
+    --accent: #0071e3; --border: rgba(0, 0, 0, 0.1); --ok: #30d158;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --card: #1d1d1f; --text: #f5f5f7; --text-2: #a1a1a6;
+      --accent: #0a84ff; --border: rgba(255, 255, 255, 0.12); --ok: #30d158;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+    background: var(--bg); color: var(--text);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem;
+    -webkit-font-smoothing: antialiased;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 24px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1); padding: 2.5rem 2rem; max-width: 480px; width: 100%;
+    animation: fadeInUp 500ms ease-out;
+  }
+  @keyframes fadeInUp { from { opacity: 0; transform: translateY(24px); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) { .card { animation: none; } }
+  .firm { font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-2); margin-bottom: 0.5rem; }
+  h1 { font-size: clamp(1.5rem, 4vw, 1.75rem); font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 0.5rem; }
+  .sub { color: var(--text-2); font-size: 0.9375rem; line-height: 1.5; margin-bottom: 1.75rem; }
+  .slots { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.5rem; }
+  .slot {
+    display: flex; align-items: center; justify-content: space-between; gap: 0.75rem;
+    width: 100%; min-height: 52px; padding: 0.875rem 1.125rem; border-radius: 14px;
+    border: 1.5px solid var(--border); background: transparent; color: var(--text);
+    font: inherit; font-size: 0.9375rem; font-weight: 500; text-align: left; cursor: pointer;
+    transition: border-color 200ms ease, background 200ms ease, transform 200ms ease;
+  }
+  .slot:hover:not(:disabled) { border-color: var(--accent); transform: translateY(-1px); }
+  .slot:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .slot.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .slot:disabled { opacity: 0.45; cursor: default; text-decoration: line-through; }
+  .slot .why { font-size: 0.75rem; font-weight: 400; color: var(--text-2); text-decoration: none; flex-shrink: 0; }
+  .confirm {
+    display: inline-flex; align-items: center; justify-content: center; width: 100%; min-height: 48px;
+    padding: 0.875rem 1.75rem; border: none; border-radius: 980px; background: var(--accent); color: #fff;
+    font: inherit; font-size: 1rem; font-weight: 600; cursor: pointer; transition: opacity 200ms ease, transform 200ms ease;
+  }
+  .confirm:hover:not(:disabled) { transform: translateY(-1px); }
+  .confirm:disabled { opacity: 0.4; cursor: default; transform: none; }
+  .confirm:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .note { margin-top: 1rem; font-size: 0.8125rem; color: var(--text-2); line-height: 1.5; text-align: center; }
+  .error { margin-top: 1rem; font-size: 0.875rem; color: #ff453a; line-height: 1.5; }
+  .done-icon { width: 56px; height: 56px; border-radius: 50%; background: color-mix(in srgb, var(--ok) 18%, transparent); color: var(--ok); display: flex; align-items: center; justify-content: center; font-size: 1.75rem; margin-bottom: 1.25rem; }
+  .meet-link { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: 0.875rem 1.75rem; border-radius: 980px; background: var(--accent); color: #fff; text-decoration: none; font-weight: 600; margin-top: 0.5rem; }
+  .muted-block { color: var(--text-2); font-size: 0.9375rem; line-height: 1.6; }
+</style>
+</head>
+<body>
+<main class="card" id="card" aria-live="polite">
+  <div class="firm">GovSpring Legal</div>
+  <h1>Schedule a call with Marcos Gonzalez</h1>
+  <p class="sub" id="sub">Loading available times…</p>
+  <div id="content"></div>
+</main>
+<script>
+(function () {
+  var token = location.pathname.split('/')[2] || '';
+  var preselect = new URLSearchParams(location.search).get('slot') || '';
+  var sub = document.getElementById('sub');
+  var content = document.getElementById('content');
+  var selected = '';
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function showBooked(booked, heading) {
+    sub.textContent = heading || 'You are all set. A calendar invitation with the details is on its way to your email.';
+    content.innerHTML =
+      '<div class="done-icon" aria-hidden="true">✓</div>' +
+      '<p style="font-weight:600;font-size:1.0625rem;margin-bottom:0.25rem;">' + esc(booked.label) + '</p>' +
+      (booked.meetLink
+        ? '<p class="muted-block">The meeting includes a Google Meet link:</p><a class="meet-link" href="' + esc(booked.meetLink) + '">Open Google Meet link</a>'
+        : '<p class="muted-block">The Google Meet link is in the calendar invitation.</p>');
+  }
+
+  function showMessage(msg) {
+    sub.textContent = '';
+    content.innerHTML = '<p class="muted-block">' + esc(msg) + '</p>';
+  }
+
+  function render(data) {
+    if (data.status === 'booked') { showBooked(data.booked, 'A time has already been booked from this link.'); return; }
+    if (data.status === 'stale') {
+      showMessage('The offered times are no longer available. Please reply to the email and we will find a time that works.');
+      return;
+    }
+    sub.textContent = 'Pick a time that works for you. One click books it and sends a calendar invitation with a Google Meet link.';
+    var open = data.slots.filter(function (s) { return !s.past && !s.taken; });
+    content.innerHTML =
+      '<div class="slots" role="radiogroup" aria-label="Available times">' +
+      data.slots.map(function (s) {
+        var off = s.past || s.taken;
+        return '<button type="button" class="slot" role="radio" aria-checked="false" data-iso="' + esc(s.startISO) + '"' + (off ? ' disabled' : '') + '>' +
+          '<span>' + esc(s.label) + '</span>' + (off ? '<span class="why">no longer available</span>' : '') + '</button>';
+      }).join('') +
+      '</div>' +
+      '<button type="button" class="confirm" id="confirmBtn" disabled>Book this time</button>' +
+      '<div class="error" id="err" hidden></div>' +
+      '<p class="note">All times are US Eastern. Booking creates a calendar event for you and Marcos with a Google Meet link attached.</p>';
+
+    var confirmBtn = document.getElementById('confirmBtn');
+    content.querySelectorAll('.slot:not(:disabled)').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        content.querySelectorAll('.slot').forEach(function (b) { b.classList.remove('selected'); b.setAttribute('aria-checked', 'false'); });
+        btn.classList.add('selected'); btn.setAttribute('aria-checked', 'true');
+        selected = btn.dataset.iso;
+        confirmBtn.disabled = false;
+      });
+    });
+    // Deep link from a specific button in the email: preselect that slot if still open.
+    if (preselect) {
+      var match = content.querySelector('.slot[data-iso="' + CSS.escape(preselect) + '"]:not(:disabled)');
+      if (match) match.click();
+    }
+    if (!open.length) showMessage('The offered times are no longer available. Please reply to the email and we will find a time that works.');
+
+    confirmBtn.addEventListener('click', function () {
+      if (!selected) return;
+      var err = document.getElementById('err');
+      err.hidden = true;
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Booking…';
+      fetch('/book/' + encodeURIComponent(token) + '/confirm', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ startISO: selected })
+      }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+        .then(function (r) {
+          if (r.ok) { showBooked(r.j.booked); return; }
+          if (r.j && r.j.booked) { showBooked(r.j.booked, 'A time has already been booked from this link.'); return; }
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = 'Book this time';
+          err.textContent = (r.j && r.j.error) || 'Something went wrong. Please reply to the email instead.';
+          err.hidden = false;
+          if (r.j && r.j.taken) load(); // refresh so the just-taken slot greys out
+        })
+        .catch(function () {
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = 'Book this time';
+          err.textContent = 'Could not reach the server. Please check your connection and try again.';
+          err.hidden = false;
+        });
+    });
+  }
+
+  function load() {
+    fetch('/book/' + encodeURIComponent(token) + '/data')
+      .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (r) {
+        if (!r.ok) { showMessage((r.j && r.j.error) || 'This booking link is not valid.'); return; }
+        render(r.j);
+      })
+      .catch(function () { showMessage('Could not load this page. Please check your connection and try again.'); });
+  }
+  load();
+})();
+</script>
+</body>
+</html>

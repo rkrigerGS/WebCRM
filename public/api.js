@@ -92,6 +92,8 @@ window.api = {
   // can be shown differently from a success.
   onIngestFailed: (cb) => onServerEvent('ingest-failed', cb),
   onReply: (cb) => { onServerEvent('reply', cb); onServerEvent('dormant-return', cb); },
+  // A prospect booked a meeting through an emailed time-slot link.
+  onBooked: (cb) => onServerEvent('booked', cb),
   // Background failures (Gmail polling, digest, backup, OAuth, calendar) — {ref, scope, message}.
   // The message carries raw internal detail (paths, Google's verbatim errors), so the server
   // only writes this event to admin streams; non-admin sessions never receive it at all.
@@ -130,5 +132,6 @@ window.api = {
   removeExclusion:     (match_type, value) => sendJSON('/api/admin/exclusions/remove', 'POST', { match_type, value }),
 
   saveDigestRecipients: (recipientIds)     => sendJSON('/api/config/digest-recipients', 'POST', { recipientIds }),
-  sendDigestNow:        ()                 => sendJSON('/api/admin/digest/send-now', 'POST')
+  sendDigestNow:        ()                 => sendJSON('/api/admin/digest/send-now', 'POST'),
+  saveMeetingParticipants: (participantIds) => sendJSON('/api/config/meeting-participants', 'POST', { participantIds })
 };

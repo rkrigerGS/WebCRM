@@ -156,7 +156,7 @@ ${exemplars}`;
     : `Do not add a personal anecdote.`;
 
   const slotsText = (chosenSlots && chosenSlots.length)
-    ? `Specific open times to offer instead of "I'm available next week" (from Marcos's actual calendar): ${chosenSlots.join('; ')}. Weave these into the scheduling sentence naturally, e.g. "I'm free ${chosenSlots[0]}${chosenSlots.length > 1 ? ' or ' + chosenSlots[chosenSlots.length - 1] : ''}" — do not list more than these options.`
+    ? `Specific open times to offer instead of "I'm available next week" (from Marcos's actual calendar): ${chosenSlots.join('; ')}. Weave these into the scheduling sentence naturally, e.g. "I'm free ${chosenSlots[0]}${chosenSlots.length > 1 ? ' or ' + chosenSlots[chosenSlots.length - 1] : ''}" — do not list more than these options. The app automatically appends one-click booking buttons for these exact times below the signature, so add a short natural mention that one click on any of the times below books it and sends a calendar invite with a video link. Do not write out any URL yourself.`
     : '';
 
   const followupText = isFollowup

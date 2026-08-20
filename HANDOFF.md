@@ -1,10 +1,14 @@
 # HANDOFF — audit fix batch, shipped
 
-**Update 2026-08-19 (latest): a second batch — error reference codes, the invite-pending
+**Update 2026-08-19 (latest): one-click booking links with real Google Meet events are
+built and committed locally (not pushed). See "One-click booking links with real Meet
+events, BUILT" near the bottom — including the one operational step this needs: Marcos
+must Disconnect and reconnect Gmail once after deploy to grant the new `calendar.events`
+scope.**
+
+**Update 2026-08-19: a second batch — error reference codes, the invite-pending
 fix, reorderable views, the header cleanup, and the first cut of Google Calendar
-availability — is committed and pushed on top of `46ab845`. See "NEXT SESSION STARTS HERE"
-at the very bottom of this file for the one thing this batch was explicitly deferred on
-(Google Meet links) — read that section first, before anything else below.**
+availability — is committed and pushed on top of `46ab845`.**
 
 **2026-08-19 (earlier): audit fix batch committed, pushed, and deployed.** Commit `46ab845`
 ("Harden the CRM: close the audit's 57 findings") is on `origin/main` and was the commit
@@ -247,7 +251,85 @@ zip valid (18 entries, secrets excluded, UTF-8 bit set), invite-pending heal re-
 by injecting the drift state and confirming a restart fixes it, boot clean with no
 audit-coverage warnings, all files `node --check` clean.
 
+## 2026-08-19 (latest) — One-click booking links with real Meet events, BUILT
+
+This closes the "NEXT SESSION STARTS HERE" item below. Rafael picked a **click-driven
+Option B**: nothing is written to Marcos's calendar when the email goes out; the real
+event (with a Meet link) is created only at the moment the prospect clicks a time.
+Participants: an admin-set default list of app users, each pre-checked but deselectable
+by the sender on a per-email basis.
+
+**Committed locally, NOT pushed.** See "Before this goes live" below.
+
+### The flow
+
+1. In the draft questions step the SA picks up to 5 half-hour openings, pulled live from
+   Marcos's calendar over the next two business days (`calendar.js` now builds 30-minute
+   slots, `SLOT_MINUTES = 30`, `LOOKAHEAD_BUSINESS_DAYS = 2`, `MAX_SLOTS = 16`).
+2. The draft screen shows which times will be offered and a "Meeting participants"
+   checklist (defaults from `config.meetingParticipantIds`, deselectable per email).
+3. On send, `saveFinal` mints one booking **offer** (`server/bookings.js`, new JSON store
+   at `<data>/bookings.json`) holding an unguessable 40-hex token, the slots, the
+   prospect's address and the chosen participants. The email goes out as
+   multipart/alternative: the plain-text part lists each time with its URL, the HTML part
+   renders them as inline-styled buttons.
+4. The prospect opens `/book/<token>` (`public/book.html`, self-contained: no session, no
+   app scripts, no styles.css) and clicks a time. `POST /book/<token>/confirm` re-checks
+   free/busy, creates the Calendar event with `conferenceData.createRequest`
+   (`?conferenceDataVersion=1&sendUpdates=all`, so Google emails the invite), marks the
+   offer booked, writes an activity note plus an audit row under the system actor
+   `prospect (booking link)`, and pushes a `booked` SSE event to open CRM tabs.
+
+### Deliberate design points (don't "simplify" these away)
+
+- **The offered/approved text and the learning library never contain the booking block.**
+  `final_sent` and the approved-email library store exactly what the SA approved; the
+  block is appended only to the wire message, so exemplars never learn tokens or URLs.
+- **The `/book/*` routes are outside the `/api` session gate on purpose** (the gate is
+  `app.use('/api', ...)`), rate-limited per IP (`BOOK_PROBE_MAX = 60`), and audited
+  inline. They expose nothing but the offer's own slots.
+- **Confirms are serialized** through a single promise chain (`bookingConfirmChain`) so
+  two prospects clicking at once can't double-book.
+- **Every calendar read failure throws** — an unreadable calendar is never degraded to
+  "free". The booking page's load-time re-check is best-effort (page still renders, slots
+  just aren't pre-marked taken); the confirm-time check is hard.
+- **Participants are intersected server-side with active app users' emails**, so a
+  tampered request can't invite arbitrary addresses.
+- **Slot validation is strict** at send time (bad/past dates, reversed ranges, blank or
+  over-long labels → 400) and `hasCalendarWriteAccess()` is required (→ 409 telling the
+  admin to reconnect Gmail).
+- The calendar event title has no em dash — it lands in the prospect's invite, and the
+  firm's outward-facing writing rule bans them.
+
+### Before this goes live
+
+**Marcos must Disconnect and reconnect Gmail once.** The OAuth scope string in `gmail.js`
+now includes `calendar.events` alongside `gmail.modify` and `calendar.readonly`; existing
+tokens don't carry it. Until he reconnects, sending *with* offered times is refused with a
+clear 409 (sending without them is unaffected), and Settings shows "Calendar: read-only
+access. Disconnect and reconnect Gmail to enable one-click booking links."
+
+### What was verified, and what wasn't
+
+Verified in the local sandbox with the Gmail/Calendar modules stubbed: all four
+`/book/<token>/data` states (open, booked, stale, unknown token), every confirm rejection
+path (unknown token, unoffered time, past slot, already booked, no calendar scope, slot
+taken since the email), the confirm happy path end to end (event payload, offer marked
+booked, activity note, audit row), slot-validation rejections at send time, participant
+filtering (case-insensitive, unknown addresses stripped, deduped), the rate limiter, the
+booking page in a real browser (slot selection, `?slot=` deep-link preselect, booked and
+invalid states, no JS errors), the draft screen's booking section, and the Settings
+"Default meeting participants" block saving through to config.
+
+**Not verified (needs live OAuth):** the actual Google `events.insert` call, whether the
+minted Meet link comes back on `conferenceData.entryPoints` or `hangoutLink` for this
+account, and `sendUpdates=all` invite delivery. First real test after deploy: reconnect
+Gmail, send yourself an email with two offered times, click one, confirm the invite and
+Meet link arrive.
+
 ## NEXT SESSION STARTS HERE — Google Meet link / calendar event creation
+
+**(Resolved by the section above — kept for the reasoning behind the choice.)**
 
 The calendar-availability feature above only **reads** free/busy and inserts text time
 slots into the email ("I'm free Tuesday 2-3pm ET") alongside the existing Clio booking
@@ -286,3 +368,47 @@ This is a bigger feature than the read-only version, not a small addition:
   `conferenceData: {createRequest: {requestId: ..., conferenceSolutionKey: {type:
   'hangoutsMeet'}}}` and `?conferenceDataVersion=1` on the URL — that's what actually
   produces a Meet link on the response's `conferenceData.entryPoints`.
+
+## Possible future upgrade — visual calendar-grid picker (NOT built, deliberately deferred)
+
+Rafael asked for the exact Gmail-drafting experience: in Gmail, clicking the calendar
+icon while composing opens Google Calendar in a side panel showing a visual grid of your
+actual calendar, you click-drag to mark which specific blocks you're offering, and Gmail
+inserts those as an interactive "Available times" card the recipient can pick from
+inline, without leaving their inbox.
+
+**What's built today (the "one-click booking links" feature above) is a lighter,
+click-to-book version of this**, not the visual grid: the SA picks slots from a plain
+checklist of already-computed 30-minute openings (no visual grid, no drag-to-select), and
+nothing is put on the calendar until the recipient clicks a link that lands on a
+standalone booking page (`/book/<token>`) outside Gmail — not an inline card in their
+inbox. Rafael confirmed this simpler version is enough for now. **If a future request
+asks to make it "look and feel like Gmail's own calendar picker," it means building the
+following — hand this whole section to Claude verbatim to skip the back-and-forth:**
+
+1. **A visual grid, not a checklist, in the draft questions step.** Replace the
+   `slotsBlock` list in `public/renderer.js` (the `.opt[data-kind="slot"]` rows) with an
+   actual week/day grid component — hours down the side, days across the top, the SA's
+   already-fetched busy/free blocks shaded in, click-and-drag (or click-to-toggle) to mark
+   which open blocks to offer. This is a genuinely new front-end component; nothing in the
+   current codebase provides a calendar-grid UI, so it needs to be built from scratch (an
+   HTML/CSS/JS grid is enough — no need for a calendar library/dependency for a single
+   read-only-background + click-toggle grid).
+2. **Keep everything server-side exactly as-is.** `server/calendar.js` (busy-interval
+   fetch, `nyWallClockToUTC`, `isRangeFree`, `createMeetEvent`), `server/bookings.js` (the
+   offer store), the `/book/<token>` + `/book/<token>/confirm` routes, and the
+   HTML-button email rendering in `server/server.js` (`bookingHtmlEmail`/
+   `bookingTextBlock`) do not need to change. The grid only changes *how the SA picks
+   slots* on the draft screen — it still produces the same `bookingSlots: [{startISO,
+   endISO, label}]` array that `saveFinal` already validates and turns into an offer.
+3. **Optional, more ambitious stretch (only if explicitly asked for): an inline card in
+   the recipient's inbox instead of a standalone booking page.** True Gmail-style inline
+   "Available times" cards are a Gmail-client-side AMP/rendering feature Google reserves
+   for its own product — there is no public API to make an arbitrary sent email render an
+   interactive picker inside Gmail's UI itself. The realistic approximation (what's
+   already built) is the HTML button email → standalone booking page. Don't attempt a true
+   inline-card clone; explain this constraint if asked.
+4. **Effort estimate:** the grid component itself is the only new, nontrivial piece —
+   call it a solid day of front-end work (grid rendering, click/drag selection state,
+   converting selected blocks into the same `{startISO, endISO, label}` shape the backend
+   already expects). Nothing else in the stack changes.

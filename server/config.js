@@ -20,6 +20,7 @@ const DEFAULTS = {
   backupFrequency: 'off',        // 'off' | 'daily' | '3days' | 'weekly' (see server/backup.js)
   lastBackupAt: '',              // ISO timestamp of the last scheduled backup sent, or '' if never
   digestRecipientIds: [],        // additional user ids to CC on the Monday digest, beyond Marcos (always included) — see server/digest.js
+  meetingParticipantIds: [],     // user ids added by default to meetings booked through emailed slot links (the SA can deselect per email) — see the /book routes in server.js
   lastDigestWeekKey: '',         // NY-local date (YYYY-MM-DD) of the Monday last sent or logged-as-missed, so a restart never double-sends or loses the week
   setupCompleted: false          // set once the first admin exists; a second gate on /api/auth/setup (see server.js)
 };

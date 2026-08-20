@@ -3,14 +3,17 @@
 // picker" flow). Reuses gmail.js's OAuth connection (same account, same token, combined
 // gmail.modify + calendar.readonly scope) — there is no separate Calendar connect step.
 
+const crypto = require('crypto');
 const gmail = require('./gmail');
 
 const TIMEZONE = 'America/New_York';
 const BUSINESS_START_HOUR = 9;
 const BUSINESS_END_HOUR = 17;
-const LOOKAHEAD_BUSINESS_DAYS = 5;
-const SLOT_HOURS = 1;
-const MAX_SLOTS = 10;
+// Half-hour slots over the next two business days: short-notice, low-commitment openings
+// suit a cold-outreach booking link better than week-out hour blocks did.
+const LOOKAHEAD_BUSINESS_DAYS = 2;
+const SLOT_MINUTES = 30;
+const MAX_SLOTS = 16;
 
 // Converts an America/New_York wall-clock instant (y/m/d/hour/minute) to the correct UTC
 // Date, DST-correct. Two passes converge: format the first guess back into NY wall time,
@@ -89,16 +92,34 @@ async function getAvailableSlots() {
     end: nyWallClockToUTC(y, month, d, BUSINESS_END_HOUR, 0)
   }));
 
+  const busy = await getBusyIntervals(
+    dayWindows[0].start.toISOString(),
+    dayWindows[dayWindows.length - 1].end.toISOString()
+  );
+
+  const slotMs = SLOT_MINUTES * 60000;
+  const slots = [];
+  for (const { start: dayStart, end: dayEnd } of dayWindows) {
+    for (let t = dayStart.getTime(); t + slotMs <= dayEnd.getTime(); t += slotMs) {
+      const slotStart = new Date(t), slotEnd = new Date(t + slotMs);
+      if (busy.some(b => overlaps(slotStart, slotEnd, b.start, b.end))) continue;
+      slots.push({ startISO: slotStart.toISOString(), endISO: slotEnd.toISOString(), label: formatSlotLabel(slotStart, slotEnd) });
+      if (slots.length >= MAX_SLOTS) return slots;
+    }
+  }
+  return slots;
+}
+
+// The raw busy list for a window, with the same fail-loudly semantics as above — shared by
+// the slot builder and the public booking page (which re-checks offered slots on load and
+// again at confirm time, so a slot Marcos filled after the email went out can't be booked).
+async function getBusyIntervals(timeMinISO, timeMaxISO) {
   // callGmail (not a bare ensureAccessToken + requestJSON) so a 401 from a token Google
   // invalidated early gets the same forced-refresh-and-retry every Gmail call gets.
   const freeBusy = await gmail.callGmail(accessToken => ({
     hostname: 'www.googleapis.com', path: '/calendar/v3/freeBusy', method: 'POST',
     headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
-    body: {
-      timeMin: dayWindows[0].start.toISOString(),
-      timeMax: dayWindows[dayWindows.length - 1].end.toISOString(),
-      items: [{ id: 'primary' }]
-    }
+    body: { timeMin: timeMinISO, timeMax: timeMaxISO, items: [{ id: 'primary' }] }
   }));
   // Google reports a per-calendar failure inside the 200 response rather than as an HTTP
   // error: calendars.primary carries an errors[] and an empty busy[]. Reading .busy straight
@@ -113,24 +134,58 @@ async function getAvailableSlots() {
 
   // An unparseable interval must not be silently dropped either — dropping it marks a booked
   // hour as free, which is the same outward-facing mistake as ignoring errors[].
-  const busy = primary.busy.map(b => {
+  return primary.busy.map(b => {
     const start = new Date(b.start), end = new Date(b.end);
     if (isNaN(start.getTime()) || isNaN(end.getTime())) {
       throw new Error(`Google returned an unreadable busy interval (${JSON.stringify(b)}), so open times cannot be determined.`);
     }
     return { start, end };
   });
-
-  const slots = [];
-  for (const { start: dayStart, end: dayEnd } of dayWindows) {
-    for (let t = dayStart.getTime(); t + SLOT_HOURS * 3600000 <= dayEnd.getTime(); t += SLOT_HOURS * 3600000) {
-      const slotStart = new Date(t), slotEnd = new Date(t + SLOT_HOURS * 3600000);
-      if (busy.some(b => overlaps(slotStart, slotEnd, b.start, b.end))) continue;
-      slots.push({ startISO: slotStart.toISOString(), endISO: slotEnd.toISOString(), label: formatSlotLabel(slotStart, slotEnd) });
-      if (slots.length >= MAX_SLOTS) return slots;
-    }
-  }
-  return slots;
 }
 
-module.exports = { getAvailableSlots };
+// True only if the primary calendar shows nothing overlapping [startISO, endISO). Same
+// throw-on-unreadable rule: a booking must never proceed on an unverifiable window.
+async function isRangeFree(startISO, endISO) {
+  const busy = await getBusyIntervals(startISO, endISO);
+  const start = new Date(startISO), end = new Date(endISO);
+  return !busy.some(b => overlaps(start, end, b.start, b.end));
+}
+
+// Creates the real Calendar event (on Marcos's primary calendar, with the prospect and any
+// default participants as guests) and asks Google to attach a Meet link to it. Requires the
+// calendar.events scope — callers gate on gmail.hasCalendarWriteAccess() first so a stale
+// grant produces a clear "reconnect Gmail" message instead of a Google 403.
+// sendUpdates=all makes Google email the invite to every attendee, so the prospect gets the
+// Meet link even if they never see the confirmation page again.
+async function createMeetEvent({ startISO, endISO, summary, description, attendees }) {
+  const event = await gmail.callGmail(accessToken => ({
+    hostname: 'www.googleapis.com',
+    path: '/calendar/v3/events?conferenceDataVersion=1&sendUpdates=all',
+    method: 'POST',
+    headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+    body: {
+      summary,
+      description,
+      start: { dateTime: startISO, timeZone: TIMEZONE },
+      end: { dateTime: endISO, timeZone: TIMEZONE },
+      attendees: (attendees || []).map(email => ({ email })),
+      conferenceData: {
+        createRequest: {
+          requestId: 'gs-' + crypto.randomBytes(8).toString('hex'),
+          conferenceSolutionKey: { type: 'hangoutsMeet' }
+        }
+      }
+    }
+  }));
+  // The Meet link is usually on the response already; hangoutLink is Google's own shortcut
+  // field for it. If the conference is still provisioning, the invite email carries it —
+  // the booking has still succeeded, so this returns with meetLink ''.
+  const entry = ((event.conferenceData && event.conferenceData.entryPoints) || []).find(p => p.entryPointType === 'video');
+  return {
+    eventId: event.id || '',
+    meetLink: (entry && entry.uri) || event.hangoutLink || '',
+    htmlLink: event.htmlLink || ''
+  };
+}
+
+module.exports = { getAvailableSlots, getBusyIntervals, isRangeFree, createMeetEvent };

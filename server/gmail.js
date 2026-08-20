@@ -19,13 +19,16 @@ const config = require('./config');
 const store = require('./store');
 const audit = require('./audit');
 
-// calendar.readonly rides on the same OAuth grant as Gmail — one Google account, one
-// consent screen, one token. calendar.js reuses ensureAccessToken()/requestJSON() below
-// to call the Calendar API; it never gets its own connect flow. An already-connected
-// account only has the gmail.modify grant until it's reconnected once (prompt: 'consent'
-// below forces the combined consent screen on every connect), so isConnected() alone
-// isn't enough to know calendar access is usable — see hasCalendarAccess().
-const SCOPE = 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.readonly';
+// calendar.readonly and calendar.events ride on the same OAuth grant as Gmail — one
+// Google account, one consent screen, one token. calendar.js reuses
+// ensureAccessToken()/requestJSON() below to call the Calendar API; it never gets its own
+// connect flow. calendar.readonly covers the free/busy lookup; calendar.events (added for
+// the booking-link feature) lets the app create the Calendar event + Meet link when a
+// prospect books an offered slot. An already-connected account only has the scopes it was
+// connected with until it's reconnected once (prompt: 'consent' below forces the combined
+// consent screen on every connect), so isConnected() alone isn't enough to know calendar
+// access is usable — see hasCalendarAccess()/hasCalendarWriteAccess().
+const SCOPE = 'https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events';
 const LABEL_NAME = 'WebApp Outreach';
 const TOKEN_REFRESH_SKEW_MS = 2 * 60 * 1000; // refresh 2 minutes before actual expiry
 const REQUEST_TIMEOUT_MS = 20000;            // see requestJSON()
@@ -85,6 +88,13 @@ function hasCalendarAccess() {
   return !!(token && token.scope && token.scope.includes('calendar'));
 }
 
+// The write half (event creation for booked slots) shipped later still, so an account can
+// have free/busy access but not this. Checked the same way: against what Google actually
+// granted, since 'calendar.readonly' does not substring-match 'calendar.events'.
+function hasCalendarWriteAccess() {
+  return !!(token && token.scope && token.scope.includes('calendar.events'));
+}
+
 function getStatus() {
   return {
     connected: isConnected(),
@@ -93,6 +103,7 @@ function getStatus() {
     // are gone" — the second is fixed in Settings, not by reconnecting.
     needsCreds: !!(token && token.refreshToken) && !config.hasGoogleCreds(),
     calendarConnected: isConnected() && hasCalendarAccess(),
+    calendarWrite: isConnected() && hasCalendarWriteAccess(),
     loadError
   };
 }
@@ -331,7 +342,11 @@ async function ensureLabel() {
 
 // ---- Build and send the actual message ----
 
-function buildRawMessage({ from, to, cc, subject, bodyText, inReplyTo, references }) {
+// `bodyHtml` is optional: when present the message goes out as multipart/alternative
+// (text first, HTML preferred by capable clients) so the booking-link buttons render as
+// buttons while text-only clients still get every URL in the plain part. Without it the
+// message stays exactly the single-part text/plain it has always been.
+function buildRawMessage({ from, to, cc, subject, bodyText, bodyHtml, inReplyTo, references }) {
   const headers = [
     `From: ${encodeAddress(from)}`,
     `To: ${encodeAddress(to)}`,
@@ -339,22 +354,40 @@ function buildRawMessage({ from, to, cc, subject, bodyText, inReplyTo, reference
     `Subject: ${encodeHeader(subject)}`,
     ...(inReplyTo ? [`In-Reply-To: ${encodeHeader(inReplyTo)}`] : []),
     ...(references ? [`References: ${encodeHeader(references)}`] : []),
-    'MIME-Version: 1.0',
-    'Content-Type: text/plain; charset="UTF-8"',
-    'Content-Transfer-Encoding: base64'
+    'MIME-Version: 1.0'
   ];
-  const raw = headers.join('\r\n') + '\r\n\r\n' + encodeBody(bodyText);
+  let raw;
+  if (bodyHtml) {
+    const boundary = 'gs_alt_' + Date.now().toString(36);
+    headers.push(`Content-Type: multipart/alternative; boundary="${boundary}"`);
+    raw = headers.join('\r\n') + '\r\n\r\n' + [
+      `--${boundary}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      encodeBody(bodyText),
+      `--${boundary}`,
+      'Content-Type: text/html; charset="UTF-8"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      encodeBody(bodyHtml),
+      `--${boundary}--`
+    ].join('\r\n');
+  } else {
+    headers.push('Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64');
+    raw = headers.join('\r\n') + '\r\n\r\n' + encodeBody(bodyText);
+  }
   return Buffer.from(raw, 'utf8').toString('base64url');
 }
 
-// params: { to, cc: [], subject, bodyText, threadId, inReplyTo, references }
+// params: { to, cc: [], subject, bodyText, bodyHtml?, threadId, inReplyTo, references }
 // Returns { gmailThreadId, gmailMessageId } — gmailMessageId is the RFC "Message-ID"
 // header value (needed to thread a future follow-up), best-effort: if it can't be
 // fetched back, the send has still succeeded and the function still returns normally
 // with gmailMessageId as ''.
-async function sendEmail({ to, cc, subject, bodyText, threadId, inReplyTo, references }) {
+async function sendEmail({ to, cc, subject, bodyText, bodyHtml, threadId, inReplyTo, references }) {
   const from = (token && token.email) || 'marcos@govspringlegal.com';
-  const raw = buildRawMessage({ from, to, cc, subject, bodyText, inReplyTo, references });
+  const raw = buildRawMessage({ from, to, cc, subject, bodyText, bodyHtml, inReplyTo, references });
 
   const sendBody = { raw };
   if (threadId) sendBody.threadId = threadId;
@@ -521,7 +554,7 @@ function connectedEmail() {
 module.exports = {
   init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail,
   sendAttachmentEmail, sendInviteEmail, sendStandaloneEmail, getThreadReplies, getMessageBody,
-  connectedEmail, hasCalendarAccess,
+  connectedEmail, hasCalendarAccess, hasCalendarWriteAccess,
   // Exposed so calendar.js can make its own read-only Calendar API calls through the same
   // connection — same token, same refresh-on-401 handling, no second OAuth client.
   ensureAccessToken, requestJSON, callGmail

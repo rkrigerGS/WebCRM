@@ -685,8 +685,8 @@ function renderQuestions(q){
   const personalBlock=(q.personalHooks&&q.personalHooks.length)?`<div class="q-block"><div class="q-label">Personal touch (optional)</div><div class="q-hint">Catalog hooks that may fit this prospect. Pick any to weave in, or none.</div>${q.personalHooks.map(h=>`<div class="opt" data-kind="hook" data-id="${esc(h.id)}"><div class="opt-title">${esc(h.label)}</div><div class="opt-detail">${esc(h.suggestion)}</div></div>`).join('')}</div>`:'';
   const slotsBlock=flowState.calendarConnected
     ?(flowState.slots.length
-      ?`<div class="q-block"><div class="q-label">Offer specific open times (optional)</div><div class="q-hint">From Marcos's calendar. Pick up to 3 to include instead of the generic "available next week" line.</div>${flowState.slots.map(s=>`<div class="opt" data-kind="slot" data-iso="${esc(s.startISO)}"><span class="opt-title">${esc(s.label)}</span></div>`).join('')}</div>`
-      :`<div class="q-block"><div class="q-hint">No open business-hours slots found in the next few days on Marcos's calendar.</div></div>`)
+      ?`<div class="q-block"><div class="q-label">Offer specific open times (optional)</div><div class="q-hint">Half-hour openings on Marcos's calendar over the next two business days. Pick up to 5; each one becomes a one-click booking button in the email that creates a calendar invite with a Google Meet link.</div>${flowState.slots.map(s=>`<div class="opt" data-kind="slot" data-iso="${esc(s.startISO)}"><span class="opt-title">${esc(s.label)}</span></div>`).join('')}</div>`
+      :`<div class="q-block"><div class="q-hint">No open business-hours slots found in the next two business days on Marcos's calendar.</div></div>`)
     :(flowState.calendarFailed
       ?`<div class="q-block"><div class="q-hint">Could not read Marcos's calendar just now, so specific open times aren't available for this draft.${flowState.calendarRef?` Reference code: ${esc(flowState.calendarRef)}.`:''} The draft will use the usual "available next week" wording.</div></div>`
       :`<div class="q-block"><div class="q-hint">Connect Google Calendar in Settings to offer specific open times here.</div></div>`);
@@ -703,7 +703,7 @@ function renderQuestions(q){
   emailModalBody.querySelectorAll('.opt[data-kind="slot"]').forEach(el=>el.addEventListener('click',()=>{
     const iso=el.dataset.iso;const i=flowState.selectedSlots.indexOf(iso);
     if(i>=0){flowState.selectedSlots.splice(i,1);el.classList.remove('selected');}
-    else{if(flowState.selectedSlots.length>=3)return;flowState.selectedSlots.push(iso);el.classList.add('selected');}
+    else{if(flowState.selectedSlots.length>=5)return;flowState.selectedSlots.push(iso);el.classList.add('selected');}
   }));
   document.getElementById('genBtn').addEventListener('click',()=>{
     const chosen=(q.personalHooks||[]).filter(h=>flowState.hooks.includes(h.id)).map(h=>h.suggestion);
@@ -738,9 +738,10 @@ function guessRecipientEmail(d){
 
 async function renderDraft(draft,usage){
   const tokens=usage&&usage.output_tokens?`${usage.input_tokens||0} in / ${usage.output_tokens} out`:'';
-  const [gmailStatus,ccable]=await Promise.all([
+  const [gmailStatus,ccable,cfg]=await Promise.all([
     window.api.getGmailStatus().catch(()=>({connected:false})),
-    window.api.listCcableUsers().catch(()=>[])
+    window.api.listCcableUsers().catch(()=>[]),
+    window.api.getConfig().catch(()=>({}))
   ]);
   const company=flowState.dossier.company_name||'';
   const defaultSubject=flowState.isFollowup?`Re: ${company}`:company;
@@ -749,6 +750,23 @@ async function renderDraft(draft,usage){
     ?ccable.map(u=>`<label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;font-weight:400;"><input type="checkbox" class="ccCheck" value="${esc(u.email)}"> ${esc(u.username)} (${esc(u.email)})</label>`).join('')
     :`<div class="hint">No other users have an email on file to CC.</div>`;
 
+  // Booking-link section: only when the SA picked open times in the questions step.
+  // Participants default from the admin-set list (config.meetingParticipantIds) and can
+  // be deselected per email; Marcos organizes the event so he is always on it.
+  const offeredSlots=(flowState.selectedSlots||[]).map(iso=>(flowState.slots||[]).find(s=>s.startISO===iso)).filter(Boolean);
+  const defaultPartIds=cfg.meetingParticipantIds||[];
+  let bookingSection='';
+  if(offeredSlots.length){
+    const partOptions=ccable.length
+      ?ccable.map(u=>`<label style="display:flex;align-items:center;gap:6px;margin-bottom:4px;font-weight:400;"><input type="checkbox" class="meetPartCheck" value="${esc(u.email)}" ${defaultPartIds.includes(u.id)?'checked':''}> ${esc(u.username)} (${esc(u.email)})</label>`).join('')
+      :`<div class="hint">No other users have an email on file to add.</div>`;
+    bookingSection=`
+    <div class="settings-field"><label>Bookable times in this email</label>
+      <div class="hint">One-click booking buttons for ${offeredSlots.map(s=>esc(s.label)).join('; ')} will be added below the signature. Booking creates a calendar invite with a Google Meet link.</div></div>
+    <div class="settings-field"><label>Meeting participants (besides Marcos and the prospect)</label>${partOptions}</div>
+    ${gmailStatus.calendarWrite?'':'<div class="error-note">Booking links need Google Calendar write access. An admin should disconnect and reconnect Gmail in Settings first, or the send will be rejected.</div>'}`;
+  }
+
   emailModalBody.innerHTML=`
     <div class="q-hint">Review and edit. Paste the version you actually send back here and save so the app learns from your changes.</div>
     <textarea class="draft-area" id="draftArea">${esc(draft)}</textarea>
@@ -756,6 +774,7 @@ async function renderDraft(draft,usage){
     <div class="settings-field"><label>To</label><input class="field-input" id="sendTo" value="${esc(defaultTo)}" placeholder="recipient@example.com"></div>
     <div class="settings-field"><label>Subject</label><input class="field-input" id="sendSubject" value="${esc(defaultSubject)}"></div>
     <div class="settings-field"><label>CC (optional)</label>${ccOptions}</div>
+    ${bookingSection}
     <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;"><input type="checkbox" id="saveToLibraryCheck" checked> Save this email to the learning library</label>
     ${gmailStatus.connected?'':'<div class="error-note">Gmail is not connected. Ask an admin to connect it in Settings before sending.</div>'}
     <div id="sendErr" class="error-note" hidden></div>
@@ -775,7 +794,9 @@ async function renderDraft(draft,usage){
     btn.disabled=true; btn.textContent='Sending…';
     try{
       const saveToLibrary=document.getElementById('saveToLibraryCheck').checked;
-      await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc,saveToLibrary});
+      const bookingSlots=offeredSlots.map(s=>({startISO:s.startISO,endISO:s.endISO,label:s.label}));
+      const meetingParticipants=[...emailModalBody.querySelectorAll('.meetPartCheck:checked')].map(el=>el.value);
+      await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc,saveToLibrary,bookingSlots,meetingParticipants});
       emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId);
     }catch(e){
       btn.disabled=false; btn.textContent=originalLabel;
@@ -835,12 +856,14 @@ async function openSettings(){
           ?`<button class="btn btn-ghost btn-sm" id="gmailDisconnectBtn">Disconnect</button>`
           :`<button class="btn btn-sm" id="gmailConnectBtn" ${gmailStatus.hasCreds?'':'disabled title="Add a Google Client ID and Secret below first"'}>Connect Gmail</button>`}
       </div>
-      <div class="key-status ${gmailStatus.calendarConnected?'key-set':'key-unset'}" style="margin-top:8px;">
-        ${gmailStatus.calendarConnected
-          ?'Calendar: connected — real open times can be offered in drafts.'
-          :(gmailStatus.connected
-            ?'Calendar: not yet granted. Disconnect and reconnect Gmail to add Calendar access (same account, no separate login).'
-            :'Calendar: connects together with Gmail above.')}
+      <div class="key-status ${gmailStatus.calendarWrite?'key-set':'key-unset'}" style="margin-top:8px;">
+        ${gmailStatus.calendarWrite
+          ?'Calendar: connected — open times and one-click booking links can be offered in drafts.'
+          :(gmailStatus.calendarConnected
+            ?'Calendar: read-only access. Disconnect and reconnect Gmail to enable one-click booking links in emails (same account, no separate login).'
+            :(gmailStatus.connected
+              ?'Calendar: not yet granted. Disconnect and reconnect Gmail to add Calendar access (same account, no separate login).'
+              :'Calendar: connects together with Gmail above.'))}
       </div></div>
     <div class="settings-field"><label>Google OAuth client</label>
       <div class="hint">From Google Cloud Console &rarr; APIs &amp; Services &rarr; Credentials. Needed once, before connecting.</div>
@@ -871,6 +894,10 @@ async function openSettings(){
         <button class="btn btn-sm" id="sendDigestNowBtn" ${gmailStatus.connected?'':'disabled title="Connect Gmail first"'}>Send digest now</button>
       </div>
       ${cfg.lastDigestWeekKey?`<div class="key-status key-set" style="margin-top:6px;">Last digest week: ${esc(cfg.lastDigestWeekKey)}</div>`:''}</div>
+    <div class="settings-field"><label>Default meeting participants</label>
+      <div class="hint">Pre-checked on every email that offers bookable times; the sender can deselect them per email. Marcos is always on the meeting as organizer.</div>
+      ${digestCandidates.length?digestCandidates.map(u=>`<label style="display:flex;align-items:center;gap:6px;margin:4px 0;font-weight:400;"><input type="checkbox" class="meetPartDefaultCheck" value="${u.id}" ${(cfg.meetingParticipantIds||[]).includes(u.id)?'checked':''}> ${esc(u.username)} (${esc(u.email)})</label>`).join(''):'<div class="hint">No other active users have an email on file.</div>'}
+      <div style="margin-top:8px;"><button class="btn btn-ghost btn-sm" id="saveMeetPartBtn">Save participants</button></div></div>
     `:''}
     <div class="modal-actions"><button class="btn" id="saveSettingsBtn">${isAdmin?'Save':'Close'}</button></div>`;
   const keyPeek=document.getElementById('apiKeyPeek');
@@ -915,6 +942,11 @@ async function openSettings(){
     document.getElementById('saveDigestRecipBtn').addEventListener('click',async()=>{
       const ids=[...settingsBody.querySelectorAll('.digestRecipCheck:checked')].map(el=>parseInt(el.value,10));
       try{ await window.api.saveDigestRecipients(ids); toast('Digest recipients saved.'); }
+      catch(err){ alert(err.message); }
+    });
+    document.getElementById('saveMeetPartBtn').addEventListener('click',async()=>{
+      const ids=[...settingsBody.querySelectorAll('.meetPartDefaultCheck:checked')].map(el=>parseInt(el.value,10));
+      try{ await window.api.saveMeetingParticipants(ids); toast('Default meeting participants saved.'); }
       catch(err){ alert(err.message); }
     });
     document.getElementById('sendDigestNowBtn').addEventListener('click',async()=>{
@@ -1318,6 +1350,7 @@ document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',a
 // live ingest
 window.api.onIngested((r)=>{ if(r.outcome==='ingested'){loadProspects();toast('New prospect added from research');} else if(r.outcome==='duplicate'){toast('Skipped a duplicate');} else if(r.outcome==='excluded'){toast(`Research file ${r.file?`"${r.file}" `:''}was skipped — that company is on the do-not-contact list`,7000);} });
 window.api.onReply((r)=>{ loadProspects(); if(r.company_name)toast(`New reply from ${r.company_name}`); });
+window.api.onBooked((r)=>{ loadProspects(); toast(`${r.company_name||'A prospect'} booked a meeting: ${r.label||''}`,8000); });
 // Background connection/generation failures (Gmail polling, digest, backup, OAuth) surfaced
 // with a short reference code — admin-only, since fixing these means opening Settings.
 // Only admin sessions are sent this event (the server filters it), so no role check is needed
