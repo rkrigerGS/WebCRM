@@ -7,10 +7,19 @@
 - Secure developer backdoor login (commit `22b059c`) — random token per restart, auto-creates `dev_rafael` admin account
 - Google Calendar write access support (requires `calendar.events` scope; SA must enable Calendar API in GCP and reconnect Gmail)
 
-**In progress (not yet deployed):**
-- Outreach history panel on prospect detail (all sends, channels, dates, approval status)
-- Date picker for "log outreach sent elsewhere" modal (backdate external sends)
-- Full-screen prospect view (click open prospect again to expand; close returns to previous tab)
+**In progress (committed, not yet deployed):**
+- Outreach history panel on prospect detail (commit `a56f6e1`)
+  - Timeline view of all outreach attempts (email, LinkedIn, phone)
+  - Shows date, channel, message snippet (first 100 chars)
+  - Extracted from activity log entries starting with "Outreach via"
+- Date picker for "log outreach sent elsewhere" modal (same commit)
+  - Allows backdating external sends to when they actually happened
+  - Defaults to today, accepts any past date
+  - Passed to server as ISO YYYY-MM-DD string
+- Full-screen prospect view (same commit)
+  - Click an open prospect again to expand to full screen
+  - Hides list table, detail pane takes 100% width
+  - Close button returns to previous view and exits full-screen
 
 **Setup step pending:**
 Marcos must enable the Google Calendar API in the GCP project (`930064057128`) at https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=930064057128 and reconnect Gmail in Settings. Until then, calendar availability queries fail with ref code (currently `7debfd`).
