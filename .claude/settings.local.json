@@ -46,7 +46,8 @@
       "Bash(node *)",
       "Bash(rm -f /tmp/admin.jar /tmp/jane.jar /tmp/jane2.jar /tmp/test_generate_audit.js /tmp/govspring_test.log)",
       "Bash(rm -rf data)",
-      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('exclusions:', d['exclusions']\\)\")"
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('exclusions:', d['exclusions']\\)\")",
+      "Bash(rm -f *)"
     ]
   }
 }

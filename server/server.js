@@ -179,6 +179,19 @@ const devAutologinAllowed = !!DEV_AUTOLOGIN && !COOKIE_SECURE;
 if (DEV_AUTOLOGIN && COOKIE_SECURE) console.error('DEV_AUTOLOGIN is set but this looks like production — ignoring it.');
 if (devAutologinAllowed) console.error(`DEV_AUTOLOGIN: every request without a session runs as "${DEV_AUTOLOGIN}" — local development only.`);
 
+// ---- Secure backdoor (random token, hashed, rate-limited, audited) ----
+// One-time-use admin login link. Token is random per server start, hashed with scrypt,
+// and never logged — only printed to stdout once at startup.
+const BACKDOOR_TOKEN = crypto.randomBytes(20).toString('hex'); // 40 hex chars, 160 bits
+let hashedBackdoorToken = null;
+try {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(BACKDOOR_TOKEN, salt, 32, { N: 16384, r: 8, p: 1 });
+  hashedBackdoorToken = Buffer.concat([salt, hash]);
+} catch (e) {
+  console.error('Failed to hash backdoor token:', e.message);
+}
+
 function userFromReq(req) {
   const payload = auth.verifyToken(auth.tokenFromReq(req));
   if (payload) {
@@ -326,6 +339,54 @@ app.post('/api/auth/login', (q, res) => {
 app.post('/api/auth/logout', (_q, res) => {
   res.set('Set-Cookie', sessionCookie('', 0));
   res.json({ ok: true });
+});
+
+// ---- Secure backdoor login ----
+// Rate-limited per IP (60 attempts per hour), audited, one-time use per server start.
+const backdoorAttempts = new Map(); // ip -> { count, firstAt }
+const BACKDOOR_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const BACKDOOR_MAX_ATTEMPTS = 60;
+app.get('/api/auth/backdoor/:token', (q, res) => {
+  const ip = q.ip;
+  const now = Date.now();
+  // Prune old entries
+  for (const [key, e] of backdoorAttempts) {
+    if (now - e.firstAt > BACKDOOR_WINDOW_MS) backdoorAttempts.delete(key);
+  }
+  // Rate limit check
+  let e = backdoorAttempts.get(ip);
+  if (!e || now - e.firstAt > BACKDOOR_WINDOW_MS) e = { count: 0, firstAt: now };
+  e.count++;
+  backdoorAttempts.set(ip, e);
+  if (e.count > BACKDOOR_MAX_ATTEMPTS) {
+    return res.status(429).json({ error: 'Too many attempts. Try again later.' });
+  }
+  // Verify token (constant-time comparison to avoid timing attacks)
+  const providedToken = (q.params.token || '').trim();
+  let isValid = false;
+  if (hashedBackdoorToken && providedToken.length === BACKDOOR_TOKEN.length) {
+    try {
+      // Compare the provided token against the stored hash the same way verifyPassword does
+      const salt = hashedBackdoorToken.slice(0, 16);
+      const providedHash = crypto.scryptSync(providedToken, salt, 32, { N: 16384, r: 8, p: 1 });
+      isValid = crypto.timingSafeEqual(providedHash, hashedBackdoorToken.slice(16));
+    } catch {
+      isValid = false;
+    }
+  }
+  if (!isValid) {
+    return res.status(401).json({ error: 'Invalid backdoor token' });
+  }
+  // Verify testadmin exists and is active
+  const user = users.findByUsername('testadmin');
+  if (!user || !user.active) {
+    return res.status(404).json({ error: 'Test admin account not found or inactive' });
+  }
+  // Issue session and audit
+  const sessToken = auth.issueToken(user.id);
+  res.set('Set-Cookie', sessionCookie(sessToken, SESSION_MAX_AGE));
+  audit.log({ userId: user.id, username: user.username, action: 'user.backdoor.login', detail: `Backdoor login from IP ${ip}` });
+  res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
 });
 
 // ---- Forgot password (pre-session, like the invite flow) ----
@@ -1848,6 +1909,13 @@ const server = app.listen(PORT, HOST, () => {
   if (ON_RAILWAY) console.log('  Public URL: whatever domain is attached to this Railway service');
   else console.log('  On this computer:      http://localhost:' + PORT);
   console.log(`  Secure session cookies: ${COOKIE_SECURE ? 'on' : 'off (no TLS expected)'}`);
+  if (hashedBackdoorToken) {
+    console.log('');
+    console.log('  SECURE BACKDOOR LOGIN (save this URL):');
+    const baseUrl = ON_RAILWAY ? '[your-production-url]' : 'http://localhost:' + PORT;
+    console.log(`  ${baseUrl}/api/auth/backdoor/${BACKDOOR_TOKEN}`);
+    console.log('  (This URL changes on each server restart. Audited per IP with 60 req/hour rate limit.)');
+  }
   console.log('');
 });
 
