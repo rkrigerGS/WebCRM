@@ -1,10 +1,26 @@
-# HANDOFF — audit fix batch, shipped
+# HANDOFF
+
+## Status: 2026-08-21
+
+**Deployed (on origin/main, running in production):**
+- One-click booking links with real Google Meet events (commit `81c1b31`)
+- Secure developer backdoor login (commit `22b059c`) — random token per restart, auto-creates `dev_rafael` admin account
+- Google Calendar write access support (requires `calendar.events` scope; SA must enable Calendar API in GCP and reconnect Gmail)
+
+**In progress (not yet deployed):**
+- Outreach history panel on prospect detail (all sends, channels, dates, approval status)
+- Date picker for "log outreach sent elsewhere" modal (backdate external sends)
+- Full-screen prospect view (click open prospect again to expand; close returns to previous tab)
+
+**Setup step pending:**
+Marcos must enable the Google Calendar API in the GCP project (`930064057128`) at https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=930064057128 and reconnect Gmail in Settings. Until then, calendar availability queries fail with ref code (currently `7debfd`).
+
+---
+
+## Historical updates
 
 **Update 2026-08-19 (latest): one-click booking links with real Google Meet events are
-built and committed locally (not pushed). See "One-click booking links with real Meet
-events, BUILT" near the bottom — including the one operational step this needs: Marcos
-must Disconnect and reconnect Gmail once after deploy to grant the new `calendar.events`
-scope.**
+built and committed. See "One-click booking links with real Meet events, BUILT" below — including the operational step this needs: Marcos must Disconnect and reconnect Gmail once after deploy to grant the new `calendar.events` scope.**
 
 **Update 2026-08-19: a second batch — error reference codes, the invite-pending
 fix, reorderable views, the header cleanup, and the first cut of Google Calendar

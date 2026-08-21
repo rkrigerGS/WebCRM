@@ -323,14 +323,15 @@ function listDormantDue(today) {
   return store.prospects.filter(p => p.status === 'dormant' && p.dormant_until && p.dormant_until <= today).map(p => p.id);
 }
 
-function logExternal(id, { channel, text }) {
+function logExternal(id, { channel, text, loggedAt }) {
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { ok: false };
-  const today = store_.todayNY();
-  appendActivity(p, { date: today, text: `Outreach via ${channel}: ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}` });
+  // Use provided date or default to today (NY timezone). loggedAt should be ISO YYYY-MM-DD.
+  const date = (loggedAt && /^\d{4}-\d{2}-\d{2}$/.test(loggedAt)) ? loggedAt : store_.todayNY();
+  appendActivity(p, { date, text: `Outreach via ${channel}: ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}` });
   p.status = 'sent';
   p.channel = channel;
-  p.date_sent = today;
+  p.date_sent = date;
   // Logging fresh outreach is a deliberate status change, so it acknowledges the same
   // attention flags updateProspect() clears — otherwise a prospect stays flagged as
   // awaiting reply review, or keeps a stale dormant tag, after being contacted again.

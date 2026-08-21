@@ -272,6 +272,9 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
   display: flex; flex-direction: column; overflow: hidden;
   box-shadow: var(--shadow-md);
 }
+.detail-pane.detail-fullscreen {
+  width: 100%; border-left: none;
+}
 .detail-head { display: flex; justify-content: space-between; align-items: flex-start; padding: 20px 20px 16px; border-bottom: 1px solid var(--line); }
 .detail-score { display: inline-block; font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--gold-deep); margin-bottom: 6px; }
 .detail-name { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 4px; line-height: 1.2; }

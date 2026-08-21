@@ -5,12 +5,14 @@ let allProspects = [];
 let selectedId = null;
 let currentView = 'all';
 let selectedIds = new Set();
+let detailFullScreen = false;
 
 const rowsEl     = document.getElementById('rows');
 const emptyEl    = document.getElementById('emptyState');
 const searchEl   = document.getElementById('searchBox');
 const detailPane = document.getElementById('detailPane');
 const bulkBar    = document.getElementById('bulkBar');
+const tableWrap  = document.querySelector('.table-wrap');
 
 const STATUS_LABELS={new:'Not contacted',sent:'Awaiting reply',replied:'Replied',signed:'Signed',dead:'Dead',dormant:'Dormant'};
 function statusLabel(s){return STATUS_LABELS[s]||s;}
@@ -227,12 +229,38 @@ function litLine(l,t){ if(!t)return''; const cls=/NEEDS CHECKING/i.test(t)?'need
 // Corrupt persisted activity JSON must render as an empty log, not throw and blank the pane.
 function parseActivity(raw){ try{ const a=JSON.parse(raw||'[]'); return Array.isArray(a)?a:[]; }catch{ return []; } }
 
+// Extract outreach events from activity: entries starting with "Outreach via".
+// Returns array of {date, channel, snippet} sorted newest first.
+function extractOutreachHistory(activity){
+  const outreach=[];
+  const actArray=Array.isArray(activity)?activity:parseActivity(activity);
+  for(const a of actArray){
+    if(!a.text||!a.text.startsWith('Outreach via '))continue;
+    const match=a.text.match(/^Outreach via (\w+): (.*)$/);
+    if(!match)continue;
+    const channel=match[1];
+    const fullText=match[2];
+    const snippet=fullText.slice(0,100)+(fullText.length>100?'…':'');
+    outreach.push({date:a.date,channel,snippet,fullText});
+  }
+  return outreach.reverse();
+}
+
 // Two rows clicked in quick succession race their fetches: without the sequence check, the
 // slower (first) response could land last and paint the WRONG prospect under the highlight
 // of the second. Only the latest openDetail call is allowed to touch the pane.
 let detailSeq=0;
 async function openDetail(id){
   const seq=++detailSeq;
+  // If clicking an already-open prospect, toggle full-screen mode instead of refreshing.
+  if(selectedId===id && detailPane.hidden===false){
+    detailFullScreen=!detailFullScreen;
+    detailPane.classList.toggle('detail-fullscreen',detailFullScreen);
+    if(tableWrap)tableWrap.hidden=detailFullScreen;
+    return;
+  }
+  detailFullScreen=false;
+  if(tableWrap)tableWrap.hidden=false;
   selectedId=id; renderList();
   let p;
   // If the row is gone (deleted by someone else) or the request fails, close the pane
@@ -257,6 +285,7 @@ async function openDetail(id){
   const lit=d.prior_litigation||{};
   const issues=Array.isArray(d.issue_spotting)?d.issue_spotting:[];
   const activity=parseActivity(p.activity);
+  const outreachHistory=extractOutreachHistory(p.activity);
 
   document.getElementById('detailBody').innerHTML=`
     <div class="section">
@@ -289,6 +318,8 @@ async function openDetail(id){
     </div>
 
     ${p.final_sent?`<div class="section"><div class="section-label">Sent email</div><div class="prose" style="white-space:pre-wrap;">${esc(shorten(p.final_sent,600))}</div></div>`:''}
+
+    ${outreachHistory.length?`<div class="section"><div class="section-label">Outreach history</div>${outreachHistory.map(o=>`<div class="field" style="font-size:12px;"><span class="field-key">${esc(o.date)}</span> <span style="color:var(--text-soft);margin:0 6px;">·</span> <span style="text-transform:capitalize;">${esc(o.channel)}</span> <span style="color:var(--text-soft);margin:0 6px;">·</span> <span class="field-val">${esc(o.snippet)}</span></div>`).join('')}</div>`:''}
 
     ${activity.length?`<div class="section"><div class="section-label">Activity</div>${activity.slice().reverse().map(a=>`<div class="field"><span class="field-key">${esc(a.date)}:</span> <span class="field-val">${esc(a.text)}</span></div>`).join('')}</div>`:''}
 
@@ -368,8 +399,11 @@ const emailModalTitle=document.getElementById('emailModalTitle');
 function openLogExternal(id){
   emailModalTitle.textContent='Log outreach sent elsewhere';
   emailModal.hidden=false;
+  const today=new Date().toISOString().split('T')[0];
   emailModalBody.innerHTML=`
     <div class="q-hint">Paste an email, LinkedIn message, or a note about a call made outside the app. This records the outreach and starts the follow-up clock.</div>
+    <div class="settings-field"><label>Date</label>
+      <input type="date" id="extDate" class="field-input" value="${today}"></div>
     <div class="settings-field"><label>Channel</label>
       <select id="extChannel" class="field-input"><option value="email">Email</option><option value="linkedin">LinkedIn</option><option value="phone">Phone call</option></select></div>
     <div class="settings-field"><label>Message or note</label>
@@ -381,9 +415,10 @@ function openLogExternal(id){
     if(btn.disabled)return;
     const channel=document.getElementById('extChannel').value;
     const text=document.getElementById('extText').value.trim();
+    const loggedAt=document.getElementById('extDate').value;
     if(!text)return;
     btn.disabled=true;
-    try{ await window.api.logExternal(id,{channel,text}); }
+    try{ await window.api.logExternal(id,{channel,text,loggedAt}); }
     catch(err){ btn.disabled=false; toast('Outreach not logged: '+err.message,6000); return; }
     emailModal.hidden=true; loadProspects(); openDetail(id);
   });
@@ -1288,7 +1323,7 @@ const VIEW_ORDER_KEY='viewOrder';
 })();
 ['filterFit','filterState','filterAgency','filterDesignation','sortBy'].forEach(id=>document.getElementById(id).addEventListener('change',renderList));
 searchEl.addEventListener('input',renderList);
-document.getElementById('closeDetail').addEventListener('click',()=>{detailPane.hidden=true;selectedId=null;renderList();});
+document.getElementById('closeDetail').addEventListener('click',()=>{detailPane.hidden=true;detailPane.classList.remove('detail-fullscreen');detailFullScreen=false;if(tableWrap)tableWrap.hidden=false;selectedId=null;renderList();});
 document.getElementById('revealBtn').addEventListener('click',()=>window.api.revealWatched());
 document.getElementById('emptyReveal').addEventListener('click',()=>window.api.revealWatched());
 
