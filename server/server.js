@@ -180,8 +180,12 @@ if (DEV_AUTOLOGIN && COOKIE_SECURE) console.error('DEV_AUTOLOGIN is set but this
 if (devAutologinAllowed) console.error(`DEV_AUTOLOGIN: every request without a session runs as "${DEV_AUTOLOGIN}" — local development only.`);
 
 // ---- Secure backdoor (random token, hashed, rate-limited, audited) ----
-// One-time-use admin login link. Token is random per server start, hashed with scrypt,
-// and never logged — only printed to stdout once at startup.
+// Developer admin login link. The token is regenerated on every server start (so an old
+// link stops working after a restart/redeploy) and stays valid for that process's lifetime
+// — it is NOT single-use. It is hashed in memory with scrypt, never written to disk (so it
+// can't leak through backups, unlike the removed fixed-slug backdoor) and printed once to
+// stdout at startup. It deliberately has no production/env guard: reaching a live admin
+// session is the whole point. Anyone with the startup log can use it until the next restart.
 const BACKDOOR_TOKEN = crypto.randomBytes(20).toString('hex'); // 40 hex chars, 160 bits
 let hashedBackdoorToken = null;
 try {
@@ -342,7 +346,8 @@ app.post('/api/auth/logout', (_q, res) => {
 });
 
 // ---- Secure backdoor login ----
-// Rate-limited per IP (60 attempts per hour), audited, one-time use per server start.
+// Rate-limited per IP (60 attempts per hour), audited. Route sits above the /api session
+// gate on purpose (it must be reachable pre-session), like /api/auth/login.
 const backdoorAttempts = new Map(); // ip -> { count, firstAt }
 const BACKDOOR_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const BACKDOOR_MAX_ATTEMPTS = 60;
@@ -361,12 +366,11 @@ app.get('/api/auth/backdoor/:token', (q, res) => {
   if (e.count > BACKDOOR_MAX_ATTEMPTS) {
     return res.status(429).json({ error: 'Too many attempts. Try again later.' });
   }
-  // Verify token (constant-time comparison to avoid timing attacks)
+  // Verify token: scrypt the provided value with the stored salt and timing-safe compare.
   const providedToken = (q.params.token || '').trim();
   let isValid = false;
   if (hashedBackdoorToken && providedToken.length === BACKDOOR_TOKEN.length) {
     try {
-      // Compare the provided token against the stored hash the same way verifyPassword does
       const salt = hashedBackdoorToken.slice(0, 16);
       const providedHash = crypto.scryptSync(providedToken, salt, 32, { N: 16384, r: 8, p: 1 });
       isValid = crypto.timingSafeEqual(providedHash, hashedBackdoorToken.slice(16));

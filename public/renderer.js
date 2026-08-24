@@ -157,7 +157,7 @@ function renderList(){
       if(e.target.classList.contains('rowcheck'))return;
       const id=parseInt(tr.dataset.id,10);
       const p=allProspects.find(x=>x.id===id);
-      if(p&&p.awaiting_reply_review)openReplyReview(id); else openDetail(id);
+      if(p&&p.awaiting_reply_review)openReplyReview(id); else activateRow(id);
     });
   });
   rowsEl.querySelectorAll('.rowcheck').forEach(cb=>{
@@ -236,11 +236,16 @@ function extractOutreachHistory(activity){
   const actArray=Array.isArray(activity)?activity:parseActivity(activity);
   for(const a of actArray){
     if(!a.text||!a.text.startsWith('Outreach via '))continue;
-    const match=a.text.match(/^Outreach via (\w+): (.*)$/);
+    // [\s\S] not . — pasted emails are multi-line, and . would stop at the first newline,
+    // dropping every real email (the whole point of this panel) from the history.
+    const match=a.text.match(/^Outreach via (\w+): ([\s\S]*)$/);
     if(!match)continue;
     const channel=match[1];
     const fullText=match[2];
-    const snippet=fullText.slice(0,100)+(fullText.length>100?'…':'');
+    // Collapse the newlines/tabs of a pasted email into single spaces so the timeline row
+    // stays one clean line, then trim to a preview length.
+    const oneLine=fullText.replace(/\s+/g,' ').trim();
+    const snippet=oneLine.slice(0,100)+(oneLine.length>100?'…':'');
     outreach.push({date:a.date,channel,snippet,fullText});
   }
   return outreach.reverse();
@@ -250,17 +255,23 @@ function extractOutreachHistory(activity){
 // slower (first) response could land last and paint the WRONG prospect under the highlight
 // of the second. Only the latest openDetail call is allowed to touch the pane.
 let detailSeq=0;
+function setFullScreen(on){
+  detailFullScreen=on;
+  detailPane.classList.toggle('detail-fullscreen',on);
+  if(tableWrap)tableWrap.hidden=on;
+}
+// User clicked a row. Re-clicking the already-open prospect toggles full-screen; any other
+// row opens normally. Kept separate from openDetail() so the many programmatic
+// openDetail(id) refresh calls (after a status change, note, logged outreach, etc.) re-render
+// the pane in place without flipping full-screen or being swallowed by the toggle branch.
+function activateRow(id){
+  if(selectedId===id && !detailPane.hidden){ setFullScreen(!detailFullScreen); return; }
+  openDetail(id);
+}
 async function openDetail(id){
   const seq=++detailSeq;
-  // If clicking an already-open prospect, toggle full-screen mode instead of refreshing.
-  if(selectedId===id && detailPane.hidden===false){
-    detailFullScreen=!detailFullScreen;
-    detailPane.classList.toggle('detail-fullscreen',detailFullScreen);
-    if(tableWrap)tableWrap.hidden=detailFullScreen;
-    return;
-  }
-  detailFullScreen=false;
-  if(tableWrap)tableWrap.hidden=false;
+  // Opening a different prospect drops full-screen; refreshing the current one preserves it.
+  if(id!==selectedId) setFullScreen(false);
   selectedId=id; renderList();
   let p;
   // If the row is gone (deleted by someone else) or the request fails, close the pane
@@ -399,11 +410,14 @@ const emailModalTitle=document.getElementById('emailModalTitle');
 function openLogExternal(id){
   emailModalTitle.textContent='Log outreach sent elsewhere';
   emailModal.hidden=false;
-  const today=new Date().toISOString().split('T')[0];
+  // Match the app's America/New_York convention (server uses todayNY); a plain
+  // toISOString() would roll to tomorrow's date on any evening in ET. max caps the picker
+  // at today since this field is for recording outreach that already happened.
+  const today=new Intl.DateTimeFormat('en-CA',{timeZone:'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
   emailModalBody.innerHTML=`
     <div class="q-hint">Paste an email, LinkedIn message, or a note about a call made outside the app. This records the outreach and starts the follow-up clock.</div>
     <div class="settings-field"><label>Date</label>
-      <input type="date" id="extDate" class="field-input" value="${today}"></div>
+      <input type="date" id="extDate" class="field-input" value="${today}" max="${today}"></div>
     <div class="settings-field"><label>Channel</label>
       <select id="extChannel" class="field-input"><option value="email">Email</option><option value="linkedin">LinkedIn</option><option value="phone">Phone call</option></select></div>
     <div class="settings-field"><label>Message or note</label>
@@ -1323,7 +1337,7 @@ const VIEW_ORDER_KEY='viewOrder';
 })();
 ['filterFit','filterState','filterAgency','filterDesignation','sortBy'].forEach(id=>document.getElementById(id).addEventListener('change',renderList));
 searchEl.addEventListener('input',renderList);
-document.getElementById('closeDetail').addEventListener('click',()=>{detailPane.hidden=true;detailPane.classList.remove('detail-fullscreen');detailFullScreen=false;if(tableWrap)tableWrap.hidden=false;selectedId=null;renderList();});
+document.getElementById('closeDetail').addEventListener('click',()=>{setFullScreen(false);detailPane.hidden=true;selectedId=null;renderList();});
 document.getElementById('revealBtn').addEventListener('click',()=>window.api.revealWatched());
 document.getElementById('emptyReveal').addEventListener('click',()=>window.api.revealWatched());
 

@@ -327,7 +327,11 @@ function logExternal(id, { channel, text, loggedAt }) {
   const p = store.prospects.find(x => x.id === id);
   if (!p) return { ok: false };
   // Use provided date or default to today (NY timezone). loggedAt should be ISO YYYY-MM-DD.
-  const date = (loggedAt && /^\d{4}-\d{2}-\d{2}$/.test(loggedAt)) ? loggedAt : store_.todayNY();
+  // This field records outreach that already happened, so a future date (past the client's
+  // max=today cap, i.e. a hand-crafted request) is ignored rather than stored — otherwise it
+  // would push the follow-up clock out past the real send.
+  const today = store_.todayNY();
+  const date = (loggedAt && /^\d{4}-\d{2}-\d{2}$/.test(loggedAt) && loggedAt <= today) ? loggedAt : today;
   appendActivity(p, { date, text: `Outreach via ${channel}: ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}` });
   p.status = 'sent';
   p.channel = channel;
