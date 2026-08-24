@@ -49,12 +49,41 @@ straight into **Clio Manage** via Clio's API, skipping Clio Grow entirely.
   exist (US `app.clio.com`, plus EU/CA/AU); GovSpring is US → `app.clio.com`. Exact
   endpoint field names + the upload finalize call to be pinned against live docs at build.
 
+**KEY FINDING (2026-08-24) — Clio's e-signature is NOT API-triggerable:**
+Rafael asked whether the app could call Clio Grow's e-signature service (send an
+engagement/retainer template to a client to sign) via API. Researched: **no.**
+- The **Clio Grow API** exposes only lead/contact intake — the legacy Lead Inbox endpoint
+  (create lead) plus, on the newer Clio Platform API, Contacts / Contact Notes / "Custom
+  Actions" (links added into the Grow UI). There is **no endpoint to send a template for
+  e-signature or generate a document from a Grow template.**
+- Clio's e-signature (both Grow and Manage) is a **UI-only feature powered by Dropbox Sign**;
+  neither product's public API exposes a "send for signature" action.
+- Implication: the Grow templates the other clerk is building are usable **only through
+  Clio's own UI**, not reachable by our app.
+- (Caveat: Clio's API reference is a JS-rendered SPA that couldn't be scraped directly;
+  finding is triangulated from the lead-inbox guide, the Manage/Platform handbook, and help
+  center. Worth a confirmation to Clio partner support before finalizing.)
+
+**Therefore the signed-retainer path must be one of:**
+- **Path A (full automation, no Clio Grow):** integrate an e-sign provider's OWN API
+  (Dropbox Sign or DocuSign) — app sends the retainer, receives the signed PDF via webhook,
+  then pushes contact + matter + signed PDF into Clio Manage. Templates would live in the
+  e-sign provider, NOT Clio Grow (clerk's Grow templates not reused). May need a paid
+  Dropbox Sign/DocuSign API plan (the Clio-bundled Dropbox Sign is UI-only).
+- **Path B (hybrid, reuses Grow templates):** app creates the contact + matter in Clio
+  Manage via API; the clerk sends the retainer for signature from Clio's UI using the
+  templates being built; Clio stores the signed doc on the matter automatically. Signature
+  step stays manual; no third-party integration.
+- **Path C:** app generates the retainer from its own template AND uses an e-sign API (A +
+  own doc generation). Most work.
+Choosing between these is the first interview decision — it hinges on whether keeping Clio
+Grow's template/e-sign workflow matters more than fully automating the send.
+
 **Prerequisites Rafael/firm must provide (not code):**
 1. A registered **Clio developer app** (client_id / client_secret + redirect URI) so we can
-   run the OAuth connect, mirroring the Gmail client setup.
-2. Clarity on **where the signed retainer PDF comes from** — the CRM today does outreach,
-   not intake or e-signature, so the signed document's origin is an open design question
-   (see interview).
+   run the OAuth connect, mirroring the Gmail client setup. Note: Manage API vs. Clio
+   Platform API use different developer-app types — Manage for matters/documents.
+2. If Path A/C: an **e-sign provider account with API access** (Dropbox Sign or DocuSign).
 
 **Open product questions for interview mode:** trigger for the push (button vs. status →
 "signed"); Person vs. Company contact mapping and which dossier fields map to which Clio
