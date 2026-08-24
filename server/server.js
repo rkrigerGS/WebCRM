@@ -1278,10 +1278,25 @@ function isAutomatedSender(from) {
   return /^(mailer-daemon|postmaster|no-?reply|donotreply|do-not-reply|autoreply|auto-reply|bounce[s]?)$/.test(local);
 }
 
-// Polls only prospects with a Gmail thread on file and not dead — one cheap metadata-only
-// Gmail call per active thread, not a global inbox scan. At this app's scale (a bounded
-// number of active outreach threads, not thousands) this is well within Gmail's API
-// quota. Runs only when Gmail is connected; skips the cycle otherwise, no error surfaced.
+// Every contact address on a prospect's dossier (general + per-decision-maker), lowercased
+// and deduped. Used by the search-based reply pass to watch outreach that went out from
+// Gmail directly, where there is no thread id to poll — the prospect's own address is the
+// only handle we have to recognise their reply by.
+function prospectEmails(p) {
+  const d = p.dossier || {};
+  const out = new Set();
+  const add = (v) => { const a = addressOf(v); if (a && a.includes('@')) out.add(a); };
+  add((d.contact_general || {}).email);
+  for (const c of (Array.isArray(d.contacts) ? d.contacts : [])) add(c.email);
+  return [...out];
+}
+
+// Two passes, both cheap metadata-only Gmail calls and never a global inbox scan: (1) every
+// prospect with a Gmail thread on file (app-sent outreach), one thread fetch each; (2) every
+// 'sent' prospect with no thread but a known contact address (outreach sent from Gmail and
+// logged in the app), one bounded from:/after: search each. At this app's scale (a bounded
+// number of active outreach threads, not thousands) this is well within Gmail's API quota.
+// Runs only when Gmail is connected; skips the cycle otherwise, no error surfaced.
 // The calls are awaited one at a time, so with enough threads a run can outlast the
 // 3-minute interval; the flag keeps the ticks from stacking runs on top of each other.
 let pollRunning = false;
@@ -1319,6 +1334,37 @@ async function pollForReplies() {
         // for every prospect in the loop. A per-prospect scope gave the identical message a
         // distinct dedup key each time, so one root cause produced one toast per prospect
         // every cycle and grew recentIssues with the prospect count. The id goes to the log.
+        reportIssue('gmail.replyPoll', e, `prospect ${p.id}`);
+      }
+    }
+
+    // Second pass: outreach sent from Gmail directly and logged via "Log outreach sent
+    // elsewhere" has no thread on file, so the thread loop above never sees it. Match those
+    // replies by the prospect's own contact address instead. Scoped tightly — only 'sent'
+    // prospects with no thread, not already flagged for review, and with a known email — so
+    // this stays a bounded number of searches per cycle, not a full-inbox scan.
+    const external = db.listProspects().filter(p =>
+      p.status === 'sent' && !p.gmail_thread_id && !p.awaiting_reply_review);
+    for (const p of external) {
+      try {
+        const emails = prospectEmails(p).filter(a => a !== ours);
+        if (!emails.length) continue; // no address to recognise a reply by — nothing to do
+        // Bound the search to on/after the send date (NY date string → UTC midnight epoch);
+        // fall back to a 30-day lookback if the date is somehow missing.
+        const afterSec = /^\d{4}-\d{2}-\d{2}$/.test(p.date_sent || '')
+          ? Math.floor(Date.parse(p.date_sent + 'T00:00:00Z') / 1000)
+          : Math.floor(Date.now() / 1000) - 30 * 24 * 60 * 60;
+        const latest = await gmail.searchRepliesFrom(emails, afterSec);
+        if (!latest) continue;
+        if (isAutomatedSender(latest.from)) continue;
+        if (latest.id === p.last_reply_message_id) continue; // already surfaced
+        db.recordReply(p.id, {
+          messageId: latest.id, from: latest.from, snippet: latest.snippet,
+          at: latest.internalDate ? new Date(Number(latest.internalDate)).toISOString() : new Date().toISOString()
+        });
+        audit.log({ userId: null, username: 'system (reply poll)', action: 'prospect.reply.detected', prospectId: p.id, detail: `From ${latest.from} (matched by address, no thread)` });
+        broadcast('reply', { id: p.id, company_name: p.company_name });
+      } catch (e) {
         reportIssue('gmail.replyPoll', e, `prospect ${p.id}`);
       }
     }

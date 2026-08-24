@@ -535,6 +535,39 @@ async function getThreadReplies(threadId) {
   });
 }
 
+// Metadata-only inbox search for the newest message from any of `emails`, received after
+// `afterEpochSec` (unix seconds). Used by the reply poll to catch replies to outreach that
+// was sent from Gmail directly (no thread on file), matched by the prospect's own contact
+// address. Mirrors getThreadReplies: no body fetch, just From/Date headers, so a poll cycle
+// stays cheap. Returns the newest match as {id, from, snippet, internalDate, threadId} or
+// null when there is nothing new.
+//
+// The Gmail `q` grammar: from:(a@x OR b@y) restricts to the prospect's addresses, and
+// after:<epochSec> bounds it to mail received since the outreach went out — without that
+// bound a poll would surface months-old prior correspondence as if it were a fresh reply.
+async function searchRepliesFrom(emails, afterEpochSec) {
+  const addrs = (emails || []).map(e => String(e || '').trim().toLowerCase()).filter(Boolean);
+  if (!addrs.length) return null;
+  const q = `from:(${addrs.join(' OR ')}) after:${Math.floor(afterEpochSec)}`;
+  const list = await callGmail(accessToken => ({
+    hostname: 'gmail.googleapis.com',
+    path: `/gmail/v1/users/me/messages?maxResults=5&q=${encodeURIComponent(q)}`,
+    method: 'GET', headers: { authorization: `Bearer ${accessToken}` }
+  }));
+  const ids = (list.messages || []).map(m => m.id);
+  if (!ids.length) return null;
+  // messages.list returns newest first, so the first id is the most recent match. Fetch
+  // metadata only for that one — the poll only ever surfaces the latest reply anyway.
+  const m = await callGmail(accessToken => ({
+    hostname: 'gmail.googleapis.com',
+    path: `/gmail/v1/users/me/messages/${encodeURIComponent(ids[0])}?format=metadata&metadataHeaders=From&metadataHeaders=Date`,
+    method: 'GET', headers: { authorization: `Bearer ${accessToken}` }
+  }));
+  const headers = (m.payload && m.payload.headers) || [];
+  const from = (headers.find(h => h.name === 'From') || {}).value || '';
+  return { id: m.id, from, snippet: m.snippet || '', internalDate: m.internalDate, threadId: m.threadId };
+}
+
 // Full body fetch — only called on demand when the reply review screen opens, not during
 // polling, so polling stays cheap.
 async function getMessageBody(messageId) {
@@ -553,7 +586,7 @@ function connectedEmail() {
 
 module.exports = {
   init, isConnected, getStatus, disconnect, getAuthUrl, exchangeCode, sendEmail,
-  sendAttachmentEmail, sendInviteEmail, sendStandaloneEmail, getThreadReplies, getMessageBody,
+  sendAttachmentEmail, sendInviteEmail, sendStandaloneEmail, getThreadReplies, searchRepliesFrom, getMessageBody,
   connectedEmail, hasCalendarAccess, hasCalendarWriteAccess,
   // Exposed so calendar.js can make its own read-only Calendar API calls through the same
   // connection — same token, same refresh-on-401 handling, no second OAuth client.
