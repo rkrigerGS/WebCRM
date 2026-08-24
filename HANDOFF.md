@@ -1,28 +1,32 @@
 # HANDOFF
 
-## Status: 2026-08-21
+## Status: 2026-08-24
+
+**Repo location moved** to `~/Desktop/life-dashboard/areas/GovSpring/sales work/WebCRM`
+(git re-initialised there and reconnected to `origin` = GitHub `rkrigerGS/WebCRM`; the old
+`~/Desktop/_GovSpring/govspring-web` copy and a stale nested `v2/` duplicate were deleted).
 
 **Deployed (on origin/main, running in production):**
 - One-click booking links with real Google Meet events (commit `81c1b31`)
-- Secure developer backdoor login (commit `22b059c`) — random token per restart, auto-creates `dev_rafael` admin account
+- Secure developer backdoor login (commit `22b059c`) — random token per restart, auto-creates `dev_rafael` admin account. Token is regenerated each server start and printed to the startup log; NOT single-use; no prod/env guard (deliberate).
 - Google Calendar write access support (requires `calendar.events` scope; SA must enable Calendar API in GCP and reconnect Gmail)
+- Outreach history panel + date picker for external logging + full-screen prospect view (commit `a56f6e1`)
+- Audit fixes on the above (commit `aa3abc7`): multi-line emails now show in outreach history (regex was newline-blind); full-screen toggle no longer collides with in-place refreshes (split `activateRow` from `openDetail`); external-log date uses NY timezone, caps at today, and is clamped server-side.
+- Watch replies for externally-sent outreach (commit `74445ab`): reply poll now has a
+  second pass that matches replies to app-logged-but-Gmail-sent outreach by the prospect's
+  own contact address (`gmail.searchRepliesFrom`), since those have no thread id. Bounded
+  by send date, reuses the existing recordReply/dedup/broadcast path.
 
-**In progress (committed, not yet deployed):**
-- Outreach history panel on prospect detail (commit `a56f6e1`)
-  - Timeline view of all outreach attempts (email, LinkedIn, phone)
-  - Shows date, channel, message snippet (first 100 chars)
-  - Extracted from activity log entries starting with "Outreach via"
-- Date picker for "log outreach sent elsewhere" modal (same commit)
-  - Allows backdating external sends to when they actually happened
-  - Defaults to today, accepts any past date
-  - Passed to server as ISO YYYY-MM-DD string
-- Full-screen prospect view (same commit)
-  - Click an open prospect again to expand to full screen
-  - Hides list table, detail pane takes 100% width
-  - Close button returns to previous view and exits full-screen
+**Setup steps pending (both external, on the SA / Google side — not code):**
+1. Enable the Google Calendar API in GCP project `930064057128` at https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=930064057128 then reconnect Gmail in Settings. Until then, calendar availability fails with a ref code (last seen `7debfd`).
+2. For the new externally-sent reply watching to work, the prospect must have a contact
+   email on its dossier (general or a decision-maker). Prospects with no email can't be
+   matched and are silently skipped.
 
-**Setup step pending:**
-Marcos must enable the Google Calendar API in the GCP project (`930064057128`) at https://console.developers.google.com/apis/api/calendar-json.googleapis.com/overview?project=930064057128 and reconnect Gmail in Settings. Until then, calendar availability queries fail with ref code (currently `7debfd`).
+**Unverified (needs live OAuth, same as other Gmail features):** the actual
+`gmail.searchRepliesFrom` round-trip against a real inbox. Logic + boot verified locally;
+first live test: log an external outreach for a prospect whose contact email you can send
+from, reply from that address, wait one 3-minute poll cycle, confirm it appears in Replies.
 
 ---
 
