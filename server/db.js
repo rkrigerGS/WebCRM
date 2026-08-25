@@ -226,10 +226,27 @@ function updateProspect(id, fields, opts = {}) {
   const logStatusChange = ('status' in fields && fields.status !== p.status && !internal);
   const newStatus = fields.status;
 
+  // `activity` is deliberately NOT writable from a plain request: it is the prospect's
+  // permanent log, it is appended to through addNote/logExternal/appendActivity, and a
+  // whole-field overwrite would erase every note and outreach record irrecoverably.
   const allowed = ['status', 'channel', 'first_draft', 'final_sent', 'date_sent',
-    'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity'];
-  if (internal) allowed.push('gmail_thread_id', 'gmail_message_ids');
-  for (const k of allowed) if (k in fields) p[k] = fields[k];
+    'followup_count', 'followup_days', 'next_action_date', 'newsletter'];
+  if (internal) allowed.push('gmail_thread_id', 'gmail_message_ids', 'activity');
+  // The numeric fields are rendered straight into the detail pane (one of them inside an HTML
+  // attribute), so a string here becomes stored XSS. Coerced to integers at the boundary —
+  // the client is not the only caller, so this cannot live in the route alone.
+  const NUMERIC = { followup_count: { min: 0, max: 9999 }, followup_days: { min: 1, max: 365 }, newsletter: { min: 0, max: 1 } };
+  for (const k of allowed) {
+    if (!(k in fields)) continue;
+    const bounds = NUMERIC[k];
+    if (bounds) {
+      const n = Math.trunc(Number(fields[k]));
+      if (!Number.isFinite(n)) continue; // ignore junk rather than storing it
+      p[k] = Math.min(bounds.max, Math.max(bounds.min, n));
+    } else {
+      p[k] = fields[k];
+    }
+  }
 
   if (logStatusChange) {
     appendActivity(p, {

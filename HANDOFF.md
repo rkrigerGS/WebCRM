@@ -82,6 +82,122 @@ changes open a read-only view.
 
 ---
 
+## Full audit + fixes (2026-08-24, committed)
+
+Three parallel audits (backend security/correctness, frontend correctness/XSS, a11y/UI polish)
+plus a hands-on responsive pass in a real browser. Every finding below was reproduced before
+fixing and re-verified after. Findings raised but NOT fixed are listed at the end.
+
+### Responsive layout — the reported "top bar glitches when you change window ratio"
+Root cause: **the stylesheet had no width breakpoints at all** (only `prefers-color-scheme`
+and `prefers-reduced-motion`), and the chrome was built from fixed sizes.
+- Measured at 900px wide: the toolbar overflowed its container by **473px**, four filter
+  controls (Designation + Sort) sat entirely outside the viewport, and the whole document
+  scrolled sideways. With the detail pane open the list was crushed to an unusable sliver.
+- Fixes: `.toolbar` wraps (`flex-wrap`); `#searchBox` is `flex: 0 1 300px` instead of a hard
+  `width:300px`; `.main-head` uses `min-height` (a fixed `height:56px` clipped its contents)
+  and its title truncates with `min-width:0` + ellipsis; `.status-pill` is `white-space:nowrap`
+  (pills were breaking "Awaiting reply" across two lines); `body { overflow-x: hidden }` as a
+  backstop. Four breakpoints added: 1180px (detail pane shares width), 1024px (narrower
+  sidebar/gutters), 900px (detail pane becomes an overlay sheet, filter captions hidden, Flags
+  column dropped), 720px (sidebar becomes a top strip, Location dropped).
+- Verified at 1440/1100/900/700px: toolbar overflow 0, no horizontal scroll, and table
+  header/body cell counts stay in step (7/7/6/5).
+- **Bug found in the first version of this fix**: hiding the Follow-up column via `.col-fu` hid
+  the `<th>` but not the `td.fu-cell`, shifting every row one column out of alignment. When
+  hiding a column, the `th` and `td` must be hidden together — see the comments in the 900px
+  block.
+
+### Security (backend)
+- **CRITICAL — Gmail search-query injection.** `gmail.searchRepliesFrom` interpolated prospect
+  contact addresses (which come from externally-authored dossier JSON) straight into Gmail's
+  `q` grammar. An address like `a@b.com) OR (subject:settlement` closed the `from:(` group and
+  turned the reply poll into an attacker-chosen search over the firm's whole mailbox, whose
+  matched message body is then readable via the reply-context route — reachable by any
+  logged-in non-admin. Fixed with a strict address allowlist regex; the whole search is refused
+  if any candidate fails. Verified: 6 injection vectors blocked, legitimate addresses still pass.
+  *(Introduced by the reply-watching feature earlier the same day.)*
+- **HIGH — watch folder could be pointed at the data root.** `safeWatchFolder` explicitly
+  permitted `resolved === DATA_DIR`, so `{"watchFolder":"."}` made the recursive ingester read
+  `config.json` (API key, Google client secret), `gmail-token.json` (refresh token) and
+  `users.json` (password hashes, live invite/reset tokens) in as prospect dossiers — which
+  `GET /api/prospects` then serves to every user. Now requires a strict subdirectory.
+- **HIGH — `PATCH /api/prospects/:id` forwarded the whole request body.** The db allowlist
+  included `activity`, so any logged-in user could wipe a prospect's entire log
+  (`{"activity":"[]"}`) irrecoverably, or forge history that the digest and reply-draft prompt
+  consume as fact. Route now accepts only `status` + `followup_days`; `activity` is
+  internal-only (notes/outreach go through their own append paths).
+- **MEDIUM — backups shipped live password-reset tokens.** `redactUsers` cleared `inviteToken`
+  but not `resetToken`, so a backup taken during a reset window emailed a working reset link.
+- **MEDIUM — `callClaude` had no timeout and no `setEncoding`.** A half-open socket left the
+  draft request pending forever (spinner never stops); multi-byte characters split across TLS
+  reads corrupted drafts into U+FFFD, which then got saved into the voice library. Both were
+  already fixed this way in `gmail.js`.
+
+### Security (frontend)
+- **CRITICAL — stored XSS via `followup_days` / `followup_count`.** Both were rendered raw
+  (`followup_days` *inside an HTML attribute*) and both were writable through PATCH with no
+  type check, so `{"followup_days":"4\" autofocus onfocus=\"…"}` executed for every user who
+  opened that prospect. Fixed at the root (integers coerced and clamped in
+  `db.updateProspect`) and at the sinks (`esc(String(...))`). Verified both.
+
+### Correctness (frontend)
+- **Live updates were dead for the whole session.** The `EventSource` was created at parse
+  time, before login, got a 401, and per spec a stream refused with an HTTP error never
+  reconnects — so no new-prospect toast, reply notification or auto-refresh arrived until a
+  manual reload. Now self-healing: handlers live in a registry and the stream rebuilds on a
+  capped backoff, so it connects on its own once the session exists.
+- **Manual backup was unreachable whenever any prospect was dead.** The dead-pile review
+  opened in the email modal without closing Settings; both are `fixed; inset:0; z-index:50`
+  and Settings is later in the DOM, so it painted on top and swallowed every click.
+- **Deleting a full-screened prospect left a blank window** (pane hidden, list still hidden).
+  Bulk-deleting the open prospect left its detail pane showing a deleted record.
+
+### Accessibility & polish
+- **Contrast: 6 failures fixed, verified in BOTH themes.** Measured on the real rendered
+  elements with proper alpha compositing — not from source values, which matters because the
+  first proposed fix (`--ink` on `--gold-soft`) scored 1.07:1 in dark mode. Fixed: `.status-new`
+  2.62→5.89, `.status-dead` 3.09→6.33, `.company-sub` / `.prospects thead th` 3.29→4.61,
+  `.tb-label` 3.55→4.97, and `.btn:hover` (was `#fff` on `--gold-deep` = 3.08:1, i.e. the
+  primary button got *harder* to read on hover than at rest). Also caught a pre-existing
+  dark-mode-only failure the fixes exposed: `.status-signed` at 2.32:1, because `--green`
+  inverts between themes while its text was hardcoded `#fff`. New per-theme tokens:
+  `--on-gold-soft`, `--on-line-soft`, `--on-green`; light `--text-faint` darkened to `#6e6e73`.
+  All 10 checked elements now pass AA in light and dark.
+- **Opening a prospect was mouse-only** — the app's primary action. Rows are now
+  `tabindex="0" role="button"` with an `aria-label`, Enter/Space activation, and a focus ring.
+- `:focus-visible` was setting `border-radius:4px` on the *element*, visibly re-cornering pill
+  buttons and modals on keyboard focus. Removed.
+- Checkboxes/radios were browser-default blue in a gold/forest-green UI → `accent-color`.
+- Disabled selects/inputs looked identical to active ones → real `:disabled` styling.
+- Toasts had no `role`/`aria-live`, so every success and undo was silent to screen readers.
+- Long company names and long contact emails had no break opportunity and pushed their own
+  columns sideways → `overflow-wrap`.
+
+### Raised but deliberately NOT fixed (backlog, in rough priority order)
+1. **Reset/invite links are built from the client-controlled `Host` header** (`server.js:422`,
+   `1555`) — a single unauthenticated `POST /api/auth/forgot` with a spoofed `Host` mails the
+   victim a genuine-looking link pointing at an attacker domain, handing over a live reset
+   token. Needs a configured canonical base URL, which is a config/deploy decision.
+2. **Form labels are not associated with any control app-wide** (no `for`/`id` pairing
+   anywhere) — ~30 sites; mechanical but wide.
+3. **Loading/error states**: `loadProspects()` has no try/catch (a failed load shows an empty
+   table, no message); Settings/Audit/email-flow modals await before rendering, so they open
+   blank or stale; the empty-state headline flashes before first paint; no spinner/skeleton
+   primitive exists. Also `openEmailFlow` has no sequence guard — closing it and opening
+   another prospect can render the first prospect's questions against the second's id.
+4. **Native `prompt`/`confirm`/`alert` drive real workflows** (dormant return date is typed
+   into a `prompt()`; the empty-state CTA pops an OS alert containing a filesystem path).
+5. **Modals lack `role="dialog"`/`aria-modal` and never place or restore focus.**
+6. **~70 inline `style=` attributes in renderer.js** bypass the token system; there are no
+   spacing or type-scale tokens, and 11 font sizes between 10–14px (four half-pixel).
+7. Backdoor hardening: failed attempts are not audited, and the token travels in the URL path
+   (so it lands in Railway/proxy access logs and browser history) — consider POST + body.
+8. `bookings.getOffer` resolves prototype-chain keys (`/book/__proto__/data` → 500 instead of
+   404); `saveFinal` reports success if the prospect was deleted mid-send.
+
+---
+
 ## NEXT UP — Clio Manage integration (design/interview phase, no code yet)
 
 **Goal (Rafael):** push a won client — all their info plus a *signed* retainer agreement —

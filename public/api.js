@@ -30,12 +30,41 @@ function toQuery(params) {
   return qs ? '?' + qs : '';
 }
 
-// Opened on first use and reused for every event type. The browser reconnects it on its
-// own if the connection drops, so listeners registered here stay live across a restart.
+// Opened on first use and reused for every event type.
+//
+// The browser only auto-reconnects a stream that dropped mid-flight; a stream refused with an
+// HTTP error is closed permanently. /api/events sits behind the session gate, and these
+// listeners are registered while the login screen is still up, so the very first attempt gets
+// a 401 and the app then ran the whole session with no live updates (no new-prospect toast, no
+// reply notification, no auto-refresh) until a manual reload. So: keep the handlers in a
+// registry, and whenever the stream closes, rebuild it on a backoff — once the user logs in,
+// the next attempt carries the session cookie and succeeds on its own.
 let eventStream = null;
+let eventRetryMs = 1000;
+const EVENT_RETRY_MAX_MS = 30000;
+const eventHandlers = []; // { name, cb }
+
+function connectEventStream() {
+  if (eventStream) return;
+  const es = new EventSource('/api/events');
+  eventStream = es;
+  for (const h of eventHandlers) {
+    es.addEventListener(h.name, (e) => { try { h.cb(JSON.parse(e.data)); } catch {} });
+  }
+  es.addEventListener('open', () => { eventRetryMs = 1000; });
+  es.addEventListener('error', () => {
+    if (es.readyState !== EventSource.CLOSED) return; // transient: the browser retries itself
+    es.close();
+    if (eventStream === es) eventStream = null;
+    setTimeout(connectEventStream, eventRetryMs);
+    eventRetryMs = Math.min(EVENT_RETRY_MAX_MS, eventRetryMs * 2);
+  });
+}
+
 function onServerEvent(name, cb) {
-  if (!eventStream) eventStream = new EventSource('/api/events');
-  eventStream.addEventListener(name, (e) => { try { cb(JSON.parse(e.data)); } catch {} });
+  eventHandlers.push({ name, cb });
+  if (!eventStream) connectEventStream();
+  else eventStream.addEventListener(name, (e) => { try { cb(JSON.parse(e.data)); } catch {} });
 }
 
 window.api = {

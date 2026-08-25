@@ -19,7 +19,16 @@
   --card-glass:  rgba(255, 255, 255, 0.78);
   --text:        #1d1d1f;
   --text-soft:   #55555a;
-  --text-faint:  #86868b;
+  /* #86868b measured 3.29:1 against a list row — below the 4.5:1 AA floor, and it carries the
+     column headers, filter captions and every secondary line in the app. */
+  --text-faint:  #6e6e73;
+  /* Readable text for the two tinted pill families. The pills previously used --gold-deep on
+     --gold-soft (2.62:1) and --text-faint on --line-soft (3.09:1) at 10.5px. */
+  --on-gold-soft: #6b5730;
+  --on-line-soft: #55555a;
+  /* Text on a solid --green fill. --green inverts between themes (dark green in light mode,
+     bright green in dark), so a fixed #fff read 2.32:1 on the dark-mode pill. */
+  --on-green: #ffffff;
   --line:        #e5e3dc;
   --line-soft:   #efede7;
   --on-dark:     #f5f5f7;
@@ -75,6 +84,11 @@
     --text:        #f5f5f7;
     --text-soft:   #c7c7cc;
     --text-faint:  #98989d;
+    /* Dark counterparts: light gold keeps the pill's identity on the dark gold chip, and the
+       neutral pills step up to --text-soft, which clears AA over the composited line-soft. */
+    --on-gold-soft: #dcc492;
+    --on-line-soft: #c7c7cc;
+    --on-green: #05371f;
     --line:        rgba(255, 255, 255, 0.12);
     --line-soft:   rgba(255, 255, 255, 0.07);
 
@@ -106,9 +120,21 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-/* Accessible focus, only for keyboard users */
-:focus-visible { outline: 2px solid var(--gold-deep); outline-offset: 2px; border-radius: 4px; }
+/* Accessible focus, only for keyboard users.
+   No border-radius here: this rule applied it to the ELEMENT, not the outline, so keyboard-
+   focusing a pill button (980px radius) or a modal visibly re-cornered it. Modern browsers
+   already follow the element's own radius when drawing the outline. */
+:focus-visible { outline: 2px solid var(--gold-deep); outline-offset: 2px; }
 :focus:not(:focus-visible) { outline: none; }
+
+/* Form controls inherited the browser default blue in a gold-and-forest-green UI. */
+input[type="checkbox"], input[type="radio"] { accent-color: var(--gold-deep); }
+
+/* Disabled controls had hover and focus styling but no disabled styling, so a disabled select
+   looked identical to an active one. */
+.tb-select:disabled, .field-input:disabled, .draft-area:disabled {
+  opacity: 0.5; cursor: not-allowed; background: var(--line-soft);
+}
 
 .app { display: flex; height: 100%; }
 
@@ -154,20 +180,30 @@ body {
 
 /* ---- Main ---- */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* min-height, not height: a fixed height clipped its own contents once the search field and
+   title could no longer sit side by side. flex-shrink:0 keeps the bar from being squeezed by
+   the scrolling content below it. */
 .main-head {
-  display: flex; align-items: center; justify-content: space-between;
-  height: 56px; padding: 0 24px;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  min-height: 56px; flex-shrink: 0; padding: 0 24px;
   background: var(--card-glass);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   backdrop-filter: blur(20px) saturate(180%);
   border-bottom: 1px solid var(--line);
 }
+/* min-width:0 is what actually permits the ellipsis: a flex item defaults to min-width:auto,
+   which refuses to shrink below its text and pushes the search field off the bar instead. */
 .view-title {
   font: inherit; font-size: 19px; font-weight: 700; letter-spacing: -0.02em;
   color: var(--text); margin: 0;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.head-right { display: flex; align-items: center; gap: 8px; min-width: 0; flex-shrink: 1; }
+/* flex-basis 300px instead of a hard width, so the field gives ground as the window narrows
+   rather than overflowing the header. */
 #searchBox {
-  font: inherit; padding: 8px 14px; width: 300px; color: var(--text);
+  font: inherit; padding: 8px 14px; color: var(--text);
+  flex: 0 1 300px; min-width: 0; max-width: 100%;
   border: 1px solid transparent; border-radius: var(--radius-full);
   background: var(--line-soft);
   transition: background var(--duration-fast) var(--ease), border-color var(--duration-fast) var(--ease), box-shadow var(--duration-fast) var(--ease);
@@ -179,15 +215,22 @@ body {
 }
 
 /* ---- Toolbar ---- */
+/* flex-wrap is the fix for the filters running off the right edge: without it the five filter
+   groups overflowed the bar (measured 473px past the viewport at 900px wide), which both made
+   Sort unreachable and gave the whole page a horizontal scrollbar. */
 .toolbar {
-  display: flex; align-items: center; gap: 16px; padding: 10px 24px;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; padding: 10px 24px;
+  flex-shrink: 0;
   background: var(--card-glass);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   backdrop-filter: blur(20px) saturate(180%);
   border-bottom: 1px solid var(--line-soft);
 }
-.toolbar-group { display: flex; align-items: center; gap: 8px; }
-.toolbar-spacer { flex: 1; }
+.toolbar-group { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* Only claims space while everything still fits on one row; once the bar wraps, a growing
+   spacer would strand Sort on a line of its own. */
+.toolbar-spacer { flex: 1 1 0; min-width: 0; }
+.tb-select { min-width: 0; max-width: 100%; }
 .tb-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-faint); }
 .tb-select {
   font: inherit; font-size: 13px; padding: 6px 10px;
@@ -218,6 +261,9 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
 .prospects tbody td, .audit-table tbody td, .users-table tbody td { padding: 11px 16px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
 .prospects tbody tr { cursor: pointer; transition: background var(--duration-fast) var(--ease); }
 .prospects tbody tr:hover { background: var(--line-soft); }
+/* Rows are keyboard-activatable (Enter/Space); outline-offset is negative so the ring sits
+   inside the row rather than overlapping the rows above and below. */
+.prospects tbody tr:focus-visible { background: var(--line-soft); outline: 2px solid var(--gold-deep); outline-offset: -2px; }
 .prospects tbody tr.selected { background: var(--gold-soft); }
 .col-check { width: 30px; }
 .col-score { width: 48px; }
@@ -229,24 +275,27 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
   font-family: var(--mono); font-weight: 600; font-size: 12.5px;
 }
 .score-1,.score-2,.score-3 { background: var(--gold); color: #05371f; }
-.score-4,.score-5 { background: var(--gold-soft); color: var(--gold-deep); }
+.score-4,.score-5 { background: var(--gold-soft); color: var(--on-gold-soft); }
 .score-6,.score-7 { background: var(--line); color: var(--text-soft); }
-.score-8,.score-9,.score-10 { background: var(--line-soft); color: var(--text-faint); }
-.score-none { background: var(--line-soft); color: var(--text-faint); }
+.score-8,.score-9,.score-10 { background: var(--line-soft); color: var(--on-line-soft); }
+.score-none { background: var(--line-soft); color: var(--on-line-soft); }
 
 .company-cell { font-weight: 600; letter-spacing: -0.01em; }
-.company-sub { font-size: 12px; color: var(--text-faint); margin-top: 2px; font-weight: 400; }
+.company-sub { font-size: 12px; color: var(--text-faint); margin-top: 2px; font-weight: 400; overflow-wrap: anywhere; }
 
+/* nowrap: a squeezed Status column broke "Awaiting reply" / "Not contacted" across two lines
+   inside the pill, which read as a rendering fault rather than a label. */
 .status-pill {
   display: inline-block; font-size: 10.5px; padding: 3px 9px; border-radius: var(--radius-full);
   text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600;
+  white-space: nowrap;
   background: var(--line); color: var(--text-soft);
 }
-.status-new { background: var(--gold-soft); color: var(--gold-deep); }
+.status-new { background: var(--gold-soft); color: var(--on-gold-soft); }
 .status-sent { background: var(--blue-bg); color: var(--blue); }
 .status-replied { background: var(--green-bg); color: var(--green); }
-.status-signed { background: var(--green); color: #fff; }
-.status-dead { background: var(--line-soft); color: var(--text-faint); }
+.status-signed { background: var(--green); color: var(--on-green); }
+.status-dead { background: var(--line-soft); color: var(--on-line-soft); }
 .status-dormant { background: var(--violet-bg); color: var(--violet); }
 
 .flags { display: inline-flex; gap: 5px; }
@@ -285,7 +334,9 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
 .section-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-faint); margin-bottom: 8px; }
 .field { margin-bottom: 7px; }
 .field-key { color: var(--text-faint); font-size: 12px; }
-.field-val { color: var(--text); }
+/* overflow-wrap: a long contact email or award URL in the 470px detail pane had no break
+   opportunity and pushed its own column sideways. */
+.field-val { color: var(--text); overflow-wrap: anywhere; }
 .field-val a { color: var(--blue); }
 .prose { color: var(--text-soft); font-size: 13.5px; line-height: 1.6; }
 .issue { margin-bottom: 12px; padding-left: 12px; border-left: 2px solid var(--gold); }
@@ -307,7 +358,9 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
               box-shadow var(--duration-base) var(--ease),
               transform var(--duration-base) var(--ease);
 }
-.btn:hover { background: var(--gold-deep); color: #fff; transform: translateY(-1px); box-shadow: 0 6px 16px rgba(168, 144, 95, 0.35); }
+/* Keeps the resting dark-green text: #fff on --gold-deep measured 3.08:1, so the primary
+   button became HARDER to read on hover than at rest (6.45:1). */
+.btn:hover { background: #b9a06c; color: #05371f; transform: translateY(-1px); box-shadow: 0 6px 16px rgba(168, 144, 95, 0.35); }
 .btn:active { transform: translateY(0); box-shadow: none; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; box-shadow: none; }
 .btn-ghost { background: transparent; color: var(--text-soft); border-color: var(--line); font-weight: 500; }
@@ -354,7 +407,7 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
 .opt-detail { color: var(--text-soft); font-size: 12.5px; margin-top: 2px; }
 .opt-tags { display: inline-flex; gap: 6px; margin-left: 8px; }
 .tag { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; padding: 2px 7px; border-radius: var(--radius-full); font-weight: 600; }
-.tag-suggested { background: var(--gold-soft); color: var(--gold-deep); }
+.tag-suggested { background: var(--gold-soft); color: var(--on-gold-soft); }
 .tag-proven { background: var(--green-bg); color: var(--green); }
 .toggle-row { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 .draft-area {
@@ -384,7 +437,7 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
 .key-set { color: var(--green); }
 .key-unset { color: var(--red); }
 .badge-active { background: var(--green-bg); color: var(--green); }
-.badge-inactive { background: var(--line-soft); color: var(--text-faint); }
+.badge-inactive { background: var(--line-soft); color: var(--on-line-soft); }
 
 /* ---- Login gate ---- */
 .login-gate {
@@ -442,4 +495,78 @@ table.prospects, table.audit-table, table.users-table { width: 100%; border-coll
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ---- Responsive layout ----
+   The app was authored at one width: there were no width breakpoints at all, so resizing the
+   window (or using a laptop screen with the detail pane open) pushed the toolbar filters and
+   the Sort control off the right edge and gave the whole page a horizontal scrollbar.
+
+   The rules below are ordered widest-to-narrowest. They only relax fixed widths — no layout is
+   rearranged, so the app looks identical at full size. */
+
+/* Nothing should ever scroll the page sideways; the table and the detail pane own their own
+   scrolling. This is the backstop that turns a future overflow into a contained one. */
+body { overflow-x: hidden; }
+
+/* Two panes side by side stop fitting here: give the detail pane a share of the width instead
+   of a fixed 470px, so the list keeps a usable column. */
+@media (max-width: 1180px) {
+  .detail-pane { width: min(470px, 44vw); }
+}
+
+/* Reclaim horizontal space from the chrome before touching the content: a narrower sidebar and
+   tighter gutters buy back ~60px. */
+@media (max-width: 1024px) {
+  .sidebar { width: 200px; }
+  .main-head, .toolbar { padding-left: 16px; padding-right: 16px; }
+  .bulk-bar { padding-left: 16px; padding-right: 16px; }
+  .prospects thead th, .prospects tbody td { padding-left: 12px; padding-right: 12px; }
+  #searchBox { flex-basis: 220px; }
+}
+
+/* Below this the list and a side-by-side detail pane cannot coexist: the list was compressed to
+   an unreadable sliver. Float the detail pane over the list as a right-hand sheet instead —
+   it already has its own close button and its own scroll. */
+@media (max-width: 900px) {
+  .detail-pane {
+    position: absolute; top: 0; right: 0; bottom: 0; z-index: 20;
+    width: min(470px, 100%); box-shadow: var(--shadow-lg, 0 8px 40px rgba(0,0,0,0.28));
+  }
+  .content { position: relative; }
+  /* The reply/full-screen variant already spans the pane, so keep it edge to edge. */
+  .detail-pane.detail-fullscreen { width: 100%; }
+  /* The uppercase filter captions are the least load-bearing thing in the bar; the selects
+     still read clearly on their own and this keeps the filters on one line. */
+  .toolbar .tb-label { display: none; }
+  .toolbar { gap: 8px 10px; }
+  .toolbar-spacer { display: none; }
+  /* Drop Flags (column 6) only. Both the th AND the td must be hidden together or the header
+     row shifts out of step with the body rows — Follow-up stays, since "due now" is what the
+     list is actually worked from. */
+  .prospects thead th:nth-child(6), .prospects tbody td:nth-child(6) { display: none; }
+  .fu-cell { white-space: nowrap; }
+}
+
+/* Phone / very narrow window: stack the shell so the sidebar becomes a top strip. */
+@media (max-width: 720px) {
+  .app { flex-direction: column; height: auto; min-height: 100%; }
+  .sidebar {
+    width: 100%; flex-direction: row; flex-wrap: wrap; align-items: center;
+    gap: 4px 8px; padding: 8px 12px;
+  }
+  .sidebar-brand { padding: 4px 8px 4px 0; border-bottom: none; }
+  .logo { width: 132px; }
+  .brand-tag, .sidebar-heading, .sidebar-foot { display: none; }
+  .sidebar-section { padding: 0; display: flex; flex-wrap: wrap; gap: 4px; }
+  .view-item { width: auto; padding: 6px 10px; font-size: 12.5px; }
+  .main { min-height: 0; }
+  .detail-pane { width: 100%; }
+  .main-head { flex-wrap: wrap; padding: 10px 12px; }
+  .head-right { width: 100%; }
+  #searchBox { flex: 1 1 100%; }
+  .toolbar { padding: 8px 12px; }
+  /* Location too (column 4) — company, fit, status and follow-up are what the list is scanned
+     for. Header and body cell hidden together, as above. */
+  .prospects thead th:nth-child(4), .prospects tbody td:nth-child(4) { display: none; }
 }

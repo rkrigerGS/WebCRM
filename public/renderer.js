@@ -141,8 +141,8 @@ function renderList(){
       fu = due ? `<span class="fu-overdue">due now</span>` : `in ${dueInDays}d`;
     }
 
-    return `<tr data-id="${p.id}" class="${p.id===selectedId?'selected':''}">
-      <td class="col-check"><input type="checkbox" class="rowcheck" data-id="${p.id}" ${selectedIds.has(p.id)?'checked':''}></td>
+    return `<tr data-id="${p.id}" class="${p.id===selectedId?'selected':''}" tabindex="0" role="button" aria-label="Open ${esc(p.company_name||'prospect')}">
+      <td class="col-check"><input type="checkbox" class="rowcheck" data-id="${p.id}" aria-label="Select ${esc(p.company_name||'prospect')}" ${selectedIds.has(p.id)?'checked':''}></td>
       <td class="col-score"><span class="score-chit ${scoreClass(p.fit_score)}">${p.fit_score??'—'}</span></td>
       <td><div class="company-cell">${esc(p.company_name)}</div>${p.industry?`<div class="company-sub">${esc(shorten(p.industry,42))}</div>`:''}</td>
       <td>${esc(p.city_state)}</td>
@@ -153,11 +153,16 @@ function renderList(){
   }).join('');
 
   rowsEl.querySelectorAll('tr').forEach(tr=>{
-    tr.addEventListener('click',(e)=>{
-      if(e.target.classList.contains('rowcheck'))return;
+    const open=()=>{
       const id=parseInt(tr.dataset.id,10);
       const p=allProspects.find(x=>x.id===id);
       if(p&&p.awaiting_reply_review)openReplyReview(id); else activateRow(id);
+    };
+    tr.addEventListener('click',(e)=>{ if(e.target.classList.contains('rowcheck'))return; open(); });
+    // Opening a prospect is the app's primary action and was reachable only by mouse.
+    tr.addEventListener('keydown',(e)=>{
+      if(e.target.classList.contains('rowcheck'))return; // let Space toggle the checkbox
+      if(e.key==='Enter'||e.key===' '){ e.preventDefault(); open(); }
     });
   });
   rowsEl.querySelectorAll('.rowcheck').forEach(cb=>{
@@ -322,7 +327,7 @@ async function openDetail(id){
       ${p.added_by?`<div class="field"><span class="field-key">Added by ${esc(p.added_by)}${p.added_at?` on ${esc(new Date(p.added_at).toLocaleDateString())}`:''}</span></div>`:''}
       <div class="field"><span class="status-pill status-${p.status}">${esc(statusLabel(p.status))}</span>
         ${p.date_sent?` <span class="field-key">sent ${esc(p.date_sent)}</span>`:''}
-        ${p.followup_count?` <span class="field-key">· ${p.followup_count} follow-up(s)</span>`:''}</div>
+        ${p.followup_count?` <span class="field-key">· ${esc(String(p.followup_count))} follow-up(s)</span>`:''}</div>
       <div class="detail-actions" style="margin-top:10px;">
         <button class="btn btn-sm" id="generateBtn">Generate email</button>
         <button class="btn btn-sm ${hasApproved?'':'btn-ghost'}" id="followupBtn" ${hasApproved?'':'disabled title="Needs a sent email first"'}>Draft follow-up</button>
@@ -341,7 +346,7 @@ async function openDetail(id){
           <option value="dead">Dead</option>
         </select>
         <label style="font-size:12px;color:var(--text-soft);display:flex;align-items:center;gap:5px;">
-          Follow-up gap <input type="number" id="fuDays" value="${p.followup_days||4}" min="1" max="30" style="width:52px;font:inherit;padding:3px 5px;border:1px solid var(--line);border-radius:5px;">d
+          Follow-up gap <input type="number" id="fuDays" value="${esc(String(p.followup_days||4))}" min="1" max="30" style="width:52px;font:inherit;padding:3px 5px;border:1px solid var(--line);border-radius:var(--radius-sm);">d
         </label>
       </div>
     </div>
@@ -419,7 +424,9 @@ async function openDetail(id){
     if(!confirm(`Delete ${d.company_name||p.company_name||'this prospect'}? This removes it entirely.`))return;
     try{ await window.api.deleteProspect(id); }
     catch(err){ toast('Not deleted: '+err.message,6000); return; }
-    detailPane.hidden=true; selectedId=null; loadProspects();
+    // setFullScreen(false) matters here: deleting while full-screen hid the pane but left the
+    // list hidden too, leaving an empty window with no way back except a reload.
+    setFullScreen(false); detailPane.hidden=true; selectedId=null; loadProspects();
   });
 
   detailPane.hidden=false;
@@ -564,6 +571,10 @@ function triggerBackupDownload(){
 }
 function openDeadPileReview(list){
   emailModalTitle.textContent='Dead prospect review';
+  // Settings must close first. Both modals are fixed, inset:0, z-index:50, and the Settings
+  // backdrop comes later in the DOM — so leaving it open painted it on top of this review and
+  // swallowed every click, making the manual backup unreachable whenever a prospect was dead.
+  settingsModal.hidden=true;
   emailModal.hidden=false;
   emailModal.querySelector('.modal').classList.add('modal-wide');
   const decided=new Set();
@@ -1437,6 +1448,9 @@ document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',a
     if(action==='delete'){
       if(!confirm(`Delete ${ids.length} prospect(s)?`))return;
       const failed=await runAll(id=>window.api.deleteProspect(id));
+      // If the open prospect was one of the deleted, close the pane — otherwise it kept
+      // showing a record that no longer exists, and acting on it 404'd.
+      if(selectedId!=null&&ids.includes(selectedId)){ setFullScreen(false); detailPane.hidden=true; selectedId=null; }
       selectedIds.clear(); updateBulkBar(); loadProspects();
       if(failed.length)toast(`${failed.length} of ${ids.length} could not be deleted: ${describe(failed)}`,7000);
       return;
@@ -1478,7 +1492,7 @@ window.api.onIngestFailed((r)=>{ toast(`Research file "${r.file}" was not import
 // pointer-events:none matters as much as the fade: a faded-out toast is still a box
 // sitting over the bottom of the screen, and without it, clicks in that strip landed on an
 // invisible toast instead of the page underneath.
-function toast(msg,ms=2200){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--on-dark);padding:10px 18px;border-radius:var(--radius-full);font-size:13px;font-weight:500;z-index:100;box-shadow:var(--shadow-lg);opacity:0;pointer-events:none;transition:opacity var(--duration-base) var(--ease);';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},ms);}
+function toast(msg,ms=2200){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.setAttribute('role','status');t.setAttribute('aria-live','polite');t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--on-dark);padding:10px 18px;border-radius:var(--radius-full);font-size:13px;font-weight:500;z-index:100;box-shadow:var(--shadow-lg);opacity:0;pointer-events:none;transition:opacity var(--duration-base) var(--ease);';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},ms);}
 
 // A bottom-right toast with an Undo button, for status/view changes: shows what happened
 // and gives a few seconds to catch a mistake and reverse it before it's gone.

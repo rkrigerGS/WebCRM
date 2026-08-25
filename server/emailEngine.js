@@ -288,6 +288,10 @@ function callClaude({ system, user, model }) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, (res) => {
       let body = '';
+      // Without an explicit encoding each Buffer chunk is stringified on its own, so a
+      // multi-byte character split across two TLS reads arrives as U+FFFD — and the mojibake
+      // is then saved into first_draft and the voice library. Same fix as gmail.js.
+      res.setEncoding('utf8');
       res.on('data', (d) => body += d);
       res.on('end', () => {
         try {
@@ -304,6 +308,10 @@ function callClaude({ system, user, model }) {
         }
       });
     });
+    // Node sets no socket idle timeout by default, so a half-open connection (an idle NAT or
+    // load-balancer drop) left this promise pending forever: the SA's draft spinner never
+    // stopped and the request never answered. 120s comfortably covers a long generation.
+    req.setTimeout(120000, () => req.destroy(new Error('The drafting request to Claude timed out. Try again.')));
     req.on('error', (e) => reject(e));
     req.write(payload);
     req.end();

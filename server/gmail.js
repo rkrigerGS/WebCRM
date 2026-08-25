@@ -545,9 +545,21 @@ async function getThreadReplies(threadId) {
 // The Gmail `q` grammar: from:(a@x OR b@y) restricts to the prospect's addresses, and
 // after:<epochSec> bounds it to mail received since the outreach went out — without that
 // bound a poll would surface months-old prior correspondence as if it were a fresh reply.
+// Addresses reach here from externally-authored dossier JSON, and they are interpolated into
+// Gmail's `q` search grammar below. Anything that is not strictly an address is refused: a
+// value like "a@b.com) OR (subject:settlement" would otherwise close the from:( group and
+// turn the poll into an attacker-chosen search over the firm's whole mailbox, whose matched
+// message body is then readable through the reply-context route. Parens, quotes, colons,
+// commas, semicolons, backslashes and whitespace are all excluded by this pattern.
+const ADDRESS_RE = /^[^\s@"'()<>,;:\\]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
+
 async function searchRepliesFrom(emails, afterEpochSec) {
   const addrs = (emails || []).map(e => String(e || '').trim().toLowerCase()).filter(Boolean);
   if (!addrs.length) return null;
+  // Fail the whole search rather than silently dropping the bad entry: a prospect whose
+  // dossier carries a malformed address should surface as "no replies found", never as a
+  // partially-attacker-controlled query.
+  if (!addrs.every(a => ADDRESS_RE.test(a))) return null;
   const q = `from:(${addrs.join(' OR ')}) after:${Math.floor(afterEpochSec)}`;
   const list = await callGmail(accessToken => ({
     hostname: 'gmail.googleapis.com',

@@ -60,6 +60,11 @@ function redactUsers(rawText) {
     if (!u || typeof u !== 'object') continue;
     if ('inviteToken' in u) u.inviteToken = '';
     if ('testLoginSlug' in u) delete u.testLoginSlug;
+    // Password-reset tokens are live credentials for their whole validity window: a backup
+    // taken minutes after someone clicks "forgot password" would otherwise carry a working
+    // reset link for that account out to the emailed zip.
+    if ('resetToken' in u) u.resetToken = '';
+    if ('resetExpiresAt' in u) u.resetExpiresAt = '';
   }
   return JSON.stringify(parsed, null, 2);
 }

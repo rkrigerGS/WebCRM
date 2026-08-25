@@ -567,7 +567,11 @@ setInterval(() => {
 function safeWatchFolder(configured) {
   if (!configured || typeof configured !== 'string') return null;
   const resolved = path.resolve(DATA_DIR, configured);
-  if (resolved !== DATA_DIR && !resolved.startsWith(DATA_DIR + path.sep)) return null;
+  // Must be a strict SUBdirectory. Allowing DATA_DIR itself pointed the recursive ingester at
+  // the data root, where it would read config.json (API key, Google client secret),
+  // gmail-token.json (refresh token) and users.json (password hashes, live invite/reset
+  // tokens) in as prospect dossiers — which GET /api/prospects then serves to every user.
+  if (resolved === DATA_DIR || !resolved.startsWith(DATA_DIR + path.sep)) return null;
   return resolved;
 }
 function watchedDir() {
@@ -695,9 +699,16 @@ function blockIfExcluded(req, res, id) {
 // which also requires the return date that makes a dormant prospect ever come back.
 const PATCHABLE_STATUSES = new Set(['new', 'sent', 'replied', 'signed', 'dead']);
 
+// Narrowed to the two fields the UI actually sends (renderer.js sends status and
+// followup_days only). The wider db-level allowlist stays available to internal callers, but
+// a request cannot reach final_sent/date_sent/followup_count and forge a prospect's history.
+const PATCHABLE_FIELDS = ['status', 'followup_days'];
+
 app.patch('/api/prospects/:id', mutating('prospect.update', (q, res) => {
   const id = +q.params.id;
-  const body = q.body || {};
+  const raw = q.body || {};
+  const body = {};
+  for (const k of PATCHABLE_FIELDS) if (k in raw) body[k] = raw[k];
   if ('status' in body && !PATCHABLE_STATUSES.has(body.status)) {
     const e = new Error(`Invalid status "${String(body.status)}"`); e.status = 400; throw e;
   }
