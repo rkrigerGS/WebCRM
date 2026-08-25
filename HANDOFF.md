@@ -30,6 +30,32 @@ from, reply from that address, wait one 3-minute poll cycle, confirm it appears 
 
 ---
 
+## Editable outreach history + learning (2026-08-24, committed)
+
+Closes a real gap: the "Log outreach sent elsewhere" path (`logExternal`) set `final_sent`
+but **never fed the voice library** — only app-sent emails learned (`server.js` send path).
+And the outreach-history timeline was read-only, so an outreach logged without the real
+message could not be corrected later.
+
+Now: each outreach-history entry is **clickable** → opens an "Outreach details" modal with
+the full message editable. Saving records the message; for **email** it also updates
+`final_sent` and (default-on checkbox, opt-out) saves the message to Marcos's voice library
+so drafting learns from it. Re-editing overwrites the same exemplar (no duplicates that skew
+the voice). Phone/LinkedIn entries are editable but never learned.
+
+- Activity outreach entries now carry `{id, channel, message, exemplar_file}`; legacy entries
+  (text-only) are targeted by `idx:N` and get a real id on first edit.
+- New route `PATCH /api/prospects/:id/outreach/:entryId` (`{text, saveToLibrary}`).
+- `catalogs.saveApprovedEmail(record, existingFile?)` overwrites a named exemplar when given
+  one (path.basename-guarded), else creates a new stamped file.
+- Verified: 6 db-logic assertions + 4 catalogs assertions in isolation, and 11 end-to-end
+  HTTP assertions through the live route (ingest → log → edit → learn → overwrite dedup →
+  opt-out → empty/unknown → 400s). Server boots clean.
+- Files: `server/db.js`, `server/catalogs.js`, `server/server.js`, `public/renderer.js`,
+  `public/api.js`.
+
+---
+
 ## NEXT UP — Clio Manage integration (design/interview phase, no code yet)
 
 **Goal (Rafael):** push a won client — all their info plus a *signed* retainer agreement —

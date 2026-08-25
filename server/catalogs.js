@@ -94,10 +94,20 @@ function listApprovedEmails() {
   }).filter(Boolean);
 }
 
-function saveApprovedEmail(record) {
+function saveApprovedEmail(record, existingFile) {
   // record: { company_name, recipient, services, final_text, first_draft, saved_at }
-  const safe = (record.company_name || 'unknown').replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
-  const fname = `${uniqueStamp()}_${safe}.json`;
+  // existingFile (optional): overwrite this exemplar instead of creating a new one — used when
+  // correcting a logged outreach's message so re-edits don't accumulate duplicate exemplars.
+  // path.basename guards against traversal even though the value is app-supplied.
+  let fname = null;
+  if (existingFile) {
+    const base = path.basename(String(existingFile));
+    if (base.endsWith('.json')) fname = base;
+  }
+  if (!fname) {
+    const safe = (record.company_name || 'unknown').replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
+    fname = `${uniqueStamp()}_${safe}.json`;
+  }
   store.writeJSON(path.join(dirs.approvedDir, fname), record);
   return fname;
 }

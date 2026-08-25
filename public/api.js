@@ -50,6 +50,7 @@ window.api = {
 
   addNote:        (id, text)  => sendJSON('/api/prospects/' + id + '/note', 'POST', { text }),
   logExternal:    (id, data)  => sendJSON('/api/prospects/' + id + '/external', 'POST', data),
+  editOutreach:   (id, entryId, data) => sendJSON('/api/prospects/' + id + '/outreach/' + encodeURIComponent(entryId), 'PATCH', data),
   editContact:    (id, patch) => sendJSON('/api/prospects/' + id + '/contact', 'POST', patch),
   uploadDossiers: (dossiers)  => sendJSON('/api/prospects/upload', 'POST', { dossiers }),
 

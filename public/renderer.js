@@ -229,25 +229,32 @@ function litLine(l,t){ if(!t)return''; const cls=/NEEDS CHECKING/i.test(t)?'need
 // Corrupt persisted activity JSON must render as an empty log, not throw and blank the pane.
 function parseActivity(raw){ try{ const a=JSON.parse(raw||'[]'); return Array.isArray(a)?a:[]; }catch{ return []; } }
 
-// Extract outreach events from activity: entries starting with "Outreach via".
-// Returns array of {date, channel, snippet} sorted newest first.
+// Extract outreach events from activity. Newer entries carry {id, channel, message}
+// directly; legacy entries only have the "Outreach via X: …" display text, so fall back to
+// parsing that and target them by array index ("idx:N") until an edit assigns a real id.
+// Returns {date, channel, snippet, message, entryId} sorted newest first.
 function extractOutreachHistory(activity){
   const outreach=[];
   const actArray=Array.isArray(activity)?activity:parseActivity(activity);
-  for(const a of actArray){
-    if(!a.text||!a.text.startsWith('Outreach via '))continue;
-    // [\s\S] not . — pasted emails are multi-line, and . would stop at the first newline,
-    // dropping every real email (the whole point of this panel) from the history.
-    const match=a.text.match(/^Outreach via (\w+): ([\s\S]*)$/);
-    if(!match)continue;
-    const channel=match[1];
-    const fullText=match[2];
+  actArray.forEach((a,idx)=>{
+    if(!a)return;
+    let channel=a.channel, message=a.message;
+    if(!channel||message==null){
+      // Legacy shape: recover channel + message from the display text. [\s\S] not . — pasted
+      // emails are multi-line, and . would stop at the first newline, dropping real emails.
+      if(!a.text||!a.text.startsWith('Outreach via '))return;
+      const match=a.text.match(/^Outreach via (\w+): ([\s\S]*)$/);
+      if(!match)return;
+      channel=channel||match[1];
+      if(message==null)message=match[2];
+    }
+    const entryId=a.id?a.id:('idx:'+idx);
     // Collapse the newlines/tabs of a pasted email into single spaces so the timeline row
     // stays one clean line, then trim to a preview length.
-    const oneLine=fullText.replace(/\s+/g,' ').trim();
+    const oneLine=String(message).replace(/\s+/g,' ').trim();
     const snippet=oneLine.slice(0,100)+(oneLine.length>100?'…':'');
-    outreach.push({date:a.date,channel,snippet,fullText});
-  }
+    outreach.push({date:a.date,channel,snippet,message:String(message),entryId});
+  });
   return outreach.reverse();
 }
 
@@ -330,7 +337,7 @@ async function openDetail(id){
 
     ${p.final_sent?`<div class="section"><div class="section-label">Sent email</div><div class="prose" style="white-space:pre-wrap;">${esc(shorten(p.final_sent,600))}</div></div>`:''}
 
-    ${outreachHistory.length?`<div class="section"><div class="section-label">Outreach history</div>${outreachHistory.map(o=>`<div class="field" style="font-size:12px;"><span class="field-key">${esc(o.date)}</span> <span style="color:var(--text-soft);margin:0 6px;">·</span> <span style="text-transform:capitalize;">${esc(o.channel)}</span> <span style="color:var(--text-soft);margin:0 6px;">·</span> <span class="field-val">${esc(o.snippet)}</span></div>`).join('')}</div>`:''}
+    ${outreachHistory.length?`<div class="section"><div class="section-label">Outreach history</div>${outreachHistory.map(o=>`<div class="field outreach-entry" data-entry-id="${esc(o.entryId)}" title="Click to view or add the full message" style="font-size:12px;cursor:pointer;"><span class="field-key">${esc(o.date)}</span> <span style="color:var(--text-soft);margin:0 6px;">·</span> <span style="text-transform:capitalize;">${esc(o.channel)}</span> <span style="color:var(--text-soft);margin:0 6px;">·</span> <span class="field-val">${esc(o.snippet)}</span></div>`).join('')}</div>`:''}
 
     ${activity.length?`<div class="section"><div class="section-label">Activity</div>${activity.slice().reverse().map(a=>`<div class="field"><span class="field-key">${esc(a.date)}:</span> <span class="field-val">${esc(a.text)}</span></div>`).join('')}</div>`:''}
 
@@ -364,6 +371,12 @@ async function openDetail(id){
   const fb=document.getElementById('followupBtn'); if(hasApproved) fb.addEventListener('click',()=>openEmailFlow(id,d,true));
   document.getElementById('logExternalBtn').addEventListener('click',()=>openLogExternal(id));
   document.getElementById('noteBtn').addEventListener('click',()=>openNote(id));
+  document.getElementById('detailBody').querySelectorAll('.outreach-entry').forEach(el=>{
+    el.addEventListener('click',()=>{
+      const o=outreachHistory.find(x=>String(x.entryId)===String(el.dataset.entryId));
+      if(o)openOutreachEdit(id,o);
+    });
+  });
   document.getElementById('editContactBtn').addEventListener('click',()=>openEditContact(id,c));
   document.getElementById('statusSelect').addEventListener('change',async(e)=>{
     const newStatus=e.target.value;
@@ -435,6 +448,33 @@ function openLogExternal(id){
     try{ await window.api.logExternal(id,{channel,text,loggedAt}); }
     catch(err){ btn.disabled=false; toast('Outreach not logged: '+err.message,6000); return; }
     emailModal.hidden=true; loadProspects(); openDetail(id);
+  });
+}
+
+// Open a logged outreach to view or fill in the full message that was actually sent. For
+// email, saving can feed Marcos's voice library so the drafting prompt learns from a real
+// email that originally went out from Gmail rather than through the app.
+function openOutreachEdit(id,o){
+  const isEmail=o.channel==='email';
+  emailModalTitle.textContent='Outreach details';
+  emailModal.hidden=false;
+  emailModalBody.innerHTML=`
+    <div class="q-hint">${esc(o.date)} · <span style="text-transform:capitalize;">${esc(o.channel)}</span>. Add or correct the message that was actually sent${isEmail?", so it's recorded and Marcos's voice library can learn from it":''}.</div>
+    <div class="settings-field"><label>Message</label>
+      <textarea id="oeText" class="draft-area" style="min-height:220px;" placeholder="Paste the full message that was sent.">${esc(o.message)}</textarea></div>
+    ${isEmail?`<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:2px 0 12px;"><input type="checkbox" id="oeLearn" checked> Save to Marcos's voice library (learn from this email)</label>`:''}
+    <div class="modal-actions"><button class="btn" id="oeSave">Save message</button></div>`;
+  document.getElementById('oeSave').addEventListener('click',async(e)=>{
+    const btn=e.currentTarget;
+    if(btn.disabled)return;
+    const text=document.getElementById('oeText').value.trim();
+    if(!text){toast('Message cannot be empty',4000);return;}
+    const saveToLibrary=isEmail&&document.getElementById('oeLearn').checked;
+    btn.disabled=true;
+    try{ await window.api.editOutreach(id,o.entryId,{text,saveToLibrary}); }
+    catch(err){ btn.disabled=false; toast('Not saved: '+err.message,6000); return; }
+    emailModal.hidden=true; loadProspects(); openDetail(id);
+    toast(saveToLibrary?'Message saved and added to the voice library':'Message saved',4000);
   });
 }
 

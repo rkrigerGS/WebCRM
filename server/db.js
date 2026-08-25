@@ -332,7 +332,12 @@ function logExternal(id, { channel, text, loggedAt }) {
   // would push the follow-up clock out past the real send.
   const today = store_.todayNY();
   const date = (loggedAt && /^\d{4}-\d{2}-\d{2}$/.test(loggedAt) && loggedAt <= today) ? loggedAt : today;
-  appendActivity(p, { date, text: `Outreach via ${channel}: ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}` });
+  // id + channel + message are stored on the entry (not just the truncated display `text`)
+  // so the outreach can be reopened and its full message edited later — see editOutreachEntry.
+  appendActivity(p, {
+    id: crypto.randomBytes(8).toString('hex'), date, channel, message: text,
+    text: `Outreach via ${channel}: ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}`
+  });
   p.status = 'sent';
   p.channel = channel;
   p.date_sent = date;
@@ -346,6 +351,57 @@ function logExternal(id, { channel, text, loggedAt }) {
   p.updated_at = new Date().toISOString();
   save();
   return { ok: true, channel };
+}
+
+// Add or correct the full message on a previously-logged outreach entry. `entryId` is either
+// the entry's stored id, or "idx:N" (its index in the activity array) for legacy entries that
+// predate ids — those get a real id assigned here so later edits are stable. Returns the
+// entry's channel/message/exemplar_file so the caller (server.js) can handle voice-library
+// learning, which lives with the catalog layer, not here.
+function editOutreachEntry(id, entryId, { text }) {
+  const p = store.prospects.find(x => x.id === id);
+  if (!p) return { ok: false };
+  const log = safeParse(p.activity, []);
+  if (!Array.isArray(log)) return { ok: false };
+  let entry = null;
+  if (String(entryId).startsWith('idx:')) {
+    entry = log[parseInt(String(entryId).slice(4), 10)] || null;
+  } else {
+    entry = log.find(e => e && e.id === entryId) || null;
+  }
+  if (!entry) return { ok: false, notFound: true };
+  const clean = String(text || '').trim();
+  if (!clean) return { ok: false, empty: true };
+  // Channel: prefer the stored field, else recover it from the legacy "Outreach via X:" text.
+  const m = String(entry.text || '').match(/^Outreach via (\w+):/);
+  const channel = entry.channel || (m && m[1]) || 'email';
+  if (!entry.id) entry.id = crypto.randomBytes(8).toString('hex');
+  entry.channel = channel;
+  entry.message = clean;
+  entry.text = `Outreach via ${channel}: ${clean.slice(0, 200)}${clean.length > 200 ? '…' : ''}`;
+  // For email, final_sent mirrors the latest sent body — it's what the "Sent email" panel
+  // shows and what a follow-up draft builds on, so a corrected message should replace it.
+  if (channel === 'email') p.final_sent = clean;
+  p.activity = JSON.stringify(log);
+  p.updated_at = new Date().toISOString();
+  save();
+  return { ok: true, entry: { id: entry.id, channel, message: clean, exemplar_file: entry.exemplar_file || '' } };
+}
+
+// Records which voice-library file an outreach entry produced, so re-editing that entry
+// overwrites the same exemplar instead of piling up duplicates that would skew the voice.
+function recordEntryExemplar(id, entryId, filename) {
+  const p = store.prospects.find(x => x.id === id);
+  if (!p) return { ok: false };
+  const log = safeParse(p.activity, []);
+  if (!Array.isArray(log)) return { ok: false };
+  const entry = log.find(e => e && e.id === entryId);
+  if (!entry) return { ok: false };
+  entry.exemplar_file = filename || '';
+  p.activity = JSON.stringify(log);
+  p.updated_at = new Date().toISOString();
+  save();
+  return { ok: true };
 }
 
 function editContact(id, patch) {
@@ -402,7 +458,7 @@ function safeParse(s, fallback) {
 
 module.exports = {
   init, ingestDossier, listProspects, getProspect, deleteProspect,
-  updateProspect, addNote, logExternal, editContact, checkExclusion, stats,
+  updateProspect, addNote, logExternal, editOutreachEntry, recordEntryExemplar, editContact, checkExclusion, stats,
   recordReply, setDormant, returnFromDormant, listDormantDue,
   listExclusions, removeExclusion
 };

@@ -732,6 +732,35 @@ app.post('/api/prospects/:id/external', mutating('prospect.outreach.log', (q, re
   return result;
 }));
 
+// Add or correct the full message on a previously-logged outreach entry, and — for email,
+// when opted in — save that message to Marcos's voice library so the drafting prompt learns
+// from a real sent email that was originally sent outside the app.
+app.patch('/api/prospects/:id/outreach/:entryId', mutating('prospect.outreach.edit', (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'Prospect not found' }); res.locals.skipAudit = true; return; }
+  const text = (q.body && q.body.text) || '';
+  const saveToLibrary = !!(q.body && q.body.saveToLibrary);
+  const result = db.editOutreachEntry(id, q.params.entryId, { text });
+  if (!result.ok) {
+    res.status(400).json({ error: result.empty ? 'Message cannot be empty' : 'Outreach entry not found' });
+    res.locals.skipAudit = true;
+    return;
+  }
+  let learned = '';
+  if (saveToLibrary && result.entry.channel === 'email') {
+    const fname = catalogs.saveApprovedEmail({
+      company_name: p.company_name, recipient: (p.dossier && p.dossier.contact_general && p.dossier.contact_general.email) || '',
+      services: [], first_draft: '', final_text: result.entry.message,
+      is_followup: false, saved_at: new Date().toISOString()
+    }, result.entry.exemplar_file || null);
+    db.recordEntryExemplar(id, result.entry.id, fname);
+    learned = ' — saved to voice library';
+  }
+  res.locals.audit = { prospectId: id, detail: `Edited ${result.entry.channel} outreach message${learned}` };
+  return { ok: true, entryId: result.entry.id };
+}));
+
 app.post('/api/prospects/:id/contact', mutating('prospect.contact.edit', (q, res) => {
   const id = +q.params.id;
   const result = db.editContact(id, q.body);
