@@ -1356,6 +1356,9 @@ document.querySelectorAll('.view-item[data-view]').forEach(b=>b.addEventListener
   document.querySelectorAll('.view-item[data-view]').forEach(x=>x.classList.remove('active'));
   b.classList.add('active'); currentView=b.dataset.view;
   if(viewTitleEl)viewTitleEl.textContent=b.querySelector('.view-label').textContent;
+  // A full-screen prospect hides the list entirely, so switching views behind it would do
+  // nothing visible. Close it and return to the list showing the view that was clicked.
+  if(detailFullScreen){ setFullScreen(false); detailPane.hidden=true; selectedId=null; }
   renderList();
 }));
 
