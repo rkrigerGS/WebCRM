@@ -229,33 +229,45 @@ function litLine(l,t){ if(!t)return''; const cls=/NEEDS CHECKING/i.test(t)?'need
 // Corrupt persisted activity JSON must render as an empty log, not throw and blank the pane.
 function parseActivity(raw){ try{ const a=JSON.parse(raw||'[]'); return Array.isArray(a)?a:[]; }catch{ return []; } }
 
-// Extract outreach events from activity. Newer entries carry {id, channel, message}
-// directly; legacy entries only have the "Outreach via X: …" display text, so fall back to
-// parsing that and target them by array index ("idx:N") until an edit assigns a real id.
-// Returns {date, channel, snippet, message, entryId} sorted newest first.
-function extractOutreachHistory(activity){
-  const outreach=[];
-  const actArray=Array.isArray(activity)?activity:parseActivity(activity);
-  actArray.forEach((a,idx)=>{
+// Build the unified per-prospect activity log from the stored activity array. Every entry
+// becomes a typed, clickable row: outreach (editable — its message can be added/corrected and
+// learned from), status (a standalone status change), or note (manual notes and the auto
+// notes a send writes). Outreach entries carry {id, channel, message} on newer records; legacy
+// ones only have the "Outreach via X: …" text, so recover from that and target by array index
+// ("idx:N") until an edit assigns a real id. Newest first.
+function buildLogEntries(activity){
+  const arr=Array.isArray(activity)?activity:parseActivity(activity);
+  const cap=s=>String(s||'').charAt(0).toUpperCase()+String(s||'').slice(1);
+  const oneLine=s=>String(s||'').replace(/\s+/g,' ').trim();
+  const entries=[];
+  arr.forEach((a,idx)=>{
     if(!a)return;
-    let channel=a.channel, message=a.message;
-    if(!channel||message==null){
-      // Legacy shape: recover channel + message from the display text. [\s\S] not . — pasted
-      // emails are multi-line, and . would stop at the first newline, dropping real emails.
-      if(!a.text||!a.text.startsWith('Outreach via '))return;
-      const match=a.text.match(/^Outreach via (\w+): ([\s\S]*)$/);
-      if(!match)return;
-      channel=channel||match[1];
-      if(message==null)message=match[2];
-    }
     const entryId=a.id?a.id:('idx:'+idx);
-    // Collapse the newlines/tabs of a pasted email into single spaces so the timeline row
-    // stays one clean line, then trim to a preview length.
-    const oneLine=String(message).replace(/\s+/g,' ').trim();
-    const snippet=oneLine.slice(0,100)+(oneLine.length>100?'…':'');
-    outreach.push({date:a.date,channel,snippet,message:String(message),entryId});
+    let channel=a.channel, message=a.message;
+    if((!channel||message==null) && a.text && a.text.startsWith('Outreach via ')){
+      // Legacy shape: recover channel + message. [\s\S] not . — pasted emails are multi-line,
+      // and . would stop at the first newline, dropping the body.
+      const m=a.text.match(/^Outreach via (\w+): ([\s\S]*)$/);
+      if(m){ channel=channel||m[1]; if(message==null)message=m[2]; }
+    }
+    if(channel && message!=null){
+      const line=oneLine(message);
+      entries.push({date:a.date,type:'outreach',channel,message:String(message),entryId,
+        preview:cap(channel)+' · '+line.slice(0,80)+(line.length>80?'…':'')});
+      return;
+    }
+    if(a.kind==='status'){
+      const lbl=statusLabel(a.status||'');
+      entries.push({date:a.date,type:'status',entryId,
+        text:a.text||('Status changed to '+(lbl||a.status||'')),
+        preview:'Status → '+(lbl||a.status||'')});
+      return;
+    }
+    const t=oneLine(a.text);
+    entries.push({date:a.date,type:'note',entryId,text:String(a.text||''),
+      preview:t.slice(0,90)+(t.length>90?'…':'')});
   });
-  return outreach.reverse();
+  return entries.reverse();
 }
 
 // Two rows clicked in quick succession race their fetches: without the sequence check, the
@@ -302,8 +314,7 @@ async function openDetail(id){
   const contract=d.current_contract||{};
   const lit=d.prior_litigation||{};
   const issues=Array.isArray(d.issue_spotting)?d.issue_spotting:[];
-  const activity=parseActivity(p.activity);
-  const outreachHistory=extractOutreachHistory(p.activity);
+  const logEntries=buildLogEntries(p.activity);
 
   document.getElementById('detailBody').innerHTML=`
     <div class="section">
@@ -337,9 +348,7 @@ async function openDetail(id){
 
     ${p.final_sent?`<div class="section"><div class="section-label">Sent email</div><div class="prose" style="white-space:pre-wrap;">${esc(shorten(p.final_sent,600))}</div></div>`:''}
 
-    ${outreachHistory.length?`<div class="section"><div class="section-label">Outreach history</div>${outreachHistory.map(o=>`<div class="field outreach-entry" data-entry-id="${esc(o.entryId)}" title="Click to view or add the full message" style="font-size:12px;cursor:pointer;"><span class="field-key">${esc(o.date)}</span> <span style="color:var(--text-soft);margin:0 6px;">·</span> <span style="text-transform:capitalize;">${esc(o.channel)}</span> <span style="color:var(--text-soft);margin:0 6px;">·</span> <span class="field-val">${esc(o.snippet)}</span></div>`).join('')}</div>`:''}
-
-    ${activity.length?`<div class="section"><div class="section-label">Activity</div>${activity.slice().reverse().map(a=>`<div class="field"><span class="field-key">${esc(a.date)}:</span> <span class="field-val">${esc(a.text)}</span></div>`).join('')}</div>`:''}
+    <div class="section"><div class="section-label">Activity log</div>${logEntries.length?logEntries.map(e=>`<div class="field log-entry" data-entry-id="${esc(e.entryId)}" data-type="${e.type}" title="${e.type==='outreach'?'Click to view or edit the message':'Click to view'}" style="font-size:12px;cursor:pointer;display:flex;gap:8px;align-items:baseline;"><span class="field-key" style="white-space:nowrap;">${esc(e.date||'')}</span><span class="field-val">${esc(e.preview)}</span></div>`).join(''):`<div class="field" style="color:var(--text-faint);font-size:12px;">Nothing logged yet.</div>`}</div>
 
     <div class="section">
       <div class="section-label">Identification</div>
@@ -371,10 +380,11 @@ async function openDetail(id){
   const fb=document.getElementById('followupBtn'); if(hasApproved) fb.addEventListener('click',()=>openEmailFlow(id,d,true));
   document.getElementById('logExternalBtn').addEventListener('click',()=>openLogExternal(id));
   document.getElementById('noteBtn').addEventListener('click',()=>openNote(id));
-  document.getElementById('detailBody').querySelectorAll('.outreach-entry').forEach(el=>{
+  document.getElementById('detailBody').querySelectorAll('.log-entry').forEach(el=>{
     el.addEventListener('click',()=>{
-      const o=outreachHistory.find(x=>String(x.entryId)===String(el.dataset.entryId));
-      if(o)openOutreachEdit(id,o);
+      const e=logEntries.find(x=>String(x.entryId)===String(el.dataset.entryId));
+      if(!e)return;
+      if(e.type==='outreach')openOutreachEdit(id,e); else openLogEntryView(e);
     });
   });
   document.getElementById('editContactBtn').addEventListener('click',()=>openEditContact(id,c));
@@ -436,7 +446,7 @@ function openLogExternal(id){
     <div class="settings-field"><label>Message or note</label>
       <textarea id="extText" class="draft-area" style="min-height:180px;" placeholder="Paste the message sent, or note what was discussed on the call."></textarea></div>
     <div class="modal-actions"><button class="btn" id="extSave">Save outreach</button>
-      <span class="usage-note">Marks the prospect as contacted and sets the follow-up date.</span></div>`;
+      <span class="usage-note">Logs the outreach, sets the status to ${esc(statusLabel('sent'))}, and starts the follow-up clock.</span></div>`;
   document.getElementById('extSave').addEventListener('click',async(e)=>{
     const btn=e.currentTarget;
     if(btn.disabled)return;
@@ -476,6 +486,21 @@ function openOutreachEdit(id,o){
     emailModal.hidden=true; loadProspects(); openDetail(id);
     toast(saveToLibrary?'Message saved and added to the voice library':'Message saved',4000);
   });
+}
+
+// Read-only view for a non-outreach log entry (a note, a send record, or a standalone status
+// change). Outreach entries go to openOutreachEdit instead, since those are editable.
+function openLogEntryView(e){
+  emailModalTitle.textContent=e.type==='status'?'Status change':'Log entry';
+  emailModal.hidden=false;
+  // Status entries show the friendly label ("Status → Awaiting reply") to match the log row,
+  // rather than the raw stored status text; notes/sends show their full text verbatim.
+  const body=e.type==='status'?(e.preview||e.text||''):(e.text||e.preview||'');
+  emailModalBody.innerHTML=`
+    <div class="q-hint">${esc(e.date||'')}</div>
+    <div class="prose" style="white-space:pre-wrap;">${esc(body)}</div>
+    <div class="modal-actions"><button class="btn" id="leClose">Close</button></div>`;
+  document.getElementById('leClose').addEventListener('click',()=>{emailModal.hidden=true;});
 }
 
 function openNote(id){

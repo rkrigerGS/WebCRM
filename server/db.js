@@ -218,10 +218,25 @@ function updateProspect(id, fields, opts = {}) {
   // pre_dead_status is deliberately NOT writable from here: it is bookkeeping this
   // function maintains itself (above), and letting a request body set it would let a
   // client rewrite where the dead-pile review restores a prospect to.
+  // A standalone status change (from the detail dropdown or bulk actions) is logged as its
+  // own activity entry so the prospect's log reflects it. Status changes that are part of a
+  // larger logged action — a send, or logExternal — pass internal:true (send) or don't route
+  // through here at all (logExternal), so the outreach entry represents the change and there
+  // is no duplicate "Status →" line. Captured before the field copy overwrites p.status.
+  const logStatusChange = ('status' in fields && fields.status !== p.status && !internal);
+  const newStatus = fields.status;
+
   const allowed = ['status', 'channel', 'first_draft', 'final_sent', 'date_sent',
     'followup_count', 'followup_days', 'next_action_date', 'newsletter', 'activity'];
   if (internal) allowed.push('gmail_thread_id', 'gmail_message_ids');
   for (const k of allowed) if (k in fields) p[k] = fields[k];
+
+  if (logStatusChange) {
+    appendActivity(p, {
+      id: crypto.randomBytes(8).toString('hex'), date: store_.todayNY(),
+      kind: 'status', status: newStatus, text: `Status changed to ${newStatus}`
+    });
+  }
 
   // Read-modify-write operations, applied here against the live record rather than from a
   // snapshot the caller read earlier. The email send path reads the prospect, awaits the

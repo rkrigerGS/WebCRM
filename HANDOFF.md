@@ -56,6 +56,32 @@ the voice). Phone/LinkedIn entries are editable but never learned.
 
 ---
 
+## Unified per-prospect Activity log (2026-08-24, committed)
+
+Follow-on to the above. Replaces the separate "Outreach history" + "Activity" sections with
+a single **Activity log** that is **always shown** in the detail view (side-panel and
+full-screen), with a "Nothing logged yet" empty state. Every row is clickable: outreach
+entries open the editable modal (add/correct message, learn); notes, sends, and status
+changes open a read-only view.
+
+- **Standalone status changes are now logged.** `db.updateProspect` appends a `kind:'status'`
+  activity entry when the status changes and the call is NOT `internal`. This closes the gap
+  where flipping a prospect's status from the dropdown left no trace (the exact reason a
+  "sent" prospect could show an empty log). Status changes that are part of a send
+  (`internal:true`) or a logged outreach (`logExternal`, which doesn't route through
+  updateProspect) are deliberately NOT double-logged — the send note / outreach entry
+  represents them, and the log-outreach popup states the status it will set.
+- `buildLogEntries()` in renderer.js types each entry (outreach / status / note), recovers
+  legacy entries, and formats previews; status rows and their read-only view both show the
+  friendly label ("Status → Awaiting reply").
+- Verified: 4 status-logging assertions + 6 buildLogEntries assertions in isolation, plus a
+  live browser DOM test (log renders with all three entry types; outreach→editor with full
+  multi-line body + learn checkbox; status→read-only "Status → Awaiting reply"; full-screen
+  shows the log).
+- Files: `server/db.js`, `public/renderer.js`.
+
+---
+
 ## NEXT UP — Clio Manage integration (design/interview phase, no code yet)
 
 **Goal (Rafael):** push a won client — all their info plus a *signed* retainer agreement —
