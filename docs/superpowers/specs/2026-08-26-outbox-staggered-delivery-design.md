@@ -28,13 +28,19 @@ SA can override the computed time, send immediately anyway, or cancel a queued s
 | What triggers queuing | Automatic. Anything finalized outside the send window queues by default. The UI always shows the computed send time before the SA commits, so nothing is ever delayed invisibly. |
 | Send window | 09:00–18:00 America/New_York. |
 | Outside-window handling | Queued to the next window start. Weekends roll to Monday 09:00. |
-| Stagger | Randomized 12–25 minute gaps. Not evenly spaced: a fixed cadence is itself detectable. |
-| Daily cap | 20 sends per day; overflow spills to the next morning. |
+| Stagger | Randomized 8–18 minute gaps. Not evenly spaced: a fixed cadence is itself detectable. |
+| Daily cap | 40 sends per day; overflow spills to the next morning. |
 | Scope | Everything queues: cold outreach, follow-ups, and replies. |
 | Manual override | The SA can set a specific send time, send now regardless of hour, or cancel. |
 
 Window bounds, gap range, and cap are constants in one place, adjustable without
 touching logic.
+
+**The gap range and the cap are coupled**, and changing one without the other breaks the
+feature quietly. The window is 540 minutes, so a cap of N sends needs an average gap of
+at most `540 / (N - 1)` minutes or the later entries spill to the next morning instead of
+going out. At 40/day that ceiling is ~13.8 minutes, which the 8-18 range (averaging 13)
+clears with room for variance. Raising the cap again means lowering the gaps again.
 
 ## Deployment context
 
@@ -94,7 +100,7 @@ At queue time an entry is stamped with a concrete `sendAfterISO`, so the UI can 
 exact minute:
 
 ```
-sendAfter = max(nextWindowStart(now), lastQueuedSendAfter + random(12..25 min))
+sendAfter = max(nextWindowStart(now), lastQueuedSendAfter + random(8..18 min))
 ```
 
 clamped into the window; past the window end or the daily cap it rolls to the next
@@ -162,8 +168,8 @@ Matching the repo's existing convention (isolated logic assertions plus live end
 HTTP assertions through the real routes):
 
 - **Scheduling logic, isolated:** after-6pm queues to 9am next day; before-9am queues to
-  9am same day; Saturday and Sunday roll to Monday; gaps land in 12–25 min; the 20/day
-  cap spills; DST boundary crossing lands on the right wall-clock hour; an explicit past
+  9am same day; Saturday and Sunday roll to Monday; gaps land in 8–18 min; the 40/day
+  cap spills; a full 40-entry day fits inside the window rather than spilling; DST boundary crossing lands on the right wall-clock hour; an explicit past
   time is rejected.
 - **Worker, isolated:** overdue entries re-space rather than burst; a `sending` entry
   with no message id is reclaimed on boot; one with a message id is not.
