@@ -87,6 +87,7 @@ window.api = {
   calendarAvailability: ()    => getJSON('/api/calendar/availability'),
   emailGenerate:  (id, ans)   => sendJSON('/api/prospects/' + id + '/generate', 'POST', ans),
   emailSaveFinal: (id, t, m)  => sendJSON('/api/prospects/' + id + '/saveFinal', 'POST', { finalText: t, meta: m }),
+  suggestSubjects: (id, b)    => sendJSON('/api/prospects/' + id + '/subjects', 'POST', b),
 
   getConfig:      ()          => getJSON('/api/config'),
   setApiKey:      (key)       => sendJSON('/api/config/key', 'POST', { key }),

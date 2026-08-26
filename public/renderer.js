@@ -897,7 +897,15 @@ async function renderDraft(draft,usage){
     <textarea class="draft-area" id="draftArea">${esc(draft)}</textarea>
     <div class="modal-actions"><button class="btn" id="copyBtn">Copy to clipboard</button><button class="btn btn-ghost" id="regenBtn">Regenerate</button><div class="spacer"></div><span class="usage-note">${tokens}</span></div>
     <div class="settings-field"><label>To</label><input class="field-input" id="sendTo" value="${esc(defaultTo)}" placeholder="recipient@example.com"></div>
-    <div class="settings-field"><label>Subject</label><input class="field-input" id="sendSubject" value="${esc(defaultSubject)}"></div>
+    <div class="settings-field"><label>Subject</label>
+      <div style="display:flex;gap:6px;align-items:center;">
+        <input class="field-input" id="sendSubject" value="${esc(defaultSubject)}" style="flex:1;">
+        <button class="btn btn-ghost" id="suggestSubjBtn" type="button">Suggest</button>
+      </div>
+      <div class="hint">Five options written to read as a real person's email, not a blast. Pick one, then edit it however you like.</div>
+      <div id="subjErr" class="error-note" hidden></div>
+      <div id="subjOptions"></div>
+    </div>
     <div class="settings-field"><label>CC (optional)</label>${ccOptions}</div>
     ${bookingSection}
     <label style="display:flex;align-items:center;gap:8px;font-size:13px;margin-bottom:14px;"><input type="checkbox" id="saveToLibraryCheck" checked> Save this email to the learning library</label>
@@ -906,6 +914,39 @@ async function renderDraft(draft,usage){
     <div class="modal-actions"><button class="btn" id="saveFinalBtn" ${gmailStatus.connected?'':'disabled'}>${flowState.isFollowup?'Send follow-up':'Send email'}</button><span class="usage-note">Sends via Gmail, marks sent, and adds to the learning library.</span></div>`;
   document.getElementById('copyBtn').addEventListener('click',()=>{navigator.clipboard.writeText(document.getElementById('draftArea').value);const b=document.getElementById('copyBtn');b.textContent='Copied';setTimeout(()=>{if(b)b.textContent='Copy to clipboard';},1500);});
   document.getElementById('regenBtn').addEventListener('click',()=>{ if(flowState.isFollowup)runGeneration(); else openEmailFlow(flowState.prospectId,flowState.dossier,false); });
+  // Which generated option the SA clicked, if any. Sent with the email so the server can
+  // tell a suggestion taken as-is from one the SA rewrote — the rewrite is the correction
+  // worth learning from. Cleared to '' when they type a subject with no option picked.
+  let pickedSubject='';
+  const subjOptions=document.getElementById('subjOptions');
+  document.getElementById('suggestSubjBtn').addEventListener('click',async()=>{
+    const btn=document.getElementById('suggestSubjBtn');
+    const errEl=document.getElementById('subjErr');
+    errEl.hidden=true;
+    const emailText=document.getElementById('draftArea').value.trim();
+    if(!emailText){ errEl.textContent='Write or generate the email first, then ask for subject lines.'; errEl.hidden=false; return; }
+    const label=btn.textContent;
+    btn.disabled=true; btn.textContent='Thinking…';
+    try{
+      const r=await window.api.suggestSubjects(flowState.prospectId,{emailText,services:flowState.services||[]});
+      if(!r.ok){ errEl.textContent=r.error+(r.ref?' (ref '+r.ref+')':''); errEl.hidden=false; return; }
+      if(!r.subjects.length){
+        // Every option was dropped by the deliverability filter. Saying so plainly beats
+        // showing an empty box, and re-asking usually produces usable lines.
+        errEl.textContent='None of the suggestions passed the spam-safety checks. Try again, or write your own.';
+        errEl.hidden=false; return;
+      }
+      subjOptions.innerHTML=r.subjects.map(t=>`<div class="opt subjOpt" data-subject="${esc(t)}"><div class="opt-title">${esc(t)}</div></div>`).join('');
+      subjOptions.querySelectorAll('.subjOpt').forEach(el=>el.addEventListener('click',()=>{
+        subjOptions.querySelectorAll('.subjOpt').forEach(o=>o.classList.remove('selected'));
+        el.classList.add('selected');
+        pickedSubject=el.dataset.subject;
+        document.getElementById('sendSubject').value=pickedSubject;
+      }));
+    }catch(e){ errEl.textContent=e.message; errEl.hidden=false; }
+    finally{ btn.disabled=false; btn.textContent=label; }
+  });
+
   document.getElementById('saveFinalBtn').addEventListener('click',async()=>{
     const finalText=document.getElementById('draftArea').value;
     const to=document.getElementById('sendTo').value.trim();
@@ -921,7 +962,7 @@ async function renderDraft(draft,usage){
       const saveToLibrary=document.getElementById('saveToLibraryCheck').checked;
       const bookingSlots=offeredSlots.map(s=>({startISO:s.startISO,endISO:s.endISO,label:s.label}));
       const meetingParticipants=[...emailModalBody.querySelectorAll('.meetPartCheck:checked')].map(el=>el.value);
-      await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc,saveToLibrary,bookingSlots,meetingParticipants});
+      await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc,saveToLibrary,bookingSlots,meetingParticipants,suggestedSubject:pickedSubject});
       emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId);
     }catch(e){
       btn.disabled=false; btn.textContent=originalLabel;

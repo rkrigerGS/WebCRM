@@ -881,6 +881,39 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
   }
 }));
 
+// Five subject-line options for an already-drafted email. Deliberately a separate call
+// from /generate rather than an extra field on the draft: the body is reviewed and edited
+// first, and the subject is proposed against the text the SA actually settled on, so a
+// suggestion can reference what the email really says. Also means regenerating subjects
+// costs one small call, not a whole redraft.
+app.post('/api/prospects/:id/subjects', mutating('prospect.subjects.generate', async (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  const a = q.body || {};
+  // The body is what the SA has in the textarea, which may be edited well past first_draft.
+  // Capped so an oversized paste can't blow up the prompt; a real email is ~250 words.
+  const emailText = String(a.emailText || p.final_sent || p.first_draft || '').slice(0, 8000).trim();
+  if (!emailText) {
+    res.status(400).json({ error: 'There is no drafted email to write a subject line for yet.' });
+    res.locals.skipAudit = true;
+    return;
+  }
+  try {
+    const { subjects, usage } = await emailEngine.generateSubjects({
+      dossier: p.dossier, emailText,
+      chosenServices: Array.isArray(a.services) ? a.services.filter(x => typeof x === 'string').slice(0, 5) : []
+    });
+    res.locals.audit = { prospectId: id, detail: `Generated ${subjects.length} subject line(s) — tokens in ${(usage && usage.input_tokens) || 0} / out ${(usage && usage.output_tokens) || 0}` };
+    return { ok: true, subjects, usage };
+  } catch (e) {
+    // Same shape as /generate: caught here, so reported here or it produces no ref code.
+    const ref = reportIssue('subjects.generate', e, `prospect ${id}`);
+    res.locals.audit = { prospectId: id, detail: `Subject generation FAILED — ${String(e && e.message || e)} (ref ${ref})` };
+    return res.json({ ok: false, error: String(e && e.message || e), ref });
+  }
+}));
+
 // A corrupt gmail_message_ids field (hand-edited data, a bad restore) must degrade to
 // "no prior ids" — an unthreaded send — not crash the send route with a parse error.
 function priorMessageIds(p) {
@@ -1015,6 +1048,16 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
       final_text: finalText, is_followup: isFollowup, saved_at: new Date().toISOString()
     });
   }
+  // The subject that actually went out is learned on every send, independently of the
+  // body opt-out above: the SA opting not to save a body ("this one was unusual") says
+  // nothing about the subject, and the subject library is what future suggestions are
+  // ranked against. `suggestedSubject` is the generated option the SA picked, when they
+  // picked one, so the library can tell an accepted suggestion from a rewritten one.
+  catalogs.saveSubjectLine({
+    company_name: p.company_name, subject,
+    services: (meta && meta.services) || [],
+    suggested: (meta && typeof meta.suggestedSubject === 'string') ? meta.suggestedSubject : ''
+  });
   res.locals.audit = {
     prospectId: id,
     detail: `Sent via Gmail to ${to}${cc.length ? ` (cc: ${cc.join(', ')})` : ''}${isFollowup ? (hasThread ? ' — follow-up, threaded' : ' — follow-up, new thread (no prior Gmail thread on file)') : ''}${bookingSlots.length ? ` — ${bookingSlots.length} booking slot(s) offered` : ''}${saveToLibrary ? '' : ' — not saved to library'}`
