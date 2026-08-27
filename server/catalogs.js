@@ -10,7 +10,6 @@ const crypto = require('crypto');
 const store = require('./store');
 
 let dirs = null;
-let appDirPath = null;
 
 // The catalogs ship with the app (read-only template) but are copied into user-data on
 // first run so the user's edits and the app's learned additions persist and export.
@@ -31,7 +30,6 @@ function init(userDataDir, appDir) {
 
   const approvedDir = path.join(userDataDir, 'approved-emails');
   fs.mkdirSync(approvedDir, { recursive: true });
-  appDirPath = appDir; // remembered so listApprovedEmails() can lazily seed on first read
 
   // The reply library is completely separate from the outreach library — reply exemplars
   // never mix with cold-outreach exemplars, and Claude draws from each independently (see
@@ -162,31 +160,11 @@ function uniqueStamp() {
 // The approved-email library: each approved final email is saved as a small JSON file.
 // These are the style reference the drafting prompt learns the voice from.
 function listApprovedEmails() {
-  let files = fs.readdirSync(dirs.approvedDir).filter(f => f.endsWith('.json'));
-  if (files.length === 0) {
-    seedApprovedEmailsIfEmpty();
-    files = fs.readdirSync(dirs.approvedDir).filter(f => f.endsWith('.json'));
-  }
+  const files = fs.readdirSync(dirs.approvedDir).filter(f => f.endsWith('.json'));
   return files.map(f => {
     try { return JSON.parse(fs.readFileSync(path.join(dirs.approvedDir, f), 'utf8')); }
     catch { return null; }
   }).filter(Boolean);
-}
-
-// Seeds the approved-email library from the shipped starter set the first time it's read
-// and still empty — never on top of a library that already has real sends in it (this run,
-// or a previous one). Lazy rather than done in init(): a save that lands before the first
-// read must not retroactively gain 11 seed exemplars it never asked for. Each seed carries
-// seed: true and an identical saved_at older than any real send, so plain oldest-out
-// eviction in pruneApprovedEmails() retires them first, with no special-case needed.
-function seedApprovedEmailsIfEmpty() {
-  if (!appDirPath) return;
-  const seedDir = path.join(appDirPath, 'seed-approved-emails');
-  if (!fs.existsSync(seedDir)) return;
-  if (fs.readdirSync(dirs.approvedDir).length > 0) return; // already populated since the caller checked
-  for (const f of fs.readdirSync(seedDir)) {
-    if (f.endsWith('.json')) fs.copyFileSync(path.join(seedDir, f), path.join(dirs.approvedDir, f));
-  }
 }
 
 function saveApprovedEmail(record, existingFile) {

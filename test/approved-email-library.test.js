@@ -37,8 +37,7 @@ test('a record saved without a subject is still stored and still lists', () => {
 });
 
 test('the library is capped and the oldest record is evicted', () => {
-  const dir = freshDir();
-  const seedCount = catalogs.listApprovedEmails().length; // seeds copied in by init
+  freshDir();
   for (let i = 0; i < catalogs.MAX_APPROVED_EMAILS + 5; i++) {
     catalogs.saveApprovedEmail(rec({
       company_name: 'C' + i,
@@ -49,27 +48,39 @@ test('the library is capped and the oldest record is evicted', () => {
   const all = catalogs.listApprovedEmails();
   assert.strictEqual(all.length, catalogs.MAX_APPROVED_EMAILS,
     `library must be capped at ${catalogs.MAX_APPROVED_EMAILS}, got ${all.length}`);
-  assert.ok(seedCount >= 0);
   // The survivors are the newest ones: C0 is gone, the last one written is present.
   const names = all.map(r => r.company_name);
   assert.ok(!names.includes('C0'), 'the oldest record should have been evicted');
   assert.ok(names.includes('C' + (catalogs.MAX_APPROVED_EMAILS + 4)), 'the newest must survive');
 });
 
-test('seeds evict before real sends, because they are older', () => {
-  // Seeds carry saved_at 2026-06-01, older than any real send, so oldest-out eviction
-  // retires the training wheels first without needing a special case.
+test('older records evict before newer ones, so seeds retire on their own', () => {
   freshDir();
-  const before = catalogs.listApprovedEmails().filter(r => r.seed).length;
-  assert.ok(before > 0, 'fixture requires the seeded library');
-  for (let i = 0; i < catalogs.MAX_APPROVED_EMAILS; i++) {
-    catalogs.saveApprovedEmail(rec({
-      company_name: 'R' + i,
-      saved_at: new Date(Date.UTC(2026, 6, 1) + i * 3600000).toISOString()
-    }));
+  // Stand in for the shipped starter set: seed:true with a saved_at older than any real
+  // send. Production seeds this library from server.js at startup, not from catalogs.
+  for (let i = 0; i < 11; i++) {
+    catalogs.saveApprovedEmail(rec({ company_name: 'Seed' + i, seed: true,
+      saved_at: '2026-06-01T00:00:00.000Z' }));
   }
-  const after = catalogs.listApprovedEmails().filter(r => r.seed).length;
-  assert.strictEqual(after, 0, 'every seed should have been displaced by real sends');
+  assert.strictEqual(catalogs.listApprovedEmails().filter(r => r.seed).length, 11);
+  for (let i = 0; i < catalogs.MAX_APPROVED_EMAILS; i++) {
+    catalogs.saveApprovedEmail(rec({ company_name: 'R' + i,
+      saved_at: new Date(Date.UTC(2026, 6, 1) + i * 3600000).toISOString() }));
+  }
+  assert.strictEqual(catalogs.listApprovedEmails().filter(r => r.seed).length, 0,
+    'every seed should have been displaced by newer real sends');
+});
+
+test('listing the library never writes to it', () => {
+  const dir = freshDir();
+  const dirPath = path.join(dir, 'approved-emails');
+  assert.strictEqual(fs.readdirSync(dirPath).length, 0,
+    'a fresh catalogs dir starts empty — server.js seeds, catalogs does not');
+  catalogs.listApprovedEmails();
+  catalogs.listApprovedEmails();
+  assert.strictEqual(fs.readdirSync(dirPath).length, 0,
+    'a read must never create records: buildDraftPrompt calls this on every draft, and ' +
+    'with eviction in play a write-on-read would resurrect retired seeds');
 });
 
 test('eviction never drops the library below the cap', () => {
