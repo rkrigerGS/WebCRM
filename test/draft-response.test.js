@@ -50,6 +50,16 @@ test('empty input does not throw', () => {
   assert.deepStrictEqual(r.subjects, []);
 });
 
+test('a leading Subject: line in the body is stripped before returning', () => {
+  // Defence in depth (FIX 2b): if the model echoes a leading "Subject:" line into the
+  // body despite the exemplars and system prompt telling it not to, it must not survive
+  // into what the SA sees, sends, and potentially saves back into the voice library.
+  const leaked = `Subject: Your Fort Bliss award and timing\n\n${BODY}\n\n<<<SUBJECTS\nYour Fort Bliss award and timing\nSUBJECTS>>>`;
+  const r = parseDraftResponse(leaked);
+  assert.strictEqual(r.body, BODY);
+  assert.ok(r.body.startsWith('Dear Gary,'), 'the body must start at the greeting, not the leaked subject line');
+});
+
 test('at most five subjects survive even if the model returns more', () => {
   const r = parseDraftResponse(withSubjects([
     'Your Fort Bliss award and timing', 'A note on your Huntsville work',

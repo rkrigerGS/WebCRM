@@ -887,6 +887,15 @@ async function renderDraft(draft,usage){
   // be deselected per email; Marcos organizes the event so he is always on it.
   const offeredSlots=(flowState.selectedSlots||[]).map(iso=>(flowState.slots||[]).find(s=>s.startISO===iso)).filter(Boolean);
   const defaultPartIds=cfg.meetingParticipantIds||[];
+  // Honest hint: only point at the dropdown when it actually exists. subjSelectHtml
+  // renders nothing when the list is empty (model skipped the fence, or the filter
+  // dropped everything), so the initial hint must degrade the same way the Suggest
+  // button's error-note already does, instead of describing a control that isn't there.
+  const hasSubjOptions=!!(flowState.subjects&&flowState.subjects.length);
+  const subjHintClass=hasSubjOptions?'hint':'error-note';
+  const subjHintText=hasSubjOptions
+    ?`Five options arrive with the draft, written to read as a real person's email, not a blast — pick one below, then edit it however you like. Suggest asks for five new ones once you've edited the body.`
+    :`No usable subject suggestions came back with this draft. Write your own below, or press Suggest to ask for five more once you've edited the body.`;
   let bookingSection='';
   if(offeredSlots.length){
     const partOptions=ccable.length
@@ -909,7 +918,7 @@ async function renderDraft(draft,usage){
         <input class="field-input" id="sendSubject" value="${esc(defaultSubject)}" style="flex:1;">
         <button class="btn btn-ghost" id="suggestSubjBtn" type="button">Suggest</button>
       </div>
-      <div class="hint">Five options arrive with the draft, written to read as a real person's email, not a blast — pick one below, then edit it however you like. Suggest asks for five new ones once you've edited the body.</div>
+      <div class="${subjHintClass}">${subjHintText}</div>
       <div id="subjErr" class="error-note" hidden></div>
       <div id="subjOptions">${subjSelectHtml(flowState.subjects)}</div>
     </div>
@@ -972,7 +981,10 @@ async function renderDraft(draft,usage){
       const saveToLibrary=document.getElementById('saveToLibraryCheck').checked;
       const bookingSlots=offeredSlots.map(s=>({startISO:s.startISO,endISO:s.endISO,label:s.label}));
       const meetingParticipants=[...emailModalBody.querySelectorAll('.meetPartCheck:checked')].map(el=>el.value);
-      await window.api.emailSaveFinal(flowState.prospectId,finalText,{services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc,saveToLibrary,bookingSlots,meetingParticipants,suggestedSubject:pickedSubject});
+      const finalMeta={services:flowState.services,channel:'email',isFollowup:flowState.isFollowup,to,subject,cc,saveToLibrary,bookingSlots,meetingParticipants};
+      // Absent stays absent: an unpicked subject must omit the key rather than send ''.
+      if(pickedSubject)finalMeta.suggestedSubject=pickedSubject;
+      await window.api.emailSaveFinal(flowState.prospectId,finalText,finalMeta);
       emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId);
     }catch(e){
       btn.disabled=false; btn.textContent=originalLabel;

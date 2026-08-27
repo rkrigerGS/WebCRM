@@ -119,14 +119,21 @@ function buildDraftPrompt({ dossier, chosenIssue, chosenServices, personalNote, 
 
   // Use up to 6 approved emails as style exemplars, preferring ones sharing a chosen service.
   const ranked = rankExemplars(approved, chosenServices);
-  const exemplars = ranked.slice(0, 6)
+  const selectedExemplars = ranked.slice(0, 6);
+  const exemplars = selectedExemplars
     .map((e, i) => {
       const header = `EXAMPLE ${i + 1} (to ${e.recipient} at ${e.company_name}):`;
+      // The subject, when there is one, is set off with a blank line and labelled as
+      // reference-only so the model cannot read it as the first line of the body it is
+      // meant to imitate (see the "match this voice, structure, and length" instruction
+      // below) — a leaked "Subject:" line into the body would otherwise get saved back
+      // into this same library and self-reinforce as a stronger, wrong exemplar.
       return e.subject
-        ? `${header}\nSubject: ${e.subject}\n${e.final_text}`
+        ? `${header}\n[Subject actually sent with this email — shown for reference only, it is NOT part of the body that follows]: ${e.subject}\n\n${e.final_text}`
         : `${header}\n${e.final_text}`;
     })
     .join('\n\n---\n\n');
+  const someExemplarsLackSubject = selectedExemplars.some(e => !e.subject);
 
   const cfg = config.get();
 
@@ -142,6 +149,7 @@ NON-NEGOTIABLE STYLE RULES:
 - Frame legal help as keeping regulations from slowing operations down, protecting margin and schedule. Not crisis response.
 - Only state facts about the prospect that appear in the dossier provided. Never invent a contract, an award, a name, or a detail.
 - Only state facts about the firm/Marcos that are marked CONFIRMED in the firm facts, or that appear in the boilerplate. Do not assert LIKELY or UNVERIFIED facts as established.
+- Subject lines belong only in the <<<SUBJECTS block described below, never inside the email body. Do not open the body with, or otherwise write, a "Subject:" line.
 
 FIRM AND PEOPLE FACTS (including verbatim boilerplate to reuse):
 ${firm}
@@ -151,8 +159,7 @@ ${servicesCatalog}
 
 APPROVED EXAMPLES (match this voice, structure, and length; do not copy their specific facts):
 ${exemplars}
-
-Some examples above show no subject line: those are older records saved before subjects were tracked alongside the body. That absence is an artefact of when they were saved, not a signal that a plain or missing subject is the goal.`;
+${someExemplarsLackSubject ? '\nSome examples above show no subject line: those are older records saved before subjects were tracked alongside the body. That absence is an artefact of when they were saved, not a signal that a plain or missing subject is the goal.' : ''}`;
 
   const issueText = chosenIssue && chosenIssue.title
     ? `Lead the email around this issue: "${chosenIssue.title}". Context: ${chosenIssue.explanation}`
@@ -196,7 +203,7 @@ Write the email body, starting with the greeting. Use the recipient's first name
 
 Then, after the body, write the fence \`<<<SUBJECTS\` on its own line, then exactly five subject line options (one per line, no numbering, no quotes, no commentary), then the fence \`SUBJECTS>>>\` on its own line to close it. Having just written the body, ground each subject in something specific and real from it or from the dossier: the prospect's contract, agency, location, or the work they do. Follow these rules for every option:
 - ${SUBJECT_MIN_WORDS} to ${SUBJECT_MAX_WORDS} words, and under ${SUBJECT_MAX_CHARS} characters.
-- Sentence case. Never all capitals, not even for one word (ordinary acronyms like SBA or GSA are fine).
+- Sentence case; never capitalize a word purely for emphasis or shouting. Agency and set-aside designations (SBA, SDVOSB, 8(a), etc.) and contract-vehicle names (IDIQ, GWAC, hyphenated vehicle names like G-CACS, etc.) keep their normal capitalization — that is this firm's working vocabulary, not shouting.
 - No exclamation points. No question marks unless the email genuinely asks that question.
 - No currency symbols, no percentages, no numbers implying savings or returns.
 - No emoji. No "Re:" or "Fwd:" — faking a reply to a conversation that never happened is the single fastest way to lose a recipient's trust and get reported.
@@ -355,7 +362,7 @@ These emails go to government contractors who did not ask to hear from Marcos. A
 
 NON-NEGOTIABLE RULES:
 - ${SUBJECT_MIN_WORDS} to ${SUBJECT_MAX_WORDS} words, and under ${SUBJECT_MAX_CHARS} characters.
-- Sentence case. Never all capitals, not even for one word (ordinary acronyms like SBA or GSA are fine).
+- Sentence case; never capitalize a word purely for emphasis or shouting. Agency and set-aside designations (SBA, SDVOSB, 8(a), etc.) and contract-vehicle names (IDIQ, GWAC, hyphenated vehicle names like G-CACS, etc.) keep their normal capitalization — that is this firm's working vocabulary, not shouting.
 - No exclamation points. No question marks unless the email genuinely asks that question.
 - No currency symbols, no percentages, no numbers implying savings or returns.
 - No emoji. No "Re:" or "Fwd:" — faking a reply to a conversation that never happened is the single fastest way to lose a recipient's trust and get reported.
@@ -407,6 +414,15 @@ function parseSubjectResponse(text) {
   return subjects;
 }
 
+// Defence in depth for the exemplar/system-prompt rule that subject lines never belong in
+// the body (FIX 2): if a non-compliant response echoes a leading "Subject: ..." line into
+// the body anyway, it must not reach the SA's textarea, get sent, or get saved back into
+// the approved-email library as a stronger (wrong) exemplar for the next draft. The prompt
+// should prevent it; this makes sure one bad response can't corrupt the library regardless.
+function stripLeadingSubjectLine(body) {
+  return body.replace(/^Subject:[^\n]*\n+/i, '').trim();
+}
+
 // Splits a merged draft response into { body, subjects }. The model returns the body,
 // then the <<<SUBJECTS ... SUBJECTS>>> fence, then one subject per line. No fence, or a
 // fence the model never closed, must still yield the body: a missing subject list is a
@@ -417,9 +433,9 @@ function parseDraftResponse(text) {
   const raw = String(text || '');
   const openIdx = raw.indexOf('<<<SUBJECTS');
   if (openIdx === -1) {
-    return { body: raw.trim(), subjects: [] };
+    return { body: stripLeadingSubjectLine(raw.trim()), subjects: [] };
   }
-  const body = raw.slice(0, openIdx).trim();
+  const body = stripLeadingSubjectLine(raw.slice(0, openIdx).trim());
   let subjectsBlock = raw.slice(openIdx + '<<<SUBJECTS'.length);
   const closeIdx = subjectsBlock.indexOf('SUBJECTS>>>');
   if (closeIdx !== -1) subjectsBlock = subjectsBlock.slice(0, closeIdx);

@@ -1048,7 +1048,8 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
       final_text: finalText, is_followup: isFollowup, saved_at: new Date().toISOString(),
       subject
     };
-    if (meta && typeof meta.suggestedSubject === 'string') approvedEmail.suggested_subject = meta.suggestedSubject;
+    // Absent stays absent: an unpicked subject must omit the key, not store ''.
+    if (meta && meta.suggestedSubject) approvedEmail.suggested_subject = meta.suggestedSubject;
     catalogs.saveApprovedEmail(approvedEmail);
   }
   res.locals.audit = {

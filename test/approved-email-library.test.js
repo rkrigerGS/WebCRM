@@ -29,11 +29,15 @@ test('a subject is stored on the record and survives a round trip', () => {
 test('a record saved without a subject is still stored and still lists', () => {
   // Pre-existing records and the 11 seeds have no subject. They remain valid body
   // exemplars; only the subject half of the prompt excludes them (Task B).
-  freshDir();
-  catalogs.saveApprovedEmail(rec());
+  const dir = freshDir();
+  const fname = catalogs.saveApprovedEmail(rec());
   const all = catalogs.listApprovedEmails();
   assert.strictEqual(all.length, 1);
   assert.ok(!all[0].subject);
+  // The hard contract is "absent stays absent", not "absent or empty string" — !x passes
+  // for both, so read the raw JSON off disk and assert the key is genuinely missing.
+  const raw = JSON.parse(fs.readFileSync(path.join(dir, 'approved-emails', fname), 'utf8'));
+  assert.ok(!('subject' in raw), 'subject key must be absent from the stored record, not just falsy');
 });
 
 test('the library is capped and the oldest record is evicted', () => {
@@ -83,12 +87,27 @@ test('listing the library never writes to it', () => {
     'with eviction in play a write-on-read would resurrect retired seeds');
 });
 
-test('eviction never drops the library below the cap', () => {
+test('reaching exactly the cap prunes nothing, crossing it by one evicts exactly one', () => {
+  // The old version of this test (length <= 100 for 5 records) was near-vacuous: it
+  // would pass even if pruning were wildly wrong. Pin the actual boundary behavior
+  // instead, at the cap and one past it, where an off-by-one would actually show up.
   freshDir();
-  for (let i = 0; i < 5; i++) catalogs.saveApprovedEmail(rec({ company_name: 'X' + i }));
+  for (let i = 0; i < catalogs.MAX_APPROVED_EMAILS; i++) {
+    catalogs.saveApprovedEmail(rec({
+      company_name: 'Z' + i,
+      saved_at: new Date(Date.UTC(2026, 0, 1) + i * 86400000).toISOString()
+    }));
+  }
+  assert.strictEqual(catalogs.listApprovedEmails().length, catalogs.MAX_APPROVED_EMAILS,
+    'exactly at the cap, nothing should be pruned yet');
+
+  catalogs.saveApprovedEmail(rec({ company_name: 'ZOverflow',
+    saved_at: new Date(Date.UTC(2026, 0, 1) + catalogs.MAX_APPROVED_EMAILS * 86400000).toISOString() }));
   const all = catalogs.listApprovedEmails();
-  assert.ok(all.length <= catalogs.MAX_APPROVED_EMAILS);
-  assert.ok(all.length >= 5, 'a small library must not be pruned');
+  assert.strictEqual(all.length, catalogs.MAX_APPROVED_EMAILS,
+    'crossing the cap by one must evict exactly one, not drop below the cap');
+  assert.ok(all.some(r => r.company_name === 'ZOverflow'), 'the newest record must survive');
+  assert.ok(!all.some(r => r.company_name === 'Z0'), 'the single oldest record must be the one evicted');
 });
 
 test('a record with no saved_at does not break eviction ordering', () => {
