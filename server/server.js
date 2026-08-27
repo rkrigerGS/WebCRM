@@ -19,6 +19,7 @@ const store_ = require('./store');
 const config = require('./config');
 const catalogs = require('./catalogs');
 const emailEngine = require('./emailEngine');
+const linkedinEngine = require('./linkedinEngine');
 const auth = require('./auth');
 const users = require('./users');
 const audit = require('./audit');
@@ -767,6 +768,14 @@ app.patch('/api/prospects/:id/outreach/:entryId', mutating('prospect.outreach.ed
     }, result.entry.exemplar_file || null);
     db.recordEntryExemplar(id, result.entry.id, fname);
     learned = ' — saved to voice library';
+  } else if (saveToLibrary && result.entry.channel === 'linkedin') {
+    const fname = catalogs.saveApprovedLinkedIn({
+      company_name: p.company_name, recipient_name: '', recipient_title: '', recipient_role: '',
+      services: [], first_draft: '', final_text: result.entry.message,
+      saved_at: new Date().toISOString()
+    }, result.entry.exemplar_file || null);
+    db.recordEntryExemplar(id, result.entry.id, fname);
+    learned = ' — saved to voice library';
   }
   res.locals.audit = { prospectId: id, detail: `Edited ${result.entry.channel} outreach message${learned}` };
   return { ok: true, entryId: result.entry.id };
@@ -820,6 +829,28 @@ app.get('/api/prospects/:id/questions', (q, res) => {
     const p = db.getProspect(+q.params.id);
     if (!p) return res.status(404).json({ error: 'not found' });
     ok(res, emailEngine.buildQuestions(p.dossier));
+  } catch (e) { fail(res, e); }
+});
+
+// The LinkedIn flow asks the same framing and service questions as email — the choice of
+// issue and service is a fact about the prospect, not about the channel — plus the
+// decision-maker picker, which is what makes the draft personal. `contacts` is optional in
+// the dossier and holds at most five, and absence is always "" rather than null, so every
+// check here is on truthiness.
+app.get('/api/prospects/:id/linkedin/questions', (q, res) => {
+  try {
+    const p = db.getProspect(+q.params.id);
+    if (!p) return res.status(404).json({ error: 'not found' });
+    const dossier = p.dossier || {};
+    const contacts = (Array.isArray(dossier.contacts) ? dossier.contacts : [])
+      .map((ct, index) => ({
+        index,
+        name: ct.name || '',
+        title: ct.title || '',
+        role: ct.role || '',
+        hasPersonalUrl: !!(ct.linkedin && String(ct.linkedin).trim())
+      }));
+    ok(res, { ...emailEngine.buildQuestions(dossier), contacts });
   } catch (e) { fail(res, e); }
 });
 
@@ -879,6 +910,78 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
     res.locals.audit = { prospectId: id, detail: `Draft generation FAILED — ${String(e && e.message || e)} (ref ${ref})` };
     return res.json({ ok: false, error: String(e && e.message || e), ref });
   }
+}));
+
+app.post('/api/prospects/:id/linkedin/generate', mutating('prospect.linkedin.generate', async (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  const a = q.body || {};
+  const dossier = p.dossier || {};
+  const contacts = Array.isArray(dossier.contacts) ? dossier.contacts : [];
+  const contact = contacts[parseInt(a.contactIndex, 10)];
+  if (!contact) {
+    res.status(400).json({ error: 'Choose who this message is for' });
+    res.locals.skipAudit = true;
+    return;
+  }
+  let chosenIssue = null;
+  if (a.issueId && a.issueId !== 'general') {
+    const idx = parseInt(String(a.issueId).replace('issue_', ''), 10);
+    chosenIssue = (dossier.issue_spotting || [])[idx] || null;
+  }
+  const { draft, usage } = await linkedinEngine.generateDraft({
+    dossier, contact, chosenIssue,
+    chosenServices: a.services || [], personalNote: a.personalNote || null
+  });
+  res.locals.audit = { prospectId: id, detail: `Generated LinkedIn draft for ${contact.name || 'a contact'}` };
+  return { draft, usage, destination: linkedinEngine.resolveDestination(contact, dossier.contact_general) };
+}));
+
+// Approving is the whole delivery step: there is no send. The CRM records the outreach and
+// learns from it; the SA pastes it into LinkedIn themselves. Logging and learning happen
+// server-side and unconditionally, so a blocked popup or a denied clipboard permission in
+// the browser still leaves a correctly recorded outreach.
+app.post('/api/prospects/:id/linkedin/save', mutating('prospect.linkedin.save', (q, res) => {
+  const id = +q.params.id;
+  const p = db.getProspect(id);
+  if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  const body = q.body || {};
+  const finalText = String(body.finalText || '').trim();
+  if (!finalText) {
+    res.status(400).json({ error: 'Message cannot be empty' });
+    res.locals.skipAudit = true;
+    return;
+  }
+  const dossier = p.dossier || {};
+  const contacts = Array.isArray(dossier.contacts) ? dossier.contacts : [];
+  const contact = contacts[parseInt(body.contactIndex, 10)];
+  if (!contact) {
+    res.status(400).json({ error: 'Choose who this message is for' });
+    res.locals.skipAudit = true;
+    return;
+  }
+
+  const result = db.logExternal(id, { channel: 'linkedin', text: finalText });
+  if (!result.ok) { res.status(400).json({ error: 'Could not log the outreach' }); res.locals.skipAudit = true; return; }
+
+  const fname = catalogs.saveApprovedLinkedIn({
+    company_name: p.company_name,
+    recipient_name: contact.name || '', recipient_title: contact.title || '',
+    recipient_role: contact.role || '',
+    services: Array.isArray(body.services) ? body.services : [],
+    first_draft: String(body.firstDraft || ''), final_text: finalText,
+    saved_at: new Date().toISOString()
+  });
+
+  // Bind the exemplar to the entry logExternal just created, so a later edit corrects this
+  // exemplar in place instead of adding a second one. The id comes back from logExternal
+  // (Step 1) rather than being dug out of p.activity, which is a JSON string and would be
+  // racy to re-read under concurrent requests.
+  if (result.entryId) db.recordEntryExemplar(id, result.entryId, fname);
+
+  res.locals.audit = { prospectId: id, detail: `Logged LinkedIn outreach to ${contact.name || 'a contact'} — saved to voice library` };
+  return { ok: true, destination: linkedinEngine.resolveDestination(contact, dossier.contact_general) };
 }));
 
 // Five subject-line options for an already-drafted email. Deliberately a separate call
