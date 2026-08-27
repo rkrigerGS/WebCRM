@@ -120,7 +120,12 @@ function buildDraftPrompt({ dossier, chosenIssue, chosenServices, personalNote, 
   // Use up to 6 approved emails as style exemplars, preferring ones sharing a chosen service.
   const ranked = rankExemplars(approved, chosenServices);
   const exemplars = ranked.slice(0, 6)
-    .map((e, i) => `EXAMPLE ${i + 1} (to ${e.recipient} at ${e.company_name}):\n${e.final_text}`)
+    .map((e, i) => {
+      const header = `EXAMPLE ${i + 1} (to ${e.recipient} at ${e.company_name}):`;
+      return e.subject
+        ? `${header}\nSubject: ${e.subject}\n${e.final_text}`
+        : `${header}\n${e.final_text}`;
+    })
     .join('\n\n---\n\n');
 
   const cfg = config.get();
@@ -145,7 +150,9 @@ SERVICE CATALOG (for how each service is pitched):
 ${servicesCatalog}
 
 APPROVED EXAMPLES (match this voice, structure, and length; do not copy their specific facts):
-${exemplars}`;
+${exemplars}
+
+Some examples above show no subject line: those are older records saved before subjects were tracked alongside the body. That absence is an artefact of when they were saved, not a signal that a plain or missing subject is the goal.`;
 
   const issueText = chosenIssue && chosenIssue.title
     ? `Lead the email around this issue: "${chosenIssue.title}". Context: ${chosenIssue.explanation}`
@@ -185,7 +192,18 @@ ${slotsText}
 
 ${followupText}
 
-Write only the email body, starting with the greeting. Use the recipient's first name if a decision-maker is known in the dossier contacts; otherwise use a reasonable greeting. Do not include a subject line unless asked.`;
+Write the email body, starting with the greeting. Use the recipient's first name if a decision-maker is known in the dossier contacts; otherwise use a reasonable greeting.
+
+Then, after the body, write the fence \`<<<SUBJECTS\` on its own line, then exactly five subject line options (one per line, no numbering, no quotes, no commentary), then the fence \`SUBJECTS>>>\` on its own line to close it. Having just written the body, ground each subject in something specific and real from it or from the dossier: the prospect's contract, agency, location, or the work they do. Follow these rules for every option:
+- ${SUBJECT_MIN_WORDS} to ${SUBJECT_MAX_WORDS} words, and under ${SUBJECT_MAX_CHARS} characters.
+- Sentence case. Never all capitals, not even for one word (ordinary acronyms like SBA or GSA are fine).
+- No exclamation points. No question marks unless the email genuinely asks that question.
+- No currency symbols, no percentages, no numbers implying savings or returns.
+- No emoji. No "Re:" or "Fwd:" — faking a reply to a conversation that never happened is the single fastest way to lose a recipient's trust and get reported.
+- Never use these words or anything close to them: free, guarantee, urgent, act now, limited time, no obligation, click here, exclusive, discount, last chance, don't miss.
+- Do not describe the firm's services in the subject. The subject earns the open; the body does the pitching.
+- No em dashes. No en dashes except in numeric ranges.
+- Each of the five options must take a genuinely different angle grounded in something real. Five rewordings of one idea is not five options.`;
 
   return { system, user, model: cfg.draftModel };
 }
@@ -315,9 +333,18 @@ function cleanSubjectLine(raw) {
 }
 
 function buildSubjectPrompt({ dossier, emailText, chosenServices }) {
-  const learned = catalogs.listSubjectLines().slice(0, 12);
+  // Learn from the merged approved-email library rather than the separate subject-lines
+  // store, so a subject is judged alongside the prospect context it actually went out
+  // with. catalogs.listSubjectLines() stays in place for now; Task C retires it.
+  const learned = catalogs.listApprovedEmails()
+    .filter(e => e.subject)
+    .sort((a, b) => (Date.parse(b.saved_at) || 0) - (Date.parse(a.saved_at) || 0))
+    .slice(0, 12);
   const exemplars = learned.length
-    ? learned.map(s => `- ${s.subject}${s.company_name ? `  (to ${s.company_name})` : ''}`).join('\n')
+    ? learned.map(e => {
+        const services = (e.services || []).join(', ');
+        return `- ${e.subject}  (to ${e.company_name}${services ? `, services: ${services}` : ''})`;
+      }).join('\n')
     : '(none saved yet)';
 
   const cfg = config.get();
@@ -378,6 +405,26 @@ function parseSubjectResponse(text) {
     if (subjects.length === 5) break;
   }
   return subjects;
+}
+
+// Splits a merged draft response into { body, subjects }. The model returns the body,
+// then the <<<SUBJECTS ... SUBJECTS>>> fence, then one subject per line. No fence, or a
+// fence the model never closed, must still yield the body: a missing subject list is a
+// degraded suggestion, but a lost body is a lost draft. The subject half is run through
+// the existing parseSubjectResponse so every deliverability rule still applies — no
+// duplicated filtering here.
+function parseDraftResponse(text) {
+  const raw = String(text || '');
+  const openIdx = raw.indexOf('<<<SUBJECTS');
+  if (openIdx === -1) {
+    return { body: raw.trim(), subjects: [] };
+  }
+  const body = raw.slice(0, openIdx).trim();
+  let subjectsBlock = raw.slice(openIdx + '<<<SUBJECTS'.length);
+  const closeIdx = subjectsBlock.indexOf('SUBJECTS>>>');
+  if (closeIdx !== -1) subjectsBlock = subjectsBlock.slice(0, closeIdx);
+  const subjects = parseSubjectResponse(subjectsBlock);
+  return { body, subjects };
 }
 
 async function generateSubjects(params) {
@@ -458,8 +505,9 @@ function callClaude({ system, user, model }) {
 async function generateDraft(params) {
   const prompt = buildDraftPrompt(params);
   const { text, usage } = await callClaude(prompt);
-  return { draft: text, usage };
+  const { body, subjects } = parseDraftResponse(text);
+  return { draft: body, subjects, usage };
 }
 
 module.exports = { buildQuestions, generateDraft, buildDraftPrompt, callClaude, buildReplyPrompt, generateReplyDraft,
-  generateSubjects, buildSubjectPrompt, cleanSubjectLine, isSpammySubject, parseSubjectResponse };
+  generateSubjects, buildSubjectPrompt, cleanSubjectLine, isSpammySubject, parseSubjectResponse, parseDraftResponse };
