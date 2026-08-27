@@ -37,6 +37,9 @@ function init(userDataDir, appDir) {
   const replyDir = path.join(userDataDir, 'reply-emails');
   fs.mkdirSync(replyDir, { recursive: true });
 
+  const linkedinDir = path.join(userDataDir, 'approved-linkedin');
+  fs.mkdirSync(linkedinDir, { recursive: true });
+
   templatesPath = path.join(userDataDir, 'reply-templates.json');
   loadTemplates();
 
@@ -47,7 +50,7 @@ function init(userDataDir, appDir) {
   subjectsPath = path.join(userDataDir, 'subject-lines.json');
   loadSubjects();
 
-  dirs = { userCatalogs, approvedDir, replyDir };
+  dirs = { userCatalogs, approvedDir, replyDir, linkedinDir };
   return dirs;
 }
 
@@ -177,6 +180,37 @@ function saveApprovedEmail(record, existingFile) {
   return fname;
 }
 
+// The LinkedIn voice library. Same mechanics as the approved-email library above and
+// deliberately the same shape of code, but a separate directory: a LinkedIn message is
+// shorter, has no subject and no signature block, so mixing the two would teach the
+// drafting prompt a voice that is neither.
+function listApprovedLinkedIn() {
+  const files = fs.readdirSync(dirs.linkedinDir).filter(f => f.endsWith('.json'));
+  return files.map(f => {
+    try { return JSON.parse(fs.readFileSync(path.join(dirs.linkedinDir, f), 'utf8')); }
+    catch { return null; }
+  }).filter(Boolean);
+}
+
+// record: { company_name, recipient_name, recipient_title, recipient_role, services,
+//           first_draft, final_text, saved_at }
+// existingFile (optional): overwrite this exemplar instead of creating a new one, so
+// correcting a logged message does not accumulate duplicates. path.basename guards
+// against traversal even though the value is app-supplied.
+function saveApprovedLinkedIn(record, existingFile) {
+  let fname = null;
+  if (existingFile) {
+    const base = path.basename(String(existingFile));
+    if (base.endsWith('.json')) fname = base;
+  }
+  if (!fname) {
+    const safe = (record.company_name || 'unknown').replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
+    fname = `${uniqueStamp()}_${safe}.json`;
+  }
+  store.writeJSON(path.join(dirs.linkedinDir, fname), record);
+  return fname;
+}
+
 // The reply library: same shape and save mechanics as the approved-email library above,
 // in its own directory so replies never mix into the outreach exemplar pool.
 function listReplyEmails() {
@@ -227,7 +261,8 @@ function safeRead(p) {
 
 module.exports = {
   init, readFirmFacts, readServices, writeFirmFacts, writeServices,
-  listApprovedEmails, saveApprovedEmail, listReplyEmails, saveReplyEmail, listReplyTemplates,
+  listApprovedEmails, saveApprovedEmail, listApprovedLinkedIn, saveApprovedLinkedIn,
+  listReplyEmails, saveReplyEmail, listReplyTemplates,
   saveSubjectLine, listSubjectLines,
   dirs: () => dirs
 };
