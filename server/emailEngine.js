@@ -261,7 +261,11 @@ async function generateReplyDraft(params) {
 
 const SUBJECT_MIN_WORDS = 3;
 const SUBJECT_MAX_WORDS = 9;
-const SUBJECT_MAX_CHARS = 60;
+// 72, not 60. Measured against 14 subject lines Marcos actually approved and sent, a
+// 60-character ceiling rejected one of them at 63 characters — the filter was refusing the
+// firm's own voice. 72 clears the observed maximum with room to spare and still lands
+// inside the width most clients show before truncating.
+const SUBJECT_MAX_CHARS = 72;
 
 // Words and shapes that classifiers weight heavily toward promotional/bulk mail. Matched
 // as whole words so ordinary text ("free consultation" is in the firm's own boilerplate,
@@ -283,9 +287,17 @@ function isSpammySubject(s) {
   if (/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(t)) return true; // emoji
   if (/^(re|fwd|fw)\s*:/i.test(t)) return true;              // faked reply/forward threading
   if (/\b\d{1,3}%/.test(t)) return true;                     // percentage claims
-  // ALL CAPS, ignoring acronyms the firm legitimately uses (SBA, GSA, IDIQ, 8(a)).
-  const shouty = words.filter(w => w.length > 3 && w === w.toUpperCase() && /[A-Z]{4,}/.test(w));
-  if (shouty.length) return true;
+  // No all-caps rule. There was one, and it was wrong twice over: it claimed in its own
+  // comment to exempt the acronyms this firm uses, but its `length > 3` guard only spared
+  // three-letter ones — so IDIQ, SDVOSB, NAICS, GWAC and hyphenated vehicle names like
+  // G-CACS were all treated as shouting. That is the firm's entire working vocabulary, and
+  // the prompt actively asks the model to ground subjects in the prospect's contract and
+  // designations, so the filter was rejecting the output its own prompt requested. Against
+  // 14 real approved subject lines it produced a 14% false-positive rate.
+  //
+  // Shouting is not a signal we screen for. What actually marks bulk mail is caught below
+  // and above: spam vocabulary, exclamation and currency marks, percentage claims, emoji,
+  // and faked Re:/Fwd: threading.
   const lower = t.toLowerCase();
   if (SPAM_WORDS.some(w => new RegExp(`(^|[^a-z])${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z]|$)`).test(lower))) return true;
   return false;
