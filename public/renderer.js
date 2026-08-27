@@ -1097,15 +1097,16 @@ async function approveLinkedIn(){
   // rendered as a plain clickable link that survives a blocked popup.
   try{ await navigator.clipboard.writeText(finalText); }catch{ /* still selectable on screen above */ }
   const url=res.destination&&res.destination.url;
-  const opened=url?window.open(url,'_blank','noopener'):null;
+  const safe=url?safeUrl(url):'';
+  const opened=safe?window.open(safe,'_blank','noopener'):null;
   emailModalBody.innerHTML=`
     <div class="q-hint">Logged to this prospect's activity and saved to the learning library. The message is on your clipboard.</div>
-    ${url
-      ?`<div class="settings-field"><label>LinkedIn</label><div class="field-val"><a href="${esc(url)}" target="_blank" rel="noreferrer">${esc(url)}</a></div>${opened?'':'<div class="hint">The popup was blocked — use the link above.</div>'}</div>`
+    ${safe
+      ?`<div class="settings-field"><label>LinkedIn</label><div class="field-val"><a href="${esc(safe)}" target="_blank" rel="noreferrer">${esc(safe)}</a></div>${opened?'':'<div class="hint">The popup was blocked — use the link above.</div>'}</div>`
       :`<div class="q-hint">No LinkedIn URL on file for this contact or the company, so paste the message wherever you reach them.</div>`}
     <div class="modal-actions"><button class="btn" id="liDoneBtn">Done</button></div>`;
   document.getElementById('liDoneBtn').addEventListener('click',()=>{ emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId); });
-  toast(url?'Logged and copied. Paste it into LinkedIn and send.':'Logged and copied. No LinkedIn URL on file, so paste it wherever you reach them.',6000);
+  toast(safe?'Logged and copied. Paste it into LinkedIn and send.':'Logged and copied. No LinkedIn URL on file, so paste it wherever you reach them.',6000);
 }
 
 document.getElementById('emailModalClose').addEventListener('click',()=>{emailModal.hidden=true;emailModal.querySelector('.modal').classList.remove('modal-wide');});
