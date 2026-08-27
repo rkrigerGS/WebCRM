@@ -316,6 +316,7 @@ async function openDetail(id){
 
   const c=d.contact_general||{};
   const contacts=Array.isArray(d.contacts)?d.contacts:[];
+  const hasContacts=contacts.length>0;
   const contract=d.current_contract||{};
   const lit=d.prior_litigation||{};
   const issues=Array.isArray(d.issue_spotting)?d.issue_spotting:[];
@@ -331,6 +332,7 @@ async function openDetail(id){
       <div class="detail-actions" style="margin-top:10px;">
         <button class="btn btn-sm" id="generateBtn">Generate email</button>
         <button class="btn btn-sm ${hasApproved?'':'btn-ghost'}" id="followupBtn" ${hasApproved?'':'disabled title="Needs a sent email first"'}>Draft follow-up</button>
+        <button class="btn btn-ghost btn-sm" id="linkedinBtn" ${hasContacts?'':'disabled title="No decision-makers on file to address"'}>LinkedIn message</button>
       </div>
       <div class="detail-actions" style="margin-top:6px;">
         <button class="btn btn-ghost btn-sm" id="logExternalBtn">Log outreach sent elsewhere</button>
@@ -383,6 +385,7 @@ async function openDetail(id){
   // wire detail actions
   document.getElementById('generateBtn').addEventListener('click',()=>openEmailFlow(id,d,false));
   const fb=document.getElementById('followupBtn'); if(hasApproved) fb.addEventListener('click',()=>openEmailFlow(id,d,true));
+  const lb=document.getElementById('linkedinBtn'); if(lb&&hasContacts) lb.addEventListener('click',()=>openLinkedInFlow(id,d));
   document.getElementById('logExternalBtn').addEventListener('click',()=>openLogExternal(id));
   document.getElementById('noteBtn').addEventListener('click',()=>openNote(id));
   document.getElementById('detailBody').querySelectorAll('.log-entry').forEach(el=>{
@@ -970,6 +973,139 @@ async function renderDraft(draft,usage){
       errEl.textContent=e.message; errEl.hidden=false;
     }
   });
+}
+
+// ---- LinkedIn message flow ----
+// Reuses flowState and the emailModal shell. Four steps: pick a decision-maker (this is
+// what makes the message personal — a gate-killed prospect with no contacts never reaches
+// here, the entry button is disabled for that case), the same framing/services questions as
+// email minus the calendar-slots block, the draft, then review and approve. There is no
+// send: approving records the outreach and the voice-library exemplar server-side, and only
+// then touches the clipboard or a new tab, so a blocked popup or a denied clipboard
+// permission can never cost a logged outreach.
+async function openLinkedInFlow(prospectId,dossier){
+  flowState={prospectId,dossier,contactIndex:null,issueId:null,services:[],personalNote:null,firstDraft:null};
+  emailModalTitle.textContent='LinkedIn message';
+  emailModal.hidden=false;
+  let cfg;
+  try{ cfg=await window.api.getConfig(); }
+  catch(e){ emailModalBody.innerHTML=errorBlock('Could not load settings: '+e.message); return; }
+  if(!cfg.hasApiKey){
+    emailModalBody.innerHTML=`<div class="error-note">No Anthropic API key is set. Add it in Settings to generate drafts.</div><div class="modal-actions"><button class="btn" id="goSettings">Open Settings</button></div>`;
+    document.getElementById('goSettings').addEventListener('click',()=>{emailModal.hidden=true;openSettings();});
+    return;
+  }
+  let q;
+  try{ q=await window.api.linkedinQuestions(prospectId); }
+  catch(e){ emailModalBody.innerHTML=errorBlock('Could not load decision-makers: '+e.message); return; }
+  const contacts=Array.isArray(q.contacts)?q.contacts:[];
+  // The entry button is disabled whenever the dossier has no contacts, but a dossier can be
+  // edited out from under an already-open modal, so this stays a real check, not decoration.
+  if(!contacts.length){ emailModalBody.innerHTML=errorBlock('No decision-makers on file to address.'); return; }
+  renderLinkedInContacts(q);
+}
+
+function renderLinkedInContacts(q){
+  const rows=q.contacts.map(c=>`<div class="opt" data-kind="contact" data-index="${c.index}"><div class="opt-title">${esc(c.name||'(name not found)')}</div><div class="opt-detail">${esc([c.title,c.role].filter(Boolean).join(' · '))}</div>${c.hasPersonalUrl?'':'<div class="opt-detail" style="color:var(--text-faint);">no personal profile — will open the company page</div>'}</div>`).join('');
+  emailModalBody.innerHTML=`
+    <div class="q-block"><div class="q-label">1. Who is this message for?</div><div class="q-hint">Pick the decision-maker to personalise the message to.</div>${rows}</div>
+    <div class="modal-actions"><span class="usage-note">Pick a person to continue.</span></div>`;
+  emailModalBody.querySelectorAll('.opt[data-kind="contact"]').forEach(el=>el.addEventListener('click',()=>{
+    flowState.contactIndex=parseInt(el.dataset.index,10);
+    renderLinkedInQuestions(q);
+  }));
+}
+
+function renderLinkedInQuestions(q){
+  const issueOpts=q.issueOptions.map(o=>`<div class="opt${flowState.issueId===o.id?' selected':''}" data-kind="issue" data-id="${o.id}"><div class="opt-title">${esc(o.label)}</div>${o.detail?`<div class="opt-detail">${esc(shorten(o.detail,140))}</div>`:''}</div>`).join('');
+  const svcOpts=q.serviceOptions.map(o=>`<div class="opt${flowState.services.includes(o.id)?' selected':''}" data-kind="service" data-id="${esc(o.id)}"><span class="opt-title">${esc(o.label)}</span><span class="opt-tags">${o.suggested?'<span class="tag tag-suggested">suggested</span>':''}${o.proven?'<span class="tag tag-proven">proven</span>':''}</span></div>`).join('');
+  const personalBlock=(q.personalHooks&&q.personalHooks.length)?`<div class="q-block"><div class="q-label">Personal touch (optional)</div><div class="q-hint">Catalog hooks that may fit this prospect. Pick any to weave in, or none.</div>${q.personalHooks.map(h=>`<div class="opt" data-kind="hook" data-id="${esc(h.id)}"><div class="opt-title">${esc(h.label)}</div><div class="opt-detail">${esc(h.suggestion)}</div></div>`).join('')}</div>`:'';
+  emailModalBody.innerHTML=`
+    <div class="q-block"><div class="q-label">2. Which issue should the message lead with?</div><div class="q-hint">Pulled from this prospect's research.</div>${issueOpts}</div>
+    <div class="q-block"><div class="q-label">3. Which services should we pitch?</div><div class="q-hint">Choose one or two. Suggested ones match their issues.</div>${svcOpts}</div>
+    ${personalBlock}
+    <div class="modal-actions"><button class="btn btn-ghost" id="liBackBtn">Back</button><button class="btn" id="liGenBtn" ${(flowState.issueId&&flowState.services.length>=1)?'':'disabled'}>Generate draft</button><span class="usage-note">Two questions, then a draft.</span></div>`;
+  document.getElementById('liBackBtn').addEventListener('click',()=>renderLinkedInContacts(q));
+  emailModalBody.querySelectorAll('.opt[data-kind="issue"]').forEach(el=>el.addEventListener('click',()=>{emailModalBody.querySelectorAll('.opt[data-kind="issue"]').forEach(x=>x.classList.remove('selected'));el.classList.add('selected');flowState.issueId=el.dataset.id;updateLiGen();}));
+  emailModalBody.querySelectorAll('.opt[data-kind="service"]').forEach(el=>el.addEventListener('click',()=>{const id=el.dataset.id;const i=flowState.services.indexOf(id);if(i>=0){flowState.services.splice(i,1);el.classList.remove('selected');}else{if(flowState.services.length>=2)return;flowState.services.push(id);el.classList.add('selected');}updateLiGen();}));
+  flowState.hooks=[];
+  emailModalBody.querySelectorAll('.opt[data-kind="hook"]').forEach(el=>el.addEventListener('click',()=>{const id=el.dataset.id;const i=flowState.hooks.indexOf(id);if(i>=0){flowState.hooks.splice(i,1);el.classList.remove('selected');}else{flowState.hooks.push(id);el.classList.add('selected');}}));
+  document.getElementById('liGenBtn').addEventListener('click',()=>{
+    const chosen=(q.personalHooks||[]).filter(h=>flowState.hooks.includes(h.id)).map(h=>h.suggestion);
+    flowState.personalNote=chosen.length?chosen.join(' '):null;
+    runLinkedInGeneration();
+  });
+}
+function updateLiGen(){const b=document.getElementById('liGenBtn');if(b)b.disabled=!(flowState.issueId&&flowState.services.length>=1);}
+
+async function runLinkedInGeneration(){
+  emailModalBody.innerHTML=`<div class="gen-status">Writing the message in Marcos's voice…</div>`;
+  let res;
+  try{ res=await window.api.linkedinGenerate(flowState.prospectId,{contactIndex:flowState.contactIndex,issueId:flowState.issueId,services:flowState.services,personalNote:flowState.personalNote}); }
+  catch(e){
+    emailModalBody.innerHTML=errorBlock("Couldn't generate: "+e.message)+`<div class="modal-actions"><button class="btn btn-ghost" id="backBtn">Back</button></div>`;
+    document.getElementById('backBtn').addEventListener('click',()=>openLinkedInFlow(flowState.prospectId,flowState.dossier));
+    return;
+  }
+  flowState.firstDraft=res.draft;
+  renderLinkedInDraft(res.draft,res.usage);
+}
+
+function renderLinkedInDraft(draft,usage){
+  const tokens=usage&&usage.output_tokens?`${usage.input_tokens||0} in / ${usage.output_tokens} out`:'';
+  emailModalBody.innerHTML=`
+    <div class="q-hint">Review and edit. There is no separate send step — approving logs this exact text and saves it to the learning library; you paste it into LinkedIn yourself.</div>
+    <textarea class="draft-area" id="liDraftArea">${esc(draft)}</textarea>
+    <div id="liCount" class="usage-note"></div>
+    <div class="modal-actions"><button class="btn btn-ghost" id="liRegenBtn">Regenerate</button><div class="spacer"></div><span class="usage-note">${tokens}</span></div>
+    <div id="liApproveErr" class="error-note" hidden></div>
+    <div class="modal-actions"><button class="btn" id="liApproveBtn">Approve</button><span class="usage-note">Logs the outreach and copies it to the clipboard. No message is sent from here.</span></div>`;
+  const draftArea=document.getElementById('liDraftArea');
+  const counter=document.getElementById('liCount');
+  const updateCount=()=>{
+    const n=draftArea.value.length;
+    counter.textContent=n<=300
+      ?`${n} characters — fits a connection request`
+      :`${n} characters — too long for a connection request (300 max), fine as a message`;
+  };
+  draftArea.addEventListener('input',updateCount);
+  updateCount();
+  document.getElementById('liRegenBtn').addEventListener('click',()=>runLinkedInGeneration());
+  document.getElementById('liApproveBtn').addEventListener('click',approveLinkedIn);
+}
+
+async function approveLinkedIn(){
+  const draftArea=document.getElementById('liDraftArea');
+  const errEl=document.getElementById('liApproveErr');
+  errEl.hidden=true;
+  const finalText=draftArea.value;
+  if(!finalText.trim()){ errEl.textContent='The message is empty.'; errEl.hidden=false; return; }
+  const btn=document.getElementById('liApproveBtn');
+  const originalLabel=btn.textContent;
+  btn.disabled=true; btn.textContent='Saving…';
+  let res;
+  try{
+    res=await window.api.linkedinSave(flowState.prospectId,{finalText,contactIndex:flowState.contactIndex,services:flowState.services,firstDraft:flowState.firstDraft});
+  }catch(e){
+    btn.disabled=false; btn.textContent=originalLabel;
+    errEl.textContent=e.message; errEl.hidden=false;
+    return;
+  }
+  // Recorded server-side — everything below is best-effort browser convenience and must
+  // never be allowed to cost the logged outreach. Both the clipboard permission and the
+  // popup blocker fail silently, so neither is trusted alone: the destination is also
+  // rendered as a plain clickable link that survives a blocked popup.
+  try{ await navigator.clipboard.writeText(finalText); }catch{ /* still selectable on screen above */ }
+  const url=res.destination&&res.destination.url;
+  const opened=url?window.open(url,'_blank','noopener'):null;
+  emailModalBody.innerHTML=`
+    <div class="q-hint">Logged to this prospect's activity and saved to the learning library. The message is on your clipboard.</div>
+    ${url
+      ?`<div class="settings-field"><label>LinkedIn</label><div class="field-val"><a href="${esc(url)}" target="_blank" rel="noreferrer">${esc(url)}</a></div>${opened?'':'<div class="hint">The popup was blocked — use the link above.</div>'}</div>`
+      :`<div class="q-hint">No LinkedIn URL on file for this contact or the company, so paste the message wherever you reach them.</div>`}
+    <div class="modal-actions"><button class="btn" id="liDoneBtn">Done</button></div>`;
+  document.getElementById('liDoneBtn').addEventListener('click',()=>{ emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId); });
+  toast(url?'Logged and copied. Paste it into LinkedIn and send.':'Logged and copied. No LinkedIn URL on file, so paste it wherever you reach them.',6000);
 }
 
 document.getElementById('emailModalClose').addEventListener('click',()=>{emailModal.hidden=true;emailModal.querySelector('.modal').classList.remove('modal-wide');});
