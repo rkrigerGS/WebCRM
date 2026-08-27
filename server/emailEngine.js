@@ -374,13 +374,30 @@ async function generateSubjects(params) {
   return { subjects: parseSubjectResponse(text), usage };
 }
 
+// Seeds are training wheels. Once the library holds this many real approvals, the prompt
+// window (6) can be filled twice over from real material and the seeds are no longer
+// load-bearing, so they sort last. Below it they rank normally — a cold library still
+// needs examples to teach from.
+const SEED_DECAY_THRESHOLD = 12;
+
+// Ranking has three signals, in strict precedence. Service overlap stays primary: a
+// well-matched example teaches more than a recent mismatched one. Recency breaks ties,
+// which is what makes the library track Marcos's current voice instead of averaging
+// every voice he has ever had. Seed decay applies only past the threshold above.
 function rankExemplars(approved, chosenServices) {
   const chosen = new Set((chosenServices || []).map(s => s.toLowerCase()));
-  return [...approved].sort((a, b) => score(b) - score(a));
-  function score(e) {
-    const svcs = (e.services || []).map(s => s.toLowerCase());
-    return svcs.filter(s => chosen.has(s)).length;
-  }
+  const overlap = e => (e.services || []).map(s => s.toLowerCase()).filter(s => chosen.has(s)).length;
+  // Date.parse returns NaN for a missing or malformed stamp; || 0 sorts those last
+  // among their ties rather than throwing or poisoning the comparison.
+  const when = e => Date.parse(e && e.saved_at) || 0;
+  const decay = (approved || []).filter(e => e && !e.seed).length >= SEED_DECAY_THRESHOLD;
+
+  return [...(approved || [])].sort((a, b) => {
+    if (decay && !!a.seed !== !!b.seed) return a.seed ? 1 : -1;
+    const byOverlap = overlap(b) - overlap(a);
+    if (byOverlap) return byOverlap;
+    return when(b) - when(a);
+  });
 }
 
 // The actual API call. Returns { text, usage } or throws with a readable message.
@@ -449,5 +466,6 @@ async function generateDraft(params) {
   return { draft: text, usage };
 }
 
-module.exports = { buildQuestions, generateDraft, buildDraftPrompt, callClaude, buildReplyPrompt, generateReplyDraft,
+module.exports = { buildQuestions, generateDraft, buildDraftPrompt, callClaude, rankExemplars,
+  buildReplyPrompt, generateReplyDraft,
   generateSubjects, buildSubjectPrompt, cleanSubjectLine, isSpammySubject, parseSubjectResponse };

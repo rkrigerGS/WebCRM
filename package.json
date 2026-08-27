@@ -4,7 +4,8 @@
   "description": "GovSpring prospecting CRM, run as a local web server on an always-on host machine.",
   "main": "server/server.js",
   "scripts": {
-    "start": "node server/server.js"
+    "start": "node server/server.js",
+    "test": "node --test"
   },
   "author": "",
   "license": "UNLICENSED",
