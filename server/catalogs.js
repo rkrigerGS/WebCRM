@@ -40,13 +40,6 @@ function init(userDataDir, appDir) {
   templatesPath = path.join(userDataDir, 'reply-templates.json');
   loadTemplates();
 
-  // The subject-line library. Its own store rather than a field on the approved-email
-  // records: subjects are learned from every send (including sends whose body the SA
-  // opted out of saving), and generation reads them on their own, without loading the
-  // full body library.
-  subjectsPath = path.join(userDataDir, 'subject-lines.json');
-  loadSubjects();
-
   dirs = { userCatalogs, approvedDir, replyDir };
   return dirs;
 }
@@ -65,27 +58,6 @@ function saveTemplates() {
 }
 const MAX_TEMPLATES = 300;
 
-// ---- Subject-line library ----
-// Every subject that actually goes out is recorded here, tagged with the services pitched
-// and whether the SA edited a suggested line or took it as-is. generateSubjects() feeds
-// the most recent ones back as exemplars, the same way the approved-email library teaches
-// the body voice. Editing a subject before sending overwrites that send's record rather
-// than adding a second one, so one email never contributes two exemplars.
-let subjectsPath;
-let subjectStore = { subjects: [], nextId: 1 };
-const MAX_SUBJECTS = 200;
-
-function loadSubjects() {
-  const raw = store.readJSON(subjectsPath); // throws on a corrupt/unreadable file
-  if (!raw) return saveSubjects(); // genuinely no file yet: write the empty store
-  subjectStore = raw;
-  subjectStore.subjects = subjectStore.subjects || [];
-  subjectStore.nextId = subjectStore.nextId || store.nextIdFrom(subjectStore.subjects);
-}
-function saveSubjects() {
-  store.writeJSON(subjectsPath, subjectStore);
-}
-
 // The approved-email library is the voice reference for every draft, so it must reflect
 // Marcos's CURRENT voice rather than averaging every voice he has ever had. 100, not the
 // 200 used for subjects: listApprovedEmails() reads every file on every draft, and at
@@ -93,43 +65,6 @@ function saveSubjects() {
 // forever. The prompt uses 6 exemplars ranked by service overlap and the catalog holds 13
 // services, so 100 still leaves 5-8 examples per service.
 const MAX_APPROVED_EMAILS = 100;
-
-// record: { company_name, subject, services, suggested }
-// `suggested` is the generated option the SA picked, when they picked one. It is compared
-// against the subject actually sent to derive `edited` — that difference is the signal
-// worth learning from, since it is where the SA corrected the model.
-function saveSubjectLine(record) {
-  const subject = String(record.subject || '').trim();
-  if (!subject) return null;
-  const suggested = String(record.suggested || '').trim();
-  const entry = {
-    id: subjectStore.nextId++,
-    company_name: record.company_name || '',
-    subject,
-    services: Array.isArray(record.services) ? record.services : [],
-    suggested: suggested || null,
-    // Three states worth distinguishing when ranking exemplars: written from scratch,
-    // a suggestion taken verbatim, or a suggestion the SA rewrote.
-    origin: !suggested ? 'written' : (suggested === subject ? 'accepted' : 'edited'),
-    saved_at: new Date().toISOString()
-  };
-  // Same subject text already learned for this company: overwrite rather than duplicate.
-  const dupe = subjectStore.subjects.findIndex(s => s.subject === subject && s.company_name === entry.company_name);
-  if (dupe >= 0) subjectStore.subjects.splice(dupe, 1);
-  subjectStore.subjects.push(entry);
-  if (subjectStore.subjects.length > MAX_SUBJECTS) subjectStore.subjects = subjectStore.subjects.slice(-MAX_SUBJECTS);
-  saveSubjects();
-  return entry;
-}
-
-// Most recently learned first. A subject the SA wrote or rewrote outranks one they merely
-// accepted: an edit is a correction, and corrections carry more voice signal than an
-// option that was simply good enough to click.
-function listSubjectLines() {
-  const weight = o => (o === 'edited' ? 2 : o === 'written' ? 2 : 1);
-  return subjectStore.subjects.slice().reverse()
-    .sort((a, b) => weight(b.origin) - weight(a.origin));
-}
 
 function readFirmFacts() {
   return safeRead(path.join(dirs.userCatalogs, 'firm-and-people.md'));
@@ -262,6 +197,6 @@ function safeRead(p) {
 module.exports = {
   init, readFirmFacts, readServices, writeFirmFacts, writeServices,
   listApprovedEmails, saveApprovedEmail, listReplyEmails, saveReplyEmail, listReplyTemplates,
-  saveSubjectLine, listSubjectLines, MAX_APPROVED_EMAILS,
+  MAX_APPROVED_EMAILS,
   dirs: () => dirs
 };

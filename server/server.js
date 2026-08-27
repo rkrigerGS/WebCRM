@@ -856,7 +856,7 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
     chosenIssue = (p.dossier.issue_spotting || [])[idx] || null;
   }
   try {
-    const { draft, usage } = await emailEngine.generateDraft({
+    const { draft, subjects, usage } = await emailEngine.generateDraft({
       dossier: p.dossier, chosenIssue, chosenServices: a.services || [],
       personalNote: a.personalNote || null, isFollowup: !!a.isFollowup,
       priorEmailText: a.priorEmailText || p.final_sent || p.first_draft || '',
@@ -868,7 +868,7 @@ app.post('/api/prospects/:id/generate', mutating('prospect.draft.generate', asyn
     if (!a.isFollowup && !p.first_draft) { db.updateProspect(id, { first_draft: draft }); persisted = true; }
     const kind = a.isFollowup ? 'Follow-up draft' : (persisted ? 'First draft (saved)' : 'Draft regenerated');
     res.locals.audit = { prospectId: id, detail: `${kind} — tokens in ${(usage && usage.input_tokens) || 0} / out ${(usage && usage.output_tokens) || 0}` };
-    return { ok: true, draft, usage };
+    return { ok: true, draft, subjects, usage };
   } catch (e) {
     // Same reasoning as the failed sends: a draft that never came back is worth a line in
     // the log, otherwise a run of Claude failures is invisible.
@@ -1042,22 +1042,15 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
   db.updateProspect(id, patch, { internal: true });
   db.addNote(id, `Sent ${isFollowup ? 'follow-up' : 'outreach'} email to ${to}: "${subject}"${bookingSlots.length ? ` — offered ${bookingSlots.length} bookable time${bookingSlots.length > 1 ? 's' : ''} (${bookingSlots.map(s => s.label).join('; ')})` : ''}`, isFollowup ? 'followup' : 'outreach');
   if (saveToLibrary) {
-    catalogs.saveApprovedEmail({
+    const approvedEmail = {
       company_name: p.company_name, recipient: to,
       services: (meta && meta.services) || [], first_draft: p.first_draft || '',
-      final_text: finalText, is_followup: isFollowup, saved_at: new Date().toISOString()
-    });
+      final_text: finalText, is_followup: isFollowup, saved_at: new Date().toISOString(),
+      subject
+    };
+    if (meta && typeof meta.suggestedSubject === 'string') approvedEmail.suggested_subject = meta.suggestedSubject;
+    catalogs.saveApprovedEmail(approvedEmail);
   }
-  // The subject that actually went out is learned on every send, independently of the
-  // body opt-out above: the SA opting not to save a body ("this one was unusual") says
-  // nothing about the subject, and the subject library is what future suggestions are
-  // ranked against. `suggestedSubject` is the generated option the SA picked, when they
-  // picked one, so the library can tell an accepted suggestion from a rewritten one.
-  catalogs.saveSubjectLine({
-    company_name: p.company_name, subject,
-    services: (meta && meta.services) || [],
-    suggested: (meta && typeof meta.suggestedSubject === 'string') ? meta.suggestedSubject : ''
-  });
   res.locals.audit = {
     prospectId: id,
     detail: `Sent via Gmail to ${to}${cc.length ? ` (cc: ${cc.join(', ')})` : ''}${isFollowup ? (hasThread ? ' — follow-up, threaded' : ' — follow-up, new thread (no prior Gmail thread on file)') : ''}${bookingSlots.length ? ` — ${bookingSlots.length} booking slot(s) offered` : ''}${saveToLibrary ? '' : ' — not saved to library'}`

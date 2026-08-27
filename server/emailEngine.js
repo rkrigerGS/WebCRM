@@ -333,9 +333,9 @@ function cleanSubjectLine(raw) {
 }
 
 function buildSubjectPrompt({ dossier, emailText, chosenServices }) {
-  // Learn from the merged approved-email library rather than the separate subject-lines
+  // Learn from the merged approved-email library rather than a separate subject-lines
   // store, so a subject is judged alongside the prospect context it actually went out
-  // with. catalogs.listSubjectLines() stays in place for now; Task C retires it.
+  // with. Subject exemplars come from approved-email records that carry a subject.
   const learned = catalogs.listApprovedEmails()
     .filter(e => e.subject)
     .sort((a, b) => (Date.parse(b.saved_at) || 0) - (Date.parse(a.saved_at) || 0))
