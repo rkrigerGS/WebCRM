@@ -37,6 +37,10 @@ function safeUrl(u){
 // Every "Loading…" placeholder needs somewhere to land when the request fails, or the
 // panel sits on that word forever and looks like a hang.
 function errorBlock(msg){return `<div class="error-note">${esc(msg)}</div>`;}
+// Subject options render as a single dropdown, not stacked cards — shared by the initial
+// draft render (subjects arrive with every /generate) and the Suggest button (five more
+// against the edited body). No options means no control at all, not an empty one.
+function subjSelectHtml(list){return (list&&list.length)?`<select class="field-input" id="subjSelect"><option value="">Five suggestions — pick one, or write your own</option>${list.map(t=>`<option value="${esc(t)}">${esc(t)}</option>`).join('')}</select>`:'';}
 function shorten(s,n){s=s||'';return s.length>n?s.slice(0,n-1)+'…':s;}
 function scoreClass(s){return (s==null)?'score-none':'score-'+s;}
 function todayStr(){return new Date().toISOString().slice(0,10);}
@@ -850,6 +854,9 @@ async function runGeneration(){
   }
   // res.ref is the server-side reference code for this failure — shown so it can be reported.
   if(!res.ok){ emailModalBody.innerHTML=`<div class="error-note">Couldn't generate: ${esc(res.error)}${res.ref?` (ref ${esc(res.ref)})`:''}</div><div class="modal-actions"><button class="btn btn-ghost" id="backBtn">Back</button></div>`; document.getElementById('backBtn').addEventListener('click',()=>openEmailFlow(flowState.prospectId,flowState.dossier,flowState.isFollowup)); return; }
+  // subjects may be empty — a model that ignored the response fence — and that's a normal
+  // degrade to "no suggestions", not an error; the draft step must still render fine.
+  flowState.subjects=res.subjects||[];
   renderDraft(res.draft,res.usage);
 }
 
@@ -902,9 +909,9 @@ async function renderDraft(draft,usage){
         <input class="field-input" id="sendSubject" value="${esc(defaultSubject)}" style="flex:1;">
         <button class="btn btn-ghost" id="suggestSubjBtn" type="button">Suggest</button>
       </div>
-      <div class="hint">Five options written to read as a real person's email, not a blast. Pick one, then edit it however you like.</div>
+      <div class="hint">Five options arrive with the draft, written to read as a real person's email, not a blast — pick one below, then edit it however you like. Suggest asks for five new ones once you've edited the body.</div>
       <div id="subjErr" class="error-note" hidden></div>
-      <div id="subjOptions"></div>
+      <div id="subjOptions">${subjSelectHtml(flowState.subjects)}</div>
     </div>
     <div class="settings-field"><label>CC (optional)</label>${ccOptions}</div>
     ${bookingSection}
@@ -919,6 +926,14 @@ async function renderDraft(draft,usage){
   // worth learning from. Cleared to '' when they type a subject with no option picked.
   let pickedSubject='';
   const subjOptions=document.getElementById('subjOptions');
+  // (Re)binds the change listener on whichever <select> currently lives inside #subjOptions —
+  // needed after every innerHTML swap, since replacing the markup drops old listeners.
+  const bindSubjSelect=()=>{
+    const sel=document.getElementById('subjSelect');
+    if(!sel)return;
+    sel.addEventListener('change',()=>{ pickedSubject=sel.value; if(sel.value)document.getElementById('sendSubject').value=sel.value; });
+  };
+  bindSubjSelect();
   document.getElementById('suggestSubjBtn').addEventListener('click',async()=>{
     const btn=document.getElementById('suggestSubjBtn');
     const errEl=document.getElementById('subjErr');
@@ -936,13 +951,8 @@ async function renderDraft(draft,usage){
         errEl.textContent='None of the suggestions passed the spam-safety checks. Try again, or write your own.';
         errEl.hidden=false; return;
       }
-      subjOptions.innerHTML=r.subjects.map(t=>`<div class="opt subjOpt" data-subject="${esc(t)}"><div class="opt-title">${esc(t)}</div></div>`).join('');
-      subjOptions.querySelectorAll('.subjOpt').forEach(el=>el.addEventListener('click',()=>{
-        subjOptions.querySelectorAll('.subjOpt').forEach(o=>o.classList.remove('selected'));
-        el.classList.add('selected');
-        pickedSubject=el.dataset.subject;
-        document.getElementById('sendSubject').value=pickedSubject;
-      }));
+      subjOptions.innerHTML=subjSelectHtml(r.subjects);
+      bindSubjSelect();
     }catch(e){ errEl.textContent=e.message; errEl.hidden=false; }
     finally{ btn.disabled=false; btn.textContent=label; }
   });
