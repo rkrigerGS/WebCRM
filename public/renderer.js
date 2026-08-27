@@ -475,21 +475,23 @@ function openLogExternal(id){
 // email, saving can feed Marcos's voice library so the drafting prompt learns from a real
 // email that originally went out from Gmail rather than through the app.
 function openOutreachEdit(id,o){
-  const isEmail=o.channel==='email';
+  // Both email and LinkedIn have a voice library to learn from; phone does not (there is no
+  // message text to learn a voice from), so the checkbox stays hidden for it.
+  const canLearn=o.channel==='email'||o.channel==='linkedin';
   emailModalTitle.textContent='Outreach details';
   emailModal.hidden=false;
   emailModalBody.innerHTML=`
-    <div class="q-hint">${esc(o.date)} · <span style="text-transform:capitalize;">${esc(o.channel)}</span>. Add or correct the message that was actually sent${isEmail?", so it's recorded and Marcos's voice library can learn from it":''}.</div>
+    <div class="q-hint">${esc(o.date)} · <span style="text-transform:capitalize;">${esc(o.channel)}</span>. Add or correct the message that was actually sent${canLearn?", so it's recorded and Marcos's voice library can learn from it":''}.</div>
     <div class="settings-field"><label>Message</label>
       <textarea id="oeText" class="draft-area" style="min-height:220px;" placeholder="Paste the full message that was sent.">${esc(o.message)}</textarea></div>
-    ${isEmail?`<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:2px 0 12px;"><input type="checkbox" id="oeLearn" checked> Save to Marcos's voice library (learn from this email)</label>`:''}
+    ${canLearn?`<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:2px 0 12px;"><input type="checkbox" id="oeLearn" checked> Save to Marcos's voice library (learn from this message)</label>`:''}
     <div class="modal-actions"><button class="btn" id="oeSave">Save message</button></div>`;
   document.getElementById('oeSave').addEventListener('click',async(e)=>{
     const btn=e.currentTarget;
     if(btn.disabled)return;
     const text=document.getElementById('oeText').value.trim();
     if(!text){toast('Message cannot be empty',4000);return;}
-    const saveToLibrary=isEmail&&document.getElementById('oeLearn').checked;
+    const saveToLibrary=canLearn&&document.getElementById('oeLearn').checked;
     btn.disabled=true;
     try{ await window.api.editOutreach(id,o.entryId,{text,saveToLibrary}); }
     catch(err){ btn.disabled=false; toast('Not saved: '+err.message,6000); return; }
@@ -1048,13 +1050,22 @@ async function runLinkedInGeneration(){
     return;
   }
   flowState.firstDraft=res.draft;
-  renderLinkedInDraft(res.draft,res.usage);
+  renderLinkedInDraft(res.draft,res.usage,res.destination);
 }
 
-function renderLinkedInDraft(draft,usage){
+// Shows where approving will actually send the SA before they approve — the mitigation for
+// a company vanity URL sitting in a contact's personal-linkedin field: if the destination
+// resolved to the company page instead of a person, that's visible here, not just after the
+// tab has already opened.
+function renderLinkedInDraft(draft,usage,destination){
   const tokens=usage&&usage.output_tokens?`${usage.input_tokens||0} in / ${usage.output_tokens} out`:'';
+  const destUrl=destination&&destination.url?safeUrl(destination.url):'';
+  const destBlock=destUrl
+    ?`<div class="settings-field"><label>Will open</label><div class="field-val"><a href="${esc(destUrl)}" target="_blank" rel="noreferrer">${esc(destUrl)}</a> <span class="usage-note">(${destination.kind==='company'?'company page — no personal profile on file for this contact':'personal profile'})</span></div></div>`
+    :`<div class="q-hint">No LinkedIn URL on file for this contact or the company yet — you'll need to find them another way.</div>`;
   emailModalBody.innerHTML=`
     <div class="q-hint">Review and edit. There is no separate send step — approving logs this exact text and saves it to the learning library; you paste it into LinkedIn yourself.</div>
+    ${destBlock}
     <textarea class="draft-area" id="liDraftArea">${esc(draft)}</textarea>
     <div id="liCount" class="usage-note"></div>
     <div class="modal-actions"><button class="btn btn-ghost" id="liRegenBtn">Regenerate</button><div class="spacer"></div><span class="usage-note">${tokens}</span></div>
@@ -1098,11 +1109,15 @@ async function approveLinkedIn(){
   try{ await navigator.clipboard.writeText(finalText); }catch{ /* still selectable on screen above */ }
   const url=res.destination&&res.destination.url;
   const safe=url?safeUrl(url):'';
-  const opened=safe?window.open(safe,'_blank','noopener'):null;
+  // window.open always returns null when 'noopener' is passed (per spec — noopener means no
+  // window handle to return), so that return value can never be used to detect a blocked
+  // popup. noopener is still the right security posture, so we keep it and just stop
+  // inferring anything from what it returns: the link below is shown unconditionally.
+  if(safe) window.open(safe,'_blank','noopener');
   emailModalBody.innerHTML=`
     <div class="q-hint">Logged to this prospect's activity and saved to the learning library. The message is on your clipboard.</div>
     ${safe
-      ?`<div class="settings-field"><label>LinkedIn</label><div class="field-val"><a href="${esc(safe)}" target="_blank" rel="noreferrer">${esc(safe)}</a></div>${opened?'':'<div class="hint">The popup was blocked — use the link above.</div>'}</div>`
+      ?`<div class="settings-field"><label>LinkedIn</label><div class="field-val"><a href="${esc(safe)}" target="_blank" rel="noreferrer">${esc(safe)}</a></div><div class="hint">Opening LinkedIn — if nothing happened, use this link.</div></div>`
       :`<div class="q-hint">No LinkedIn URL on file for this contact or the company, so paste the message wherever you reach them.</div>`}
     <div class="modal-actions"><button class="btn" id="liDoneBtn">Done</button></div>`;
   document.getElementById('liDoneBtn').addEventListener('click',()=>{ emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId); });

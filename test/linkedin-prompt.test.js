@@ -53,8 +53,20 @@ test('the prompt forbids a subject line and a signature block', () => {
   assert.match(system, /No signature block/i);
 });
 
-test('an empty LinkedIn library still produces a prompt', () => {
+test('an empty LinkedIn library still produces a prompt, without an APPROVED EXAMPLES header', () => {
   freshDir();
+  const { system } = buildDraftPrompt({ dossier, contact, chosenIssue: null, chosenServices: [] });
+  assert.ok(system.length > 0);
+  assert.ok(!system.includes('APPROVED EXAMPLES'),
+    'day-one state has no exemplars, so the prompt must not claim examples follow');
+  assert.match(system, /No prior approved LinkedIn messages yet/);
+});
+
+test('a populated LinkedIn library still shows the APPROVED EXAMPLES header', () => {
+  freshDir();
+  catalogs.saveApprovedLinkedIn({ company_name: 'Nava PBC', recipient_name: 'Charles Carey',
+    recipient_title: 'GC', recipient_role: 'GC', services: [], first_draft: '',
+    final_text: 'BODY', saved_at: '2026-08-01T00:00:00.000Z' });
   const { system } = buildDraftPrompt({ dossier, contact, chosenIssue: null, chosenServices: [] });
   assert.ok(system.includes('APPROVED EXAMPLES'));
 });

@@ -211,6 +211,17 @@ function saveApprovedLinkedIn(record, existingFile) {
   return fname;
 }
 
+// Read one exemplar by filename, or null. An edit to a logged message knows the new text
+// but not who it went to, so the caller merges rather than overwriting: blanking the
+// recipient and services would erase the identity the record exists to carry and zero the
+// primary ranking signal.
+function readApprovedLinkedIn(filename) {
+  const base = path.basename(String(filename || ''));
+  if (!base.endsWith('.json')) return null;
+  try { return JSON.parse(fs.readFileSync(path.join(dirs.linkedinDir, base), 'utf8')); }
+  catch { return null; }
+}
+
 // The reply library: same shape and save mechanics as the approved-email library above,
 // in its own directory so replies never mix into the outreach exemplar pool.
 function listReplyEmails() {
@@ -261,7 +272,7 @@ function safeRead(p) {
 
 module.exports = {
   init, readFirmFacts, readServices, writeFirmFacts, writeServices,
-  listApprovedEmails, saveApprovedEmail, listApprovedLinkedIn, saveApprovedLinkedIn,
+  listApprovedEmails, saveApprovedEmail, listApprovedLinkedIn, saveApprovedLinkedIn, readApprovedLinkedIn,
   listReplyEmails, saveReplyEmail, listReplyTemplates,
   saveSubjectLine, listSubjectLines,
   dirs: () => dirs

@@ -39,9 +39,13 @@ function buildDraftPrompt({ dossier, contact, chosenIssue, chosenServices, perso
   const approved = catalogs.listApprovedLinkedIn();
 
   const ranked = emailEngine.rankExemplars(approved, chosenServices);
-  const exemplars = ranked.slice(0, 6)
-    .map((e, i) => `EXAMPLE ${i + 1} (to ${e.recipient_name} at ${e.company_name}):\n${e.final_text}`)
-    .join('\n\n---\n\n');
+  const topExemplars = ranked.slice(0, 6);
+  // Day-one state: there are no LinkedIn seeds, so every user starts with an empty library.
+  // Rendering an "APPROVED EXAMPLES" header with nothing under it told the model to match
+  // examples that don't exist; say plainly there are none yet instead.
+  const exemplarsBlock = topExemplars.length
+    ? `APPROVED EXAMPLES (match this voice, structure, and length; do not copy their specific facts):\n${topExemplars.map((e, i) => `EXAMPLE ${i + 1} (to ${e.recipient_name} at ${e.company_name}):\n${e.final_text}`).join('\n\n---\n\n')}`
+    : `No prior approved LinkedIn messages yet. The style rules above govern.`;
 
   const cfg = config.get();
 
@@ -64,8 +68,7 @@ ${firm}
 SERVICE CATALOG (for how each service is pitched):
 ${servicesCatalog}
 
-APPROVED EXAMPLES (match this voice, structure, and length; do not copy their specific facts):
-${exemplars}`;
+${exemplarsBlock}`;
 
   const issueText = chosenIssue && chosenIssue.title
     ? `Lead around this issue: "${chosenIssue.title}". Context: ${chosenIssue.explanation}`

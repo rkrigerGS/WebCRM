@@ -769,9 +769,19 @@ app.patch('/api/prospects/:id/outreach/:entryId', mutating('prospect.outreach.ed
     db.recordEntryExemplar(id, result.entry.id, fname);
     learned = ' — saved to voice library';
   } else if (saveToLibrary && result.entry.channel === 'linkedin') {
+    // An edit knows the corrected text, not who it went to. /linkedin/save binds
+    // exemplar_file at creation time, so this always overwrites that same file in place —
+    // read it first and carry forward the identity and services it already holds; only the
+    // text (and the timestamp) actually changed.
+    const prior = result.entry.exemplar_file ? catalogs.readApprovedLinkedIn(result.entry.exemplar_file) : null;
     const fname = catalogs.saveApprovedLinkedIn({
-      company_name: p.company_name, recipient_name: '', recipient_title: '', recipient_role: '',
-      services: [], first_draft: '', final_text: result.entry.message,
+      company_name: p.company_name,
+      recipient_name: (prior && prior.recipient_name) || '',
+      recipient_title: (prior && prior.recipient_title) || '',
+      recipient_role: (prior && prior.recipient_role) || '',
+      services: (prior && prior.services) || [],
+      first_draft: (prior && prior.first_draft) || '',
+      final_text: result.entry.message,
       saved_at: new Date().toISOString()
     }, result.entry.exemplar_file || null);
     db.recordEntryExemplar(id, result.entry.id, fname);
@@ -946,6 +956,7 @@ app.post('/api/prospects/:id/linkedin/save', mutating('prospect.linkedin.save', 
   const id = +q.params.id;
   const p = db.getProspect(id);
   if (!p) { res.status(404).json({ error: 'not found' }); res.locals.skipAudit = true; return; }
+  if (blockIfExcluded(q, res, id)) return;
   const body = q.body || {};
   const finalText = String(body.finalText || '').trim();
   if (!finalText) {
