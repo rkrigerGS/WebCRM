@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const store = require('./store');
 
 let dirs = null;
+let appDirPath = null;
 
 // The catalogs ship with the app (read-only template) but are copied into user-data on
 // first run so the user's edits and the app's learned additions persist and export.
@@ -30,6 +31,7 @@ function init(userDataDir, appDir) {
 
   const approvedDir = path.join(userDataDir, 'approved-emails');
   fs.mkdirSync(approvedDir, { recursive: true });
+  appDirPath = appDir; // remembered so listApprovedEmails() can lazily seed on first read
 
   // The reply library is completely separate from the outreach library — reply exemplars
   // never mix with cold-outreach exemplars, and Claude draws from each independently (see
@@ -85,6 +87,14 @@ function loadSubjects() {
 function saveSubjects() {
   store.writeJSON(subjectsPath, subjectStore);
 }
+
+// The approved-email library is the voice reference for every draft, so it must reflect
+// Marcos's CURRENT voice rather than averaging every voice he has ever had. 100, not the
+// 200 used for subjects: listApprovedEmails() reads every file on every draft, and at
+// ~1.5KB a record, 200 would mean ~300KB and 200 file opens per generation, growing
+// forever. The prompt uses 6 exemplars ranked by service overlap and the catalog holds 13
+// services, so 100 still leaves 5-8 examples per service.
+const MAX_APPROVED_EMAILS = 100;
 
 // record: { company_name, subject, services, suggested }
 // `suggested` is the generated option the SA picked, when they picked one. It is compared
@@ -152,11 +162,31 @@ function uniqueStamp() {
 // The approved-email library: each approved final email is saved as a small JSON file.
 // These are the style reference the drafting prompt learns the voice from.
 function listApprovedEmails() {
-  const files = fs.readdirSync(dirs.approvedDir).filter(f => f.endsWith('.json'));
+  let files = fs.readdirSync(dirs.approvedDir).filter(f => f.endsWith('.json'));
+  if (files.length === 0) {
+    seedApprovedEmailsIfEmpty();
+    files = fs.readdirSync(dirs.approvedDir).filter(f => f.endsWith('.json'));
+  }
   return files.map(f => {
     try { return JSON.parse(fs.readFileSync(path.join(dirs.approvedDir, f), 'utf8')); }
     catch { return null; }
   }).filter(Boolean);
+}
+
+// Seeds the approved-email library from the shipped starter set the first time it's read
+// and still empty — never on top of a library that already has real sends in it (this run,
+// or a previous one). Lazy rather than done in init(): a save that lands before the first
+// read must not retroactively gain 11 seed exemplars it never asked for. Each seed carries
+// seed: true and an identical saved_at older than any real send, so plain oldest-out
+// eviction in pruneApprovedEmails() retires them first, with no special-case needed.
+function seedApprovedEmailsIfEmpty() {
+  if (!appDirPath) return;
+  const seedDir = path.join(appDirPath, 'seed-approved-emails');
+  if (!fs.existsSync(seedDir)) return;
+  if (fs.readdirSync(dirs.approvedDir).length > 0) return; // already populated since the caller checked
+  for (const f of fs.readdirSync(seedDir)) {
+    if (f.endsWith('.json')) fs.copyFileSync(path.join(seedDir, f), path.join(dirs.approvedDir, f));
+  }
 }
 
 function saveApprovedEmail(record, existingFile) {
@@ -174,7 +204,33 @@ function saveApprovedEmail(record, existingFile) {
     fname = `${uniqueStamp()}_${safe}.json`;
   }
   store.writeJSON(path.join(dirs.approvedDir, fname), record);
+  pruneApprovedEmails();
   return fname;
+}
+
+// Keeps the library at MAX_APPROVED_EMAILS by deleting the oldest exemplars once it grows
+// past the cap. Runs after every successful write, never before, so a failed write can't
+// prune a library it didn't actually grow. A record with a missing or unparseable saved_at
+// sorts as oldest (Date.parse(...) || 0) rather than crashing the sort.
+function pruneApprovedEmails() {
+  const files = fs.readdirSync(dirs.approvedDir).filter(f => f.endsWith('.json'));
+  if (files.length <= MAX_APPROVED_EMAILS) return;
+  const entries = files.map(f => {
+    const full = path.join(dirs.approvedDir, f);
+    let savedAt = 0;
+    try { savedAt = Date.parse(JSON.parse(fs.readFileSync(full, 'utf8')).saved_at) || 0; }
+    catch { savedAt = 0; }
+    return { file: full, savedAt };
+  });
+  entries.sort((a, b) => a.savedAt - b.savedAt);
+  const excess = entries.length - MAX_APPROVED_EMAILS;
+  for (let i = 0; i < excess; i++) {
+    // A file can disappear between this listing and the unlink (another save/prune racing,
+    // an admin poking the directory). Skipping it is right: the alternative is the whole
+    // save throwing and the just-written record disappearing along with it. See backup.js's
+    // walk() for the same reasoning applied to its own directory read.
+    try { fs.unlinkSync(entries[i].file); } catch {}
+  }
 }
 
 // The reply library: same shape and save mechanics as the approved-email library above,
@@ -228,6 +284,6 @@ function safeRead(p) {
 module.exports = {
   init, readFirmFacts, readServices, writeFirmFacts, writeServices,
   listApprovedEmails, saveApprovedEmail, listReplyEmails, saveReplyEmail, listReplyTemplates,
-  saveSubjectLine, listSubjectLines,
+  saveSubjectLine, listSubjectLines, MAX_APPROVED_EMAILS,
   dirs: () => dirs
 };
