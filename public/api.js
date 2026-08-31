@@ -89,6 +89,10 @@ window.api = {
   emailSaveFinal: (id, t, m)  => sendJSON('/api/prospects/' + id + '/saveFinal', 'POST', { finalText: t, meta: m }),
   suggestSubjects: (id, b)    => sendJSON('/api/prospects/' + id + '/subjects', 'POST', b),
 
+  linkedinQuestions: (id)     => getJSON('/api/prospects/' + id + '/linkedin/questions'),
+  linkedinGenerate:  (id, a)  => sendJSON('/api/prospects/' + id + '/linkedin/generate', 'POST', a),
+  linkedinSave:      (id, b)  => sendJSON('/api/prospects/' + id + '/linkedin/save', 'POST', b),
+
   getConfig:      ()          => getJSON('/api/config'),
   setApiKey:      (key)       => sendJSON('/api/config/key', 'POST', { key }),
   updateConfig:   (patch)     => sendJSON('/api/config', 'POST', patch),

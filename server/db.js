@@ -366,8 +366,9 @@ function logExternal(id, { channel, text, loggedAt }) {
   const date = (loggedAt && /^\d{4}-\d{2}-\d{2}$/.test(loggedAt) && loggedAt <= today) ? loggedAt : today;
   // id + channel + message are stored on the entry (not just the truncated display `text`)
   // so the outreach can be reopened and its full message edited later — see editOutreachEntry.
+  const entryId = crypto.randomBytes(8).toString('hex');
   appendActivity(p, {
-    id: crypto.randomBytes(8).toString('hex'), date, channel, message: text,
+    id: entryId, date, channel, message: text,
     text: `Outreach via ${channel}: ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}`
   });
   p.status = 'sent';
@@ -382,7 +383,7 @@ function logExternal(id, { channel, text, loggedAt }) {
   if (channel === 'email' && !p.final_sent) p.final_sent = text;
   p.updated_at = new Date().toISOString();
   save();
-  return { ok: true, channel };
+  return { ok: true, channel, entryId };
 }
 
 // Add or correct the full message on a previously-logged outreach entry. `entryId` is either

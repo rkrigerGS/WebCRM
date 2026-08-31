@@ -37,10 +37,13 @@ function init(userDataDir, appDir) {
   const replyDir = path.join(userDataDir, 'reply-emails');
   fs.mkdirSync(replyDir, { recursive: true });
 
+  const linkedinDir = path.join(userDataDir, 'approved-linkedin');
+  fs.mkdirSync(linkedinDir, { recursive: true });
+
   templatesPath = path.join(userDataDir, 'reply-templates.json');
   loadTemplates();
 
-  dirs = { userCatalogs, approvedDir, replyDir };
+  dirs = { userCatalogs, approvedDir, replyDir, linkedinDir };
   return dirs;
 }
 
@@ -58,13 +61,18 @@ function saveTemplates() {
 }
 const MAX_TEMPLATES = 300;
 
-// The approved-email library is the voice reference for every draft, so it must reflect
-// Marcos's CURRENT voice rather than averaging every voice he has ever had. 100, not the
-// 200 used for subjects: listApprovedEmails() reads every file on every draft, and at
-// ~1.5KB a record, 200 would mean ~300KB and 200 file opens per generation, growing
-// forever. The prompt uses 6 exemplars ranked by service overlap and the catalog holds 13
-// services, so 100 still leaves 5-8 examples per service.
-const MAX_APPROVED_EMAILS = 100;
+// Per voice library — email and LinkedIn each cap here independently, so a busy channel
+// can never evict the other's history. A library is the voice reference for every draft,
+// so it must reflect Marcos's CURRENT voice rather than averaging every voice he has ever
+// had. 100 because list*() reads every file on every draft: at ~1.5KB a record, 200 would
+// mean ~300KB and 200 file opens per generation, growing forever. The prompt uses 6
+// exemplars ranked by service overlap and the catalog holds 13 services, so 100 still
+// leaves 5-8 examples per service.
+//
+// This cap governs the VOICE LIBRARIES only. The services catalog, the firm-and-people
+// facts and the prospect dossiers are never pruned — they grow until someone deletes
+// them by hand, deliberately.
+const MAX_LIBRARY_RECORDS = 100;
 
 function readFirmFacts() {
   return safeRead(path.join(dirs.userCatalogs, 'firm-and-people.md'));
@@ -117,26 +125,28 @@ function saveApprovedEmail(record, existingFile) {
     fname = `${uniqueStamp()}_${safe}.json`;
   }
   store.writeJSON(path.join(dirs.approvedDir, fname), record);
-  pruneApprovedEmails();
+  pruneLibrary(dirs.approvedDir);
   return fname;
 }
 
-// Keeps the library at MAX_APPROVED_EMAILS by deleting the oldest exemplars once it grows
-// past the cap. Runs after every successful write, never before, so a failed write can't
-// prune a library it didn't actually grow. A record with a missing or unparseable saved_at
-// sorts as oldest (Date.parse(...) || 0) rather than crashing the sort.
-function pruneApprovedEmails() {
-  const files = fs.readdirSync(dirs.approvedDir).filter(f => f.endsWith('.json'));
-  if (files.length <= MAX_APPROVED_EMAILS) return;
+// Keeps a voice library at MAX_LIBRARY_RECORDS by deleting its oldest exemplars once it
+// grows past the cap. Takes the directory because BOTH libraries use it — email and
+// LinkedIn cap independently at the same number, so neither one's volume can evict the
+// other's history. Runs after every successful write, never before, so a failed write
+// can't prune a library it didn't actually grow. A record with a missing or unparseable
+// saved_at sorts as oldest (Date.parse(...) || 0) rather than crashing the sort.
+function pruneLibrary(dir) {
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
+  if (files.length <= MAX_LIBRARY_RECORDS) return;
   const entries = files.map(f => {
-    const full = path.join(dirs.approvedDir, f);
+    const full = path.join(dir, f);
     let savedAt = 0;
     try { savedAt = Date.parse(JSON.parse(fs.readFileSync(full, 'utf8')).saved_at) || 0; }
     catch { savedAt = 0; }
     return { file: full, savedAt };
   });
   entries.sort((a, b) => a.savedAt - b.savedAt);
-  const excess = entries.length - MAX_APPROVED_EMAILS;
+  const excess = entries.length - MAX_LIBRARY_RECORDS;
   for (let i = 0; i < excess; i++) {
     // A file can disappear between this listing and the unlink (another save/prune racing,
     // an admin poking the directory). Skipping it is right: the alternative is the whole
@@ -144,6 +154,49 @@ function pruneApprovedEmails() {
     // walk() for the same reasoning applied to its own directory read.
     try { fs.unlinkSync(entries[i].file); } catch {}
   }
+}
+
+// The LinkedIn voice library. Same mechanics as the approved-email library above and
+// deliberately the same shape of code, but a separate directory: a LinkedIn message is
+// shorter, has no subject and no signature block, so mixing the two would teach the
+// drafting prompt a voice that is neither.
+function listApprovedLinkedIn() {
+  const files = fs.readdirSync(dirs.linkedinDir).filter(f => f.endsWith('.json'));
+  return files.map(f => {
+    try { return JSON.parse(fs.readFileSync(path.join(dirs.linkedinDir, f), 'utf8')); }
+    catch { return null; }
+  }).filter(Boolean);
+}
+
+// record: { company_name, recipient_name, recipient_title, recipient_role, services,
+//           first_draft, final_text, saved_at }
+// existingFile (optional): overwrite this exemplar instead of creating a new one, so
+// correcting a logged message does not accumulate duplicates. path.basename guards
+// against traversal even though the value is app-supplied.
+function saveApprovedLinkedIn(record, existingFile) {
+  let fname = null;
+  if (existingFile) {
+    const base = path.basename(String(existingFile));
+    if (base.endsWith('.json')) fname = base;
+  }
+  if (!fname) {
+    const safe = (record.company_name || 'unknown').replace(/[^a-z0-9]+/gi, '_').slice(0, 40);
+    fname = `${uniqueStamp()}_${safe}.json`;
+  }
+  store.writeJSON(path.join(dirs.linkedinDir, fname), record);
+  pruneLibrary(dirs.linkedinDir);
+  return fname;
+}
+
+// Read one exemplar by filename, or null. An edit to a logged message knows the new text
+// but not who it went to, so the caller merges rather than overwriting: blanking the
+// recipient and services would erase the identity the record exists to carry and zero the
+// primary ranking signal.
+function readApprovedLinkedIn(filename) {
+  const base = path.basename(String(filename || ''));
+  if (!base.endsWith('.json')) return null;
+  try { return JSON.parse(fs.readFileSync(path.join(dirs.linkedinDir, base), 'utf8')); }
+  catch { return null; }
 }
 
 // The reply library: same shape and save mechanics as the approved-email library above,
@@ -196,7 +249,8 @@ function safeRead(p) {
 
 module.exports = {
   init, readFirmFacts, readServices, writeFirmFacts, writeServices,
-  listApprovedEmails, saveApprovedEmail, listReplyEmails, saveReplyEmail, listReplyTemplates,
-  MAX_APPROVED_EMAILS,
+  listApprovedEmails, saveApprovedEmail, listApprovedLinkedIn, saveApprovedLinkedIn, readApprovedLinkedIn,
+  listReplyEmails, saveReplyEmail, listReplyTemplates,
+  MAX_LIBRARY_RECORDS,
   dirs: () => dirs
 };

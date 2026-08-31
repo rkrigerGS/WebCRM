@@ -504,10 +504,13 @@ test('no services still produces a valid prompt', () => {
   assert.ok(p.system.length > 0 && p.user.length > 0 && p.model);
 });
 
-test('the prompt never asks for a subject line', () => {
+// Tests the instruction, not the absence of a phrase: the system prompt says "No subject
+// line", so asserting that the string is absent would fail against a correct prompt.
+test('the prompt forbids a subject line and a signature block', () => {
   freshDir();
-  const { system, user } = buildDraftPrompt({ dossier, contact, chosenIssue: null, chosenServices: [] });
-  assert.doesNotMatch(system + user, /subject line/i);
+  const { system } = buildDraftPrompt({ dossier, contact, chosenIssue: null, chosenServices: [] });
+  assert.match(system, /No subject line/i);
+  assert.match(system, /No signature block/i);
 });
 
 test('an empty LinkedIn library still produces a prompt', () => {

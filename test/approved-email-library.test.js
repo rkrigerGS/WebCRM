@@ -42,7 +42,7 @@ test('a record saved without a subject is still stored and still lists', () => {
 
 test('the library is capped and the oldest record is evicted', () => {
   freshDir();
-  for (let i = 0; i < catalogs.MAX_APPROVED_EMAILS + 5; i++) {
+  for (let i = 0; i < catalogs.MAX_LIBRARY_RECORDS + 5; i++) {
     catalogs.saveApprovedEmail(rec({
       company_name: 'C' + i,
       // strictly increasing timestamps so "oldest" is unambiguous
@@ -50,12 +50,12 @@ test('the library is capped and the oldest record is evicted', () => {
     }));
   }
   const all = catalogs.listApprovedEmails();
-  assert.strictEqual(all.length, catalogs.MAX_APPROVED_EMAILS,
-    `library must be capped at ${catalogs.MAX_APPROVED_EMAILS}, got ${all.length}`);
+  assert.strictEqual(all.length, catalogs.MAX_LIBRARY_RECORDS,
+    `library must be capped at ${catalogs.MAX_LIBRARY_RECORDS}, got ${all.length}`);
   // The survivors are the newest ones: C0 is gone, the last one written is present.
   const names = all.map(r => r.company_name);
   assert.ok(!names.includes('C0'), 'the oldest record should have been evicted');
-  assert.ok(names.includes('C' + (catalogs.MAX_APPROVED_EMAILS + 4)), 'the newest must survive');
+  assert.ok(names.includes('C' + (catalogs.MAX_LIBRARY_RECORDS + 4)), 'the newest must survive');
 });
 
 test('older records evict before newer ones, so seeds retire on their own', () => {
@@ -67,7 +67,7 @@ test('older records evict before newer ones, so seeds retire on their own', () =
       saved_at: '2026-06-01T00:00:00.000Z' }));
   }
   assert.strictEqual(catalogs.listApprovedEmails().filter(r => r.seed).length, 11);
-  for (let i = 0; i < catalogs.MAX_APPROVED_EMAILS; i++) {
+  for (let i = 0; i < catalogs.MAX_LIBRARY_RECORDS; i++) {
     catalogs.saveApprovedEmail(rec({ company_name: 'R' + i,
       saved_at: new Date(Date.UTC(2026, 6, 1) + i * 3600000).toISOString() }));
   }
@@ -92,19 +92,19 @@ test('reaching exactly the cap prunes nothing, crossing it by one evicts exactly
   // would pass even if pruning were wildly wrong. Pin the actual boundary behavior
   // instead, at the cap and one past it, where an off-by-one would actually show up.
   freshDir();
-  for (let i = 0; i < catalogs.MAX_APPROVED_EMAILS; i++) {
+  for (let i = 0; i < catalogs.MAX_LIBRARY_RECORDS; i++) {
     catalogs.saveApprovedEmail(rec({
       company_name: 'Z' + i,
       saved_at: new Date(Date.UTC(2026, 0, 1) + i * 86400000).toISOString()
     }));
   }
-  assert.strictEqual(catalogs.listApprovedEmails().length, catalogs.MAX_APPROVED_EMAILS,
+  assert.strictEqual(catalogs.listApprovedEmails().length, catalogs.MAX_LIBRARY_RECORDS,
     'exactly at the cap, nothing should be pruned yet');
 
   catalogs.saveApprovedEmail(rec({ company_name: 'ZOverflow',
-    saved_at: new Date(Date.UTC(2026, 0, 1) + catalogs.MAX_APPROVED_EMAILS * 86400000).toISOString() }));
+    saved_at: new Date(Date.UTC(2026, 0, 1) + catalogs.MAX_LIBRARY_RECORDS * 86400000).toISOString() }));
   const all = catalogs.listApprovedEmails();
-  assert.strictEqual(all.length, catalogs.MAX_APPROVED_EMAILS,
+  assert.strictEqual(all.length, catalogs.MAX_LIBRARY_RECORDS,
     'crossing the cap by one must evict exactly one, not drop below the cap');
   assert.ok(all.some(r => r.company_name === 'ZOverflow'), 'the newest record must survive');
   assert.ok(!all.some(r => r.company_name === 'Z0'), 'the single oldest record must be the one evicted');
@@ -113,11 +113,11 @@ test('reaching exactly the cap prunes nothing, crossing it by one evicts exactly
 test('a record with no saved_at does not break eviction ordering', () => {
   freshDir();
   catalogs.saveApprovedEmail(rec({ company_name: 'NoDate', saved_at: undefined }));
-  for (let i = 0; i < catalogs.MAX_APPROVED_EMAILS + 2; i++) {
+  for (let i = 0; i < catalogs.MAX_LIBRARY_RECORDS + 2; i++) {
     catalogs.saveApprovedEmail(rec({
       company_name: 'Y' + i,
       saved_at: new Date(Date.UTC(2026, 0, 1) + i * 86400000).toISOString()
     }));
   }
-  assert.strictEqual(catalogs.listApprovedEmails().length, catalogs.MAX_APPROVED_EMAILS);
+  assert.strictEqual(catalogs.listApprovedEmails().length, catalogs.MAX_LIBRARY_RECORDS);
 });
