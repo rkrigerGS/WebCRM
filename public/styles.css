@@ -29,6 +29,7 @@
   /* Text on a solid --green fill. --green inverts between themes (dark green in light mode,
      bright green in dark), so a fixed #fff read 2.32:1 on the dark-mode pill. */
   --on-green: #ffffff;
+  --on-red: #ffffff;      /* on --red #c23b3b -> 5.27:1 */
   --line:        #e5e3dc;
   --line-soft:   #efede7;
   --on-dark:     #f5f5f7;
@@ -89,6 +90,7 @@
     --on-gold-soft: #dcc492;
     --on-line-soft: #c7c7cc;
     --on-green: #05371f;
+    --on-red: #1d1d1f;    /* --red inverts to #ff6961 here; #fff on it is 2.82:1, this is 5.97:1 */
     --line:        rgba(255, 255, 255, 0.12);
     --line-soft:   rgba(255, 255, 255, 0.07);
 
@@ -569,4 +571,88 @@ body { overflow-x: hidden; }
   /* Location too (column 4) — company, fit, status and follow-up are what the list is scanned
      for. Header and body cell hidden together, as above. */
   .prospects thead th:nth-child(4), .prospects tbody td:nth-child(4) { display: none; }
+}
+
+/* ============================================================================
+   ui.js dialogs, busy states, and load states
+   Added 2026-09-02 with items 3, 5 and 4b of the hardening pass.
+
+   Item 6 (retiring ~70 inline styles and the 12 ad-hoc font sizes) stays
+   deliberately deferred, but its tokens are DEFINED here because the dialog
+   work had to pick spacing and type values anyway. New code uses these; the
+   existing inline styles are untouched until the dedicated pass. See STATUS.md
+   for the trigger conditions on that pass.
+   ============================================================================ */
+
+:root {
+  /* 4px base. Replaces the ad-hoc 2/3/4/6/8/9/10/12/16/18/20/24px literals. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+
+  /* Five steps, replacing 12 sizes between 10px and 21px. The six half-pixel
+     values in the old set (10.5/11.5/12.5/13.5) are not carried over: they
+     render inconsistently across platforms and were almost certainly copied
+     computed values rather than a deliberate scale. */
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+}
+
+/* ---- ui.js dialogs ---- */
+/* Sit above the app's own modals (z-index 50): a confirm raised FROM a modal
+   must paint over it, which is the bug that made the manual-backup flow
+   unreachable when the dead-pile review opened underneath Settings. */
+.ui-dialog { z-index: 60; }
+.ui-dialog-modal { width: 460px; }
+.ui-dialog-text {
+  display: block; color: var(--text); font-size: var(--text-base);
+  line-height: 1.5; margin-bottom: var(--space-3);
+}
+.ui-dialog-control { width: 100%; box-sizing: border-box; }
+.ui-dialog-other { margin-top: var(--space-2); }
+.ui-dialog-error {
+  margin-top: var(--space-2); color: var(--red); font-size: var(--text-sm);
+}
+/* The generic .modal-actions has margin-top:16px, which double-spaces once it
+   is a sibling of .modal-body rather than nested inside it. */
+.ui-dialog-actions {
+  margin-top: 0; padding: var(--space-3) var(--space-5) var(--space-5);
+  border-top: 1px solid var(--line);
+}
+
+/* ---- Busy primitive (ui.setBusy) ---- */
+/* One spinner, no skeleton system. Applied to a container whose contents are
+   being replaced, so the user sees motion instead of an empty box. */
+[data-busy="true"] {
+  position: relative; min-height: 72px;
+  pointer-events: none;
+}
+[data-busy="true"]::after {
+  content: ""; position: absolute; top: 50%; left: 50%;
+  width: 22px; height: 22px; margin: -11px 0 0 -11px;
+  border: 2px solid var(--line); border-top-color: var(--gold-deep);
+  border-radius: var(--radius-full);
+  animation: uiSpin 700ms linear infinite;
+}
+@keyframes uiSpin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  [data-busy="true"]::after { animation-duration: 2.4s; }
+}
+
+/* ---- Failed-load panel (item 4b) ---- */
+/* Shown by loadProspects() in place of the empty-state headline, which would
+   otherwise read as "you have no prospects" when the request simply failed. */
+.ui-error-panel {
+  padding: var(--space-5); text-align: center; color: var(--text-soft);
+  font-size: var(--text-base);
+}
+.ui-error-panel .ui-error-detail {
+  display: block; margin: var(--space-2) 0 var(--space-3);
+  font-size: var(--text-sm); color: var(--text-faint);
 }

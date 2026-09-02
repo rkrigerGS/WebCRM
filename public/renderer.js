@@ -14,12 +14,60 @@ const detailPane = document.getElementById('detailPane');
 const bulkBar    = document.getElementById('bulkBar');
 const tableWrap  = document.querySelector('.table-wrap');
 
+// ---- Shared modal lifecycle (item 5 of the 2026-09-02 hardening pass) ----
+// The five modals in index.html were plain `hidden` toggles: no role="dialog", no
+// aria-modal, no aria-labelledby, and nothing moved or restored focus. A keyboard user
+// opening Settings kept their focus back on the page behind it, and could Tab straight
+// into the greyed-out app underneath. These two helpers put every modal on the same
+// lifecycle as ui.js's own dialogs rather than duplicating the behaviour per modal.
+//
+// Escape closes whichever modal is open. Each modal's own Close button already runs its
+// own teardown (some clear .modal-wide, some reload the list), so Escape routes to that
+// button when there is one instead of bypassing it.
+const MODAL_CLOSE_BUTTONS={emailModal:'emailModalClose',settingsModal:'settingsClose',usersModal:'usersClose',auditModal:'auditClose',replyModal:'replyModalClose'};
+function showModal(el){
+  window.ui.openDialog(el,{onEscape:()=>{
+    const btnId=MODAL_CLOSE_BUTTONS[el.id];
+    const btn=btnId&&document.getElementById(btnId);
+    if(btn)btn.click(); else hideModal(el);
+  }});
+}
+function hideModal(el){ window.ui.closeDialog(el); }
+
 const STATUS_LABELS={new:'Not contacted',sent:'Awaiting reply',replied:'Replied',signed:'Signed',dead:'Dead',dormant:'Dormant'};
 function statusLabel(s){return STATUS_LABELS[s]||s;}
 // Asked from four places (detail pane, reply review, dead-pile review, bulk bar); kept
 // here so the wording can't drift apart again.
 const DEAD_REASON_PROMPT='Why is this prospect dead? (optional — helps the backup review later)';
 const DEAD_REASON_PROMPT_BULK='Why are these prospects dead? (optional — applies to all selected, helps the backup review later)';
+// A fixed list, not free text. The reason exists to be read back during the dead-pile
+// review, and free-typed reasons cannot be counted or grouped — which quietly defeated the
+// point of collecting them. "Other" still allows anything, so nothing is lost; it just
+// stops being the default path. Wording is deliberately outcome-based so two people
+// looking at the same situation pick the same row.
+const DEAD_REASONS=[
+  'Not a fit for our services',
+  'No budget',
+  'Already has counsel',
+  'Unresponsive after multiple attempts',
+  'Could not reach a decision maker',
+  'Company no longer active',
+  'Asked not to be contacted',
+  'Duplicate of another prospect'
+];
+// One helper for all four callers so the wording and the option list cannot drift apart.
+// Returns null when cancelled and '' when the user chose "(no reason given)", preserving
+// the window.prompt semantics every caller was written against.
+function askDeadReason(bulk){
+  return window.ui.prompt(bulk?DEAD_REASON_PROMPT_BULK:DEAD_REASON_PROMPT,{
+    title:bulk?'Mark prospects dead':'Mark prospect dead',
+    choices:DEAD_REASONS,
+    emptyLabel:'(no reason given)',
+    otherLabel:'Other (type it below)',
+    otherPlaceholder:'Why is this one dead?',
+    okLabel:'Mark dead'
+  });
+}
 // Quotes matter as much as angle brackets here: esc() is used inside quoted HTML
 // attributes in several places, and some of those values come from outside the team — the
 // From: header of an inbound email, uploaded dossier JSON — so an unescaped " would close
@@ -222,12 +270,41 @@ function fillSelect(id,values){
   if(values.includes(cur))sel.value=cur;
 }
 
+// A failed load previously threw out of here unhandled, leaving the table empty with no
+// message — which reads as "you have no prospects", a state someone may act on. Now the
+// failure is stated, with a retry that re-runs the same path.
+let listLoadSeq=0;
 async function loadProspects(){
-  allProspects=await window.api.listProspects();
-  // enrich each with its dossier for filtering (list endpoint returns topline; fetch dossiers lazily is heavy,
-  // so we ask the main process for full rows including dossier via getProspect only when needed).
-  await refreshCountsAndFilters();
-  renderList();
+  const seq=++listLoadSeq;
+  const errEl=document.getElementById('listError');
+  const errDetail=document.getElementById('listErrorDetail');
+  window.ui.setBusy(tableWrap,true);
+  try{
+    allProspects=await window.api.listProspects();
+    // enrich each with its dossier for filtering (list endpoint returns topline; fetch dossiers lazily is heavy,
+    // so we ask the main process for full rows including dossier via getProspect only when needed).
+    await refreshCountsAndFilters();
+    if(seq!==listLoadSeq)return; // a newer load already owns the table
+    errEl.hidden=true;
+    renderList();
+  }catch(e){
+    if(seq!==listLoadSeq)return;
+    // Leave the empty-state headline out of it: this is a failure, not an empty list.
+    emptyEl.hidden=true;
+    // The rows from the last good load stay on screen — a transient failure should not
+    // blank the list someone is working from. But then "Could not load prospects" sits
+    // directly above a visible list of prospects and reads as a contradiction, so say
+    // which case this actually is.
+    const stale=document.querySelectorAll('#rows tr').length>0;
+    document.getElementById('listErrorTitle').textContent=stale
+      ? 'Could not refresh — showing the last loaded list'
+      : 'Could not load prospects';
+    errDetail.textContent=e.message||String(e);
+    errEl.hidden=false;
+    window.ui.toast((stale?'Could not refresh: ':'Could not load prospects: ')+(e.message||e),{variant:'error'});
+  }finally{
+    if(seq===listLoadSeq)window.ui.setBusy(tableWrap,false);
+  }
 }
 
 // ---- Detail pane ----
@@ -405,7 +482,10 @@ async function openDetail(id){
     if(!newStatus)return;
     const prevStatus=p.status;
     if(newStatus==='dead'){
-      const reason=window.prompt(DEAD_REASON_PROMPT);
+      const reason=await askDeadReason(false);
+      // Cancel/Escape aborts the status change entirely and puts the dropdown back.
+      // Choosing "(no reason given)" returns '' and still marks dead.
+      if(reason===null){ e.target.value=prevStatus; return; }
       if(reason&&reason.trim()){
         try{ await window.api.addNote(id,reason.trim()); }
         catch(err){ toast('The reason note could not be saved: '+err.message,6000); }
@@ -428,7 +508,7 @@ async function openDetail(id){
     catch(err){ e.target.value=prev; toast('Follow-up gap not saved: '+err.message,6000); }
   });
   document.getElementById('deleteBtn').addEventListener('click',async()=>{
-    if(!confirm(`Delete ${d.company_name||p.company_name||'this prospect'}? This removes it entirely.`))return;
+    if(!await window.ui.confirm(`Delete ${d.company_name||p.company_name||'this prospect'}? This removes it entirely.`,{title:'Delete prospect',confirmLabel:'Delete',danger:true}))return;
     try{ await window.api.deleteProspect(id); }
     catch(err){ toast('Not deleted: '+err.message,6000); return; }
     // setFullScreen(false) matters here: deleting while full-screen hid the pane but left the
@@ -446,7 +526,7 @@ const emailModalTitle=document.getElementById('emailModalTitle');
 
 function openLogExternal(id){
   emailModalTitle.textContent='Log outreach sent elsewhere';
-  emailModal.hidden=false;
+  showModal(emailModal);
   // Match the app's America/New_York convention (server uses todayNY); a plain
   // toISOString() would roll to tomorrow's date on any evening in ET. max caps the picker
   // at today since this field is for recording outreach that already happened.
@@ -471,7 +551,7 @@ function openLogExternal(id){
     btn.disabled=true;
     try{ await window.api.logExternal(id,{channel,text,loggedAt}); }
     catch(err){ btn.disabled=false; toast('Outreach not logged: '+err.message,6000); return; }
-    emailModal.hidden=true; loadProspects(); openDetail(id);
+    hideModal(emailModal); loadProspects(); openDetail(id);
   });
 }
 
@@ -483,7 +563,7 @@ function openOutreachEdit(id,o){
   // message text to learn a voice from), so the checkbox stays hidden for it.
   const canLearn=o.channel==='email'||o.channel==='linkedin';
   emailModalTitle.textContent='Outreach details';
-  emailModal.hidden=false;
+  showModal(emailModal);
   emailModalBody.innerHTML=`
     <div class="q-hint">${esc(o.date)} · <span style="text-transform:capitalize;">${esc(o.channel)}</span>. Add or correct the message that was actually sent${canLearn?", so it's recorded and Marcos's voice library can learn from it":''}.</div>
     <div class="settings-field"><label>Message</label>
@@ -499,7 +579,7 @@ function openOutreachEdit(id,o){
     btn.disabled=true;
     try{ await window.api.editOutreach(id,o.entryId,{text,saveToLibrary}); }
     catch(err){ btn.disabled=false; toast('Not saved: '+err.message,6000); return; }
-    emailModal.hidden=true; loadProspects(); openDetail(id);
+    hideModal(emailModal); loadProspects(); openDetail(id);
     toast(saveToLibrary?'Message saved and added to the voice library':'Message saved',4000);
   });
 }
@@ -508,7 +588,7 @@ function openOutreachEdit(id,o){
 // change). Outreach entries go to openOutreachEdit instead, since those are editable.
 function openLogEntryView(e){
   emailModalTitle.textContent=e.type==='status'?'Status change':'Log entry';
-  emailModal.hidden=false;
+  showModal(emailModal);
   // Status entries show the friendly label ("Status → Awaiting reply") to match the log row,
   // rather than the raw stored status text; notes/sends show their full text verbatim.
   const body=e.type==='status'?(e.preview||e.text||''):(e.text||e.preview||'');
@@ -516,12 +596,12 @@ function openLogEntryView(e){
     <div class="q-hint">${esc(e.date||'')}</div>
     <div class="prose" style="white-space:pre-wrap;">${esc(body)}</div>
     <div class="modal-actions"><button class="btn" id="leClose">Close</button></div>`;
-  document.getElementById('leClose').addEventListener('click',()=>{emailModal.hidden=true;});
+  document.getElementById('leClose').addEventListener('click',()=>{hideModal(emailModal);});
 }
 
 function openNote(id){
   emailModalTitle.textContent='Add note';
-  emailModal.hidden=false;
+  showModal(emailModal);
   emailModalBody.innerHTML=`
     <div class="settings-field"><label>Note</label>
       <textarea id="noteText" class="draft-area" style="min-height:120px;" placeholder="e.g. Spoke with Gary, interested but busy until September."></textarea></div>
@@ -534,13 +614,13 @@ function openNote(id){
     btn.disabled=true;
     try{ await window.api.addNote(id,text); }
     catch(err){ btn.disabled=false; toast('Note not saved: '+err.message,6000); return; }
-    emailModal.hidden=true; openDetail(id);
+    hideModal(emailModal); openDetail(id);
   });
 }
 
 function openEditContact(id,c){
   emailModalTitle.textContent='Edit contact details';
-  emailModal.hidden=false;
+  showModal(emailModal);
   const f=(k,v)=>`<div class="settings-field"><label>${k}</label><input class="field-input" id="ec_${k}" value="${esc(v||'')}"></div>`;
   emailModalBody.innerHTML=`${f('website',c.website)}${f('email',c.email)}${f('phone',c.phone)}${f('linkedin',c.linkedin)}
     <div class="modal-actions"><button class="btn" id="ecSave">Save</button></div>`;
@@ -551,7 +631,7 @@ function openEditContact(id,c){
     const patch={website:val('ec_website'),email:val('ec_email'),phone:val('ec_phone'),linkedin:val('ec_linkedin')};
     try{ await window.api.editContact(id,patch); }
     catch(err){ btn.disabled=false; toast('Contact not saved: '+err.message,6000); return; }
-    emailModal.hidden=true; openDetail(id);
+    hideModal(emailModal); openDetail(id);
   });
   function val(x){return document.getElementById(x).value.trim();}
 }
@@ -570,10 +650,10 @@ async function startBackupFlow(){
   openDeadPileReview(deadList);
 }
 function triggerBackupDownload(){
-  settingsModal.hidden=true;
+  hideModal(settingsModal);
   // The dead-pile review borrows the email modal and widens it; leaving it open (and wide)
   // after the download meant the next flow to use that modal opened at the wrong size.
-  emailModal.hidden=true;
+  hideModal(emailModal);
   const shell=emailModal.querySelector('.modal');
   if(shell)shell.classList.remove('modal-wide');
   window.location.href='/api/admin/backup/download';
@@ -583,8 +663,8 @@ function openDeadPileReview(list){
   // Settings must close first. Both modals are fixed, inset:0, z-index:50, and the Settings
   // backdrop comes later in the DOM — so leaving it open painted it on top of this review and
   // swallowed every click, making the manual backup unreachable whenever a prospect was dead.
-  settingsModal.hidden=true;
-  emailModal.hidden=false;
+  hideModal(settingsModal);
+  showModal(emailModal);
   emailModal.querySelector('.modal').classList.add('modal-wide');
   const decided=new Set();
   function renderRows(){
@@ -629,7 +709,7 @@ function openDeadPileReview(list){
 const replyModal=document.getElementById('replyModal');
 const replyModalBody=document.getElementById('replyModalBody');
 const replyModalTitle=document.getElementById('replyModalTitle');
-document.getElementById('replyModalClose').addEventListener('click',()=>replyModal.hidden=true);
+document.getElementById('replyModalClose').addEventListener('click',()=>hideModal(replyModal));
 
 function parseEmailAddress(raw){ const m=(raw||'').match(/<([^>]+)>/); return m?m[1]:(raw||'').trim(); }
 
@@ -637,13 +717,13 @@ function parseEmailAddress(raw){ const m=(raw||'').match(/<([^>]+)>/); return m?
 let replySeq=0;
 async function openReplyReview(id){
   const seq=++replySeq;
-  replyModal.hidden=false;
+  showModal(replyModal);
   replyModalBody.innerHTML='<div class="gen-status">Loading…</div>';
   let p;
   try{ p=await window.api.getProspect(id); }
   catch(e){ if(seq!==replySeq)return; replyModalBody.innerHTML=errorBlock('Could not load this prospect: '+e.message); return; }
   if(seq!==replySeq)return;
-  if(!p){replyModal.hidden=true;return;}
+  if(!p){hideModal(replyModal);return;}
   const d=p.dossier||{};
   const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
   const [ctx,templates]=await Promise.all([
@@ -714,8 +794,8 @@ async function openReplyReview(id){
     try{
       const res=await window.api.generateReply(id,{instruction:instrEl.value.trim(),seedDraft:document.getElementById('replyDraftArea').value.trim(),replyText:ctx.replyText||p.last_reply_snippet||''});
       if(res.ok)document.getElementById('replyDraftArea').value=res.draft;
-      else alert('Could not draft: '+res.error);
-    }catch(e){alert(e.message);}
+      else window.ui.toast('Could not draft: '+res.error,{variant:'error'});
+    }catch(e){window.ui.toast(e.message,{variant:'error'});}
     btn2.disabled=false; btn2.textContent=orig;
   });
   document.getElementById('replySendBtn').addEventListener('click',async()=>{
@@ -729,7 +809,7 @@ async function openReplyReview(id){
     sendBtn.disabled=true; sendBtn.textContent='Sending…';
     try{
       await window.api.sendReply(id,{finalText,to,subject,saveToLibrary});
-      replyModal.hidden=true; loadProspects();
+      hideModal(replyModal); loadProspects();
       toast(`Reply sent to ${d.company_name||p.company_name}`);
     }catch(e){
       sendBtn.disabled=false; sendBtn.textContent=origLabel;
@@ -746,7 +826,7 @@ async function openReplyReview(id){
     // as if the move had taken.
     try{ await window.api.updateProspect(id,{status:'replied'}); }
     catch(err){ btn.disabled=false; toast('Status not changed: '+err.message,6000); return; }
-    replyModal.hidden=true; loadProspects();
+    hideModal(replyModal); loadProspects();
     toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('replied')}`,async()=>{
       try{ await window.api.updateProspect(id,{status:prevStatus}); }
       catch(err){ toast('Could not undo: '+err.message,6000); return; }
@@ -755,23 +835,35 @@ async function openReplyReview(id){
   });
   const dormantBtn=document.getElementById('replyMarkDormantBtn');
   if(dormantBtn)dormantBtn.addEventListener('click',async()=>{
-    const returnDate=window.prompt('Return date (YYYY-MM-DD):');
+    // A date input, not a text box: window.prompt returned arbitrary text that the
+    // server then had to parse loosely. This yields an ISO value or nothing, and the
+    // min bound stops a return date in the past, which was previously accepted.
+    const returnDate=await window.ui.prompt('When should this prospect come back into the follow-up queue?',{
+      title:'Mark dormant',
+      type:'date',
+      min:new Date(Date.now()+86400000).toISOString().slice(0,10),
+      required:true,
+      requiredMessage:'Pick a return date.',
+      okLabel:'Mark dormant',
+      validate:(v)=>/^\d{4}-\d{2}-\d{2}$/.test(v)?null:'Use the date picker to choose a day.'
+    });
     if(!returnDate)return;
     try{
       await window.api.setDormant(id,returnDate);
-      replyModal.hidden=true; loadProspects();
+      hideModal(replyModal); loadProspects();
       toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('dormant')}`,async()=>{
         try{ await window.api.updateProspect(id,{status:p.status}); }
         catch(err){ toast('Could not undo: '+err.message,6000); return; }
         loadProspects();
       });
-    }catch(e){alert(e.message);}
+    }catch(e){window.ui.toast(e.message,{variant:'error'});}
   });
   document.getElementById('replyMarkDeadBtn').addEventListener('click',async(e)=>{
     const btn=e.currentTarget;
     if(btn.disabled)return;
     btn.disabled=true;
-    const reason=window.prompt(DEAD_REASON_PROMPT);
+    const reason=await askDeadReason(false);
+    if(reason===null){ btn.disabled=false; return; } // cancelled: nothing changes
     if(reason&&reason.trim()){
       try{ await window.api.addNote(id,reason.trim()); }
       catch(err){ toast('The reason note could not be saved: '+err.message,6000); }
@@ -779,7 +871,7 @@ async function openReplyReview(id){
     const prevStatus=p.status;
     try{ await window.api.updateProspect(id,{status:'dead'}); }
     catch(err){ btn.disabled=false; toast('Status not changed: '+err.message,6000); return; }
-    replyModal.hidden=true; loadProspects();
+    hideModal(replyModal); loadProspects();
     toastUndo(`${d.company_name||p.company_name} moved to ${statusLabel('dead')}`,async()=>{
       try{ await window.api.updateProspect(id,{status:prevStatus}); }
       catch(err){ toast('Could not undo: '+err.message,6000); return; }
@@ -790,20 +882,46 @@ async function openReplyReview(id){
 
 // ---- Email generation flow ----
 let flowState=null;
+// Monotonic guard for the draft flows, same pattern as replySeq above. Without it these
+// were a DATA-CORRECTNESS bug, not a cosmetic one: openEmailFlow sets flowState
+// synchronously and then awaits the questions fetch, so opening prospect A, closing it, and
+// opening prospect B while A's fetch was still in flight left A's questions rendered into
+// the modal while flowState.prospectId had already become B. The answers the SA then
+// picked were submitted against B's id — wrong prospect, wrong record, and an email
+// composed from the wrong research. Every await below re-checks that this call is still
+// the current one and drops its response if it has been superseded.
+let flowSeq=0;
 async function openEmailFlow(prospectId,dossier,isFollowup){
+  const seq=++flowSeq;
   flowState={prospectId,dossier,isFollowup,issueId:null,services:[],personalNote:null,slots:[],selectedSlots:[]};
   emailModalTitle.textContent=isFollowup?'Draft follow-up':'Generate email';
-  emailModal.hidden=false;
+  showModal(emailModal);
+  // Open in a busy state rather than leaving the previous prospect's content on screen
+  // while the fetches run (item 4b).
+  emailModalBody.innerHTML='';
+  window.ui.setBusy(emailModalBody,true);
   let cfg;
   try{ cfg=await window.api.getConfig(); }
-  catch(e){ emailModalBody.innerHTML=errorBlock('Could not load settings: '+e.message); return; }
+  catch(e){ if(seq!==flowSeq)return; window.ui.setBusy(emailModalBody,false); emailModalBody.innerHTML=errorBlock('Could not load settings: '+e.message); return; }
+  if(seq!==flowSeq)return;
   if(!cfg.hasApiKey){
+    window.ui.setBusy(emailModalBody,false);
     emailModalBody.innerHTML=`<div class="error-note">No Anthropic API key is set. Add it in Settings to generate drafts.</div><div class="modal-actions"><button class="btn" id="goSettings">Open Settings</button></div>`;
-    document.getElementById('goSettings').addEventListener('click',()=>{emailModal.hidden=true;openSettings();});
+    document.getElementById('goSettings').addEventListener('click',()=>{hideModal(emailModal);openSettings();});
     return;
   }
-  if(isFollowup){ runGeneration(); return; }
-  const [q,avail]=await Promise.all([window.api.emailQuestions(prospectId),window.api.calendarAvailability().catch(()=>({connected:false,failed:true,slots:[]}))]);
+  if(isFollowup){ window.ui.setBusy(emailModalBody,false); runGeneration(); return; }
+  let q,avail;
+  try{
+    [q,avail]=await Promise.all([window.api.emailQuestions(prospectId),window.api.calendarAvailability().catch(()=>({connected:false,failed:true,slots:[]}))]);
+  }catch(e){
+    if(seq!==flowSeq)return;
+    window.ui.setBusy(emailModalBody,false);
+    emailModalBody.innerHTML=errorBlock('Could not load the draft questions: '+e.message);
+    return;
+  }
+  if(seq!==flowSeq)return;
+  window.ui.setBusy(emailModalBody,false);
   flowState.slots=avail.connected?avail.slots:[];
   flowState.calendarConnected=avail.connected;
   // A real lookup failure must not read as "Calendar isn't set up" — that sent an admin to
@@ -990,8 +1108,17 @@ async function renderDraft(draft,usage){
       // Absent stays absent: an unpicked subject must omit the key rather than send ''.
       if(pickedSubject)finalMeta.suggestedSubject=pickedSubject;
       await window.api.emailSaveFinal(flowState.prospectId,finalText,finalMeta);
-      emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId);
+      hideModal(emailModal); loadProspects(); openDetail(flowState.prospectId);
     }catch(e){
+      // The email already went out; only the record write was lost. Re-arming Send here
+      // would contradict the message and invite a pointless second attempt (which just
+      // 404s, since the prospect is gone).
+      if(e.sentButUnrecorded){
+        btn.textContent='Already sent';
+        errEl.textContent=e.message; errEl.hidden=false;
+        loadProspects();
+        return;
+      }
       btn.disabled=false; btn.textContent=originalLabel;
       if(e.exclusion){ renderExclusionBlock(errEl,e.exclusion,flowState.prospectId,()=>document.getElementById('saveFinalBtn').click()); return; }
       errEl.textContent=e.message; errEl.hidden=false;
@@ -1008,20 +1135,30 @@ async function renderDraft(draft,usage){
 // then touches the clipboard or a new tab, so a blocked popup or a denied clipboard
 // permission can never cost a logged outreach.
 async function openLinkedInFlow(prospectId,dossier){
+  // Shares flowSeq with openEmailFlow deliberately: both render into the same modal and
+  // set the same flowState, so switching between an email draft and a LinkedIn draft is
+  // exactly the race the counter has to catch.
+  const seq=++flowSeq;
   flowState={prospectId,dossier,contactIndex:null,issueId:null,services:[],personalNote:null,firstDraft:null};
   emailModalTitle.textContent='LinkedIn message';
-  emailModal.hidden=false;
+  showModal(emailModal);
+  emailModalBody.innerHTML='';
+  window.ui.setBusy(emailModalBody,true);
   let cfg;
   try{ cfg=await window.api.getConfig(); }
-  catch(e){ emailModalBody.innerHTML=errorBlock('Could not load settings: '+e.message); return; }
+  catch(e){ if(seq!==flowSeq)return; window.ui.setBusy(emailModalBody,false); emailModalBody.innerHTML=errorBlock('Could not load settings: '+e.message); return; }
+  if(seq!==flowSeq)return;
   if(!cfg.hasApiKey){
+    window.ui.setBusy(emailModalBody,false);
     emailModalBody.innerHTML=`<div class="error-note">No Anthropic API key is set. Add it in Settings to generate drafts.</div><div class="modal-actions"><button class="btn" id="goSettings">Open Settings</button></div>`;
-    document.getElementById('goSettings').addEventListener('click',()=>{emailModal.hidden=true;openSettings();});
+    document.getElementById('goSettings').addEventListener('click',()=>{hideModal(emailModal);openSettings();});
     return;
   }
   let q;
   try{ q=await window.api.linkedinQuestions(prospectId); }
-  catch(e){ emailModalBody.innerHTML=errorBlock('Could not load decision-makers: '+e.message); return; }
+  catch(e){ if(seq!==flowSeq)return; window.ui.setBusy(emailModalBody,false); emailModalBody.innerHTML=errorBlock('Could not load decision-makers: '+e.message); return; }
+  if(seq!==flowSeq)return;
+  window.ui.setBusy(emailModalBody,false);
   const contacts=Array.isArray(q.contacts)?q.contacts:[];
   // The entry button is disabled whenever the dossier has no contacts, but a dossier can be
   // edited out from under an already-open modal, so this stays a real check, not decoration.
@@ -1142,19 +1279,34 @@ async function approveLinkedIn(){
       ?`<div class="settings-field"><label>LinkedIn</label><div class="field-val"><a href="${esc(safe)}" target="_blank" rel="noreferrer">${esc(safe)}</a></div><div class="hint">Opening LinkedIn — if nothing happened, use this link.</div></div>`
       :`<div class="q-hint">No LinkedIn URL on file for this contact or the company, so paste the message wherever you reach them.</div>`}
     <div class="modal-actions"><button class="btn" id="liDoneBtn">Done</button></div>`;
-  document.getElementById('liDoneBtn').addEventListener('click',()=>{ emailModal.hidden=true; loadProspects(); openDetail(flowState.prospectId); });
+  document.getElementById('liDoneBtn').addEventListener('click',()=>{ hideModal(emailModal); loadProspects(); openDetail(flowState.prospectId); });
   toast(safe?'Logged and copied. Paste it into LinkedIn and send.':'Logged and copied. No LinkedIn URL on file, so paste it wherever you reach them.',6000);
 }
 
-document.getElementById('emailModalClose').addEventListener('click',()=>{emailModal.hidden=true;emailModal.querySelector('.modal').classList.remove('modal-wide');});
+document.getElementById('emailModalClose').addEventListener('click',()=>{hideModal(emailModal);emailModal.querySelector('.modal').classList.remove('modal-wide');});
 
 // ---- Settings ----
 const settingsModal=document.getElementById('settingsModal');
 const settingsBody=document.getElementById('settingsBody');
+// Opens the shell first and fills it, rather than awaiting three requests before anything
+// appears: on a slow connection clicking Settings previously did nothing visible for
+// seconds. The sequence guard is the same pattern as the draft flows — less damaging here
+// (nothing is written), but a superseded response must still not paint over a newer one.
+let settingsSeq=0;
 async function openSettings(){
+  const seq=++settingsSeq;
+  showModal(settingsModal);
+  settingsBody.innerHTML='';
+  window.ui.setBusy(settingsBody,true);
   let cfg;
   try{ cfg=await window.api.getConfig(); }
-  catch(e){ toast('Could not open Settings: '+e.message,6000); return; }
+  catch(e){
+    if(seq!==settingsSeq)return;
+    window.ui.setBusy(settingsBody,false);
+    settingsBody.innerHTML=errorBlock('Could not open Settings: '+e.message);
+    return;
+  }
+  if(seq!==settingsSeq)return;
   const isAdmin=window.__currentUser&&window.__currentUser.role==='admin';
   let gmailStatus={connected:false,email:'',hasCreds:false};
   let digestCandidates=[];
@@ -1162,8 +1314,9 @@ async function openSettings(){
     try{ gmailStatus=await window.api.getGmailAdminStatus(); }catch{}
     try{ digestCandidates=(await window.api.listUsers()).filter(u=>u.active&&u.email); }catch{}
   }
+  if(seq!==settingsSeq)return;
+  window.ui.setBusy(settingsBody,false);
 
-  settingsModal.hidden=false;
   // Everything in this modal is an app-wide setting — the shared API key, the folder the
   // server watches, the default follow-up gap. The server rejects these writes from a
   // non-admin, so non-admins get a short explanation instead of controls that would fail.
@@ -1255,7 +1408,7 @@ async function openSettings(){
     if(keyEl&&keyEl.value.trim())await window.api.setApiKey(keyEl.value.trim());
     const days=daysEl?parseInt(daysEl.value,10):NaN;
     if(days)await window.api.updateConfig({defaultFollowupDays:days});
-    settingsModal.hidden=true;
+    hideModal(settingsModal);
   });
 
   if(isAdmin){
@@ -1263,7 +1416,7 @@ async function openSettings(){
     if(connectBtn)connectBtn.addEventListener('click',()=>{ window.location.href='/api/admin/gmail/connect'; });
     const disconnectBtn=document.getElementById('gmailDisconnectBtn');
     if(disconnectBtn)disconnectBtn.addEventListener('click',async()=>{
-      if(!confirm('Disconnect Gmail? Outreach emails cannot be sent until reconnected.'))return;
+      if(!await window.ui.confirm('Disconnect Gmail? Outreach emails cannot be sent until reconnected.',{title:'Disconnect Gmail',confirmLabel:'Disconnect',danger:true}))return;
       await window.api.disconnectGmail(); openSettings();
     });
     document.getElementById('saveGoogleCredsBtn').addEventListener('click',async()=>{
@@ -1276,30 +1429,30 @@ async function openSettings(){
     document.getElementById('downloadBackupBtn').addEventListener('click',startBackupFlow);
     document.getElementById('backupFreqSelect').addEventListener('change',async(e)=>{
       try{ await window.api.saveBackupSchedule(e.target.value); }
-      catch(err){ alert(err.message); }
+      catch(err){ window.ui.toast(err.message,{variant:'error'}); }
       openSettings();
     });
     document.getElementById('saveDigestRecipBtn').addEventListener('click',async()=>{
       const ids=[...settingsBody.querySelectorAll('.digestRecipCheck:checked')].map(el=>parseInt(el.value,10));
       try{ await window.api.saveDigestRecipients(ids); toast('Digest recipients saved.'); }
-      catch(err){ alert(err.message); }
+      catch(err){ window.ui.toast(err.message,{variant:'error'}); }
     });
     document.getElementById('saveMeetPartBtn').addEventListener('click',async()=>{
       const ids=[...settingsBody.querySelectorAll('.meetPartDefaultCheck:checked')].map(el=>parseInt(el.value,10));
       try{ await window.api.saveMeetingParticipants(ids); toast('Default meeting participants saved.'); }
-      catch(err){ alert(err.message); }
+      catch(err){ window.ui.toast(err.message,{variant:'error'}); }
     });
     document.getElementById('sendDigestNowBtn').addEventListener('click',async()=>{
       const btn=document.getElementById('sendDigestNowBtn');
       const orig=btn.textContent; btn.disabled=true; btn.textContent='Sending…';
       try{ const r=await window.api.sendDigestNow(); toast(`Digest sent to ${r.to}`); }
-      catch(err){ alert(err.message); }
+      catch(err){ window.ui.toast(err.message,{variant:'error'}); }
       btn.disabled=false; btn.textContent=orig;
     });
   }
 }
 document.getElementById('settingsBtn').addEventListener('click',openSettings);
-document.getElementById('settingsClose').addEventListener('click',()=>settingsModal.hidden=true);
+document.getElementById('settingsClose').addEventListener('click',()=>hideModal(settingsModal));
 document.getElementById('logoutBtn').addEventListener('click',async()=>{ await window.api.authLogout(); location.reload(); });
 
 // ---- Admin: role-gated nav ----
@@ -1336,12 +1489,17 @@ function wirePeekToggle(btn,input,ms=1500){
 const usersModal=document.getElementById('usersModal');
 const usersBody=document.getElementById('usersBody');
 let resetPwId=null; // id of the user row currently showing the inline reset-password form, or null
+let usersSeq=0;
 async function openUsers(){
-  usersModal.hidden=false;
-  usersBody.innerHTML='<div class="gen-status">Loading…</div>';
+  const seq=++usersSeq;
+  showModal(usersModal);
+  usersBody.innerHTML='';
+  window.ui.setBusy(usersBody,true);
   let list;
   try{ list=await window.api.listUsers(); }
-  catch(e){ usersBody.innerHTML=errorBlock('Could not load the user list: '+e.message); return; }
+  catch(e){ if(seq!==usersSeq)return; window.ui.setBusy(usersBody,false); usersBody.innerHTML=errorBlock('Could not load the user list: '+e.message); return; }
+  if(seq!==usersSeq)return;
+  window.ui.setBusy(usersBody,false);
   resetPwId=null;
   renderUsers(list);
 }
@@ -1423,26 +1581,26 @@ function renderUsers(list){
     try{
       const u=await window.api.resendInvite(id);
       toast(u.inviteEmailSent?'Invite resent.':(u.inviteEmailError||'Invite email could not be sent.'));
-    }catch(e){ alert(e.message); }
+    }catch(e){ window.ui.toast(e.message,{variant:'error'}); }
     openUsers();
   }));
 
   usersBody.querySelectorAll('.emailInput').forEach(inp=>inp.addEventListener('change',async(e)=>{
     const id=parseInt(e.target.dataset.id,10);
     try{ await window.api.setUserEmail(id,e.target.value.trim()); }
-    catch(err){ alert(err.message); openUsers(); }
+    catch(err){ window.ui.toast(err.message,{variant:'error'}); openUsers(); }
   }));
 
   usersBody.querySelectorAll('.roleSelect').forEach(sel=>sel.addEventListener('change',async(e)=>{
     const id=parseInt(e.target.dataset.id,10);
     try{ await window.api.changeUserRole(id,e.target.value); }
-    catch(err){ alert(err.message); }
+    catch(err){ window.ui.toast(err.message,{variant:'error'}); }
     openUsers();
   }));
   usersBody.querySelectorAll('.deactivateBtn').forEach(b=>b.addEventListener('click',async()=>{
     const id=parseInt(b.dataset.id,10);
     try{ await window.api.deactivateUser(id); }
-    catch(err){ alert(err.message); }
+    catch(err){ window.ui.toast(err.message,{variant:'error'}); }
     openUsers();
   }));
   usersBody.querySelectorAll('.reactivateBtn').forEach(b=>b.addEventListener('click',async()=>{
@@ -1463,21 +1621,26 @@ function renderUsers(list){
     const id=parseInt(b.dataset.id,10);
     const pw=document.getElementById('resetPwInput').value;
     try{ await window.api.resetUserPassword(id,pw); resetPwId=null; openUsers(); }
-    catch(err){ alert(err.message); }
+    catch(err){ window.ui.toast(err.message,{variant:'error'}); }
   }));
 }
 document.getElementById('usersBtn').addEventListener('click',openUsers);
-document.getElementById('usersClose').addEventListener('click',()=>usersModal.hidden=true);
+document.getElementById('usersClose').addEventListener('click',()=>hideModal(usersModal));
 
 // ---- Admin: Audit log ----
 const auditModal=document.getElementById('auditModal');
 const auditBody=document.getElementById('auditBody');
+let auditSeq=0;
 async function openAuditLog(){
-  auditModal.hidden=false;
-  auditBody.innerHTML='<div class="gen-status">Loading…</div>';
+  const seq=++auditSeq;
+  showModal(auditModal);
+  auditBody.innerHTML='';
+  window.ui.setBusy(auditBody,true);
   let userList,actionList;
   try{ [userList,actionList]=await Promise.all([window.api.listUsers(),window.api.listAuditActions()]); }
-  catch(e){ auditBody.innerHTML=errorBlock('Could not load the audit log: '+e.message); return; }
+  catch(e){ if(seq!==auditSeq)return; window.ui.setBusy(auditBody,false); auditBody.innerHTML=errorBlock('Could not load the audit log: '+e.message); return; }
+  if(seq!==auditSeq)return;
+  window.ui.setBusy(auditBody,false);
   auditBody.innerHTML=`
     <div class="toolbar" style="padding:0 0 14px;background:transparent;border:none;">
       <div class="toolbar-group"><label class="tb-label">User</label>
@@ -1528,13 +1691,13 @@ function renderAuditRows(entries){
   }).join('');
 }
 document.getElementById('auditBtn').addEventListener('click',openAuditLog);
-document.getElementById('auditClose').addEventListener('click',()=>auditModal.hidden=true);
+document.getElementById('auditClose').addEventListener('click',()=>hideModal(auditModal));
 
 // ---- Add prospects (upload dossier JSONs from any device) ----
 document.getElementById('addProspectsBtn').addEventListener('click',openUpload);
 function openUpload(){
   emailModalTitle.textContent='Add prospects';
-  emailModal.hidden=false;
+  showModal(emailModal);
   emailModalBody.innerHTML=`
     <div class="q-hint">Upload dossier JSON files. Drop them below or pick files. Each is added to the shared database and appears for everyone. Duplicates (same UEI) are skipped automatically.</div>
     <div id="dropZone" style="border:2px dashed var(--line);border-radius:10px;padding:34px;text-align:center;color:var(--text-soft);cursor:pointer;margin-bottom:12px;">
@@ -1634,6 +1797,9 @@ searchEl.addEventListener('input',renderList);
 document.getElementById('closeDetail').addEventListener('click',()=>{setFullScreen(false);detailPane.hidden=true;selectedId=null;renderList();});
 document.getElementById('revealBtn').addEventListener('click',()=>window.api.revealWatched());
 document.getElementById('emptyReveal').addEventListener('click',()=>window.api.revealWatched());
+// Retry re-runs the same load path rather than reloading the page, so filters and the
+// open prospect survive a transient failure.
+document.getElementById('listRetry').addEventListener('click',()=>loadProspects());
 
 // bulk actions
 document.getElementById('selectAll').addEventListener('change',(e)=>{
@@ -1661,7 +1827,7 @@ document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',a
   b.disabled=true;
   try{
     if(action==='delete'){
-      if(!confirm(`Delete ${ids.length} prospect(s)?`))return;
+      if(!await window.ui.confirm(`Delete ${ids.length} prospect(s)? This removes them entirely.`,{title:'Delete prospects',confirmLabel:`Delete ${ids.length}`,danger:true}))return;
       const failed=await runAll(id=>window.api.deleteProspect(id));
       // If the open prospect was one of the deleted, close the pane — otherwise it kept
       // showing a record that no longer exists, and acting on it 404'd.
@@ -1673,7 +1839,9 @@ document.querySelectorAll('[data-bulk]').forEach(b=>b.addEventListener('click',a
     const prevStatuses={};
     allProspects.filter(p=>ids.includes(p.id)).forEach(p=>{prevStatuses[p.id]=p.status;});
     if(action==='dead'){
-      const reason=window.prompt(DEAD_REASON_PROMPT_BULK);
+      const reason=await askDeadReason(true);
+      // Especially important in bulk: cancelling used to still kill every selected row.
+      if(reason===null)return;
       if(reason&&reason.trim()){
         const noteFailed=await runAll(id=>window.api.addNote(id,reason.trim()));
         if(noteFailed.length)toast(`The reason note could not be saved on ${noteFailed.length} prospect(s)`,5000);
@@ -1707,7 +1875,27 @@ window.api.onIngestFailed((r)=>{ toast(`Research file "${r.file}" was not import
 // pointer-events:none matters as much as the fade: a faded-out toast is still a box
 // sitting over the bottom of the screen, and without it, clicks in that strip landed on an
 // invisible toast instead of the page underneath.
-function toast(msg,ms=2200){let t=document.getElementById('toast');if(!t){t=document.createElement('div');t.id='toast';t.setAttribute('role','status');t.setAttribute('aria-live','polite');t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--on-dark);padding:10px 18px;border-radius:var(--radius-full);font-size:13px;font-weight:500;z-index:100;box-shadow:var(--shadow-lg);opacity:0;pointer-events:none;transition:opacity var(--duration-base) var(--ease);';document.body.appendChild(t);}t.textContent=msg;t.style.opacity='1';clearTimeout(t._timer);t._timer=setTimeout(()=>{t.style.opacity='0';},ms);}
+// variant 'error' is not cosmetic: a failure announced as role="status" is polite, so a
+// screen reader may not interrupt for it, and a failure that looks identical to a success
+// is easy to miss entirely. Errors switch to role="alert"/assertive and a red ground.
+function toast(msg,ms=2200,variant='info'){
+  let t=document.getElementById('toast');
+  if(!t){
+    t=document.createElement('div');
+    t.id='toast';
+    t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 18px;border-radius:var(--radius-full);font-size:13px;font-weight:500;z-index:100;box-shadow:var(--shadow-lg);opacity:0;pointer-events:none;transition:opacity var(--duration-base) var(--ease);';
+    document.body.appendChild(t);
+  }
+  const isErr=variant==='error';
+  t.setAttribute('role',isErr?'alert':'status');
+  t.setAttribute('aria-live',isErr?'assertive':'polite');
+  t.style.background=isErr?'var(--red)':'var(--ink)';
+  t.style.color=isErr?'var(--on-red)':'var(--on-dark)';
+  t.textContent=msg;
+  t.style.opacity='1';
+  clearTimeout(t._timer);
+  t._timer=setTimeout(()=>{t.style.opacity='0';},ms);
+}
 
 // A bottom-right toast with an Undo button, for status/view changes: shows what happened
 // and gives a few seconds to catch a mistake and reverse it before it's gone.
@@ -1749,13 +1937,14 @@ function renderExclusionBlock(container,exclusion,prospectId,onRetry){
   const removeBtn=document.getElementById('removeExclusionBtn');
   if(removeBtn)removeBtn.addEventListener('click',async()=>{
     try{ await window.api.removeExclusion(exclusion.match_type,exclusion.value); toast('Exclusion removed.'); onRetry(); }
-    catch(err){ alert(err.message); }
+    catch(err){ window.ui.toast(err.message,{variant:'error'}); }
   });
   document.getElementById('exclusionMarkDeadBtn').addEventListener('click',async()=>{
-    const reason=window.prompt(DEAD_REASON_PROMPT);
+    const reason=await askDeadReason(false);
+    if(reason===null)return; // cancelled: leave the prospect alone
     if(reason&&reason.trim())await window.api.addNote(prospectId,reason.trim());
     await window.api.updateProspect(prospectId,{status:'dead'});
-    emailModal.hidden=true; replyModal.hidden=true; loadProspects();
+    hideModal(emailModal); hideModal(replyModal); loadProspects();
     toast('Marked dead.');
   });
 }

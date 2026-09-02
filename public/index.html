@@ -15,9 +15,9 @@
       <img src="assets/logo.svg" alt="GovSpring Legal" class="login-logo" />
       <div class="login-tag">Prospecting</div>
       <div id="loginMsg" class="login-msg"></div>
-      <input type="text" id="loginUser" class="login-input" placeholder="Username" autocomplete="username" />
+      <input type="text" id="loginUser" aria-label="Username" class="login-input" placeholder="Username" autocomplete="username" />
       <div class="input-row">
-        <input type="password" id="loginPw" class="login-input" placeholder="Password" autocomplete="current-password" />
+        <input type="password" id="loginPw" aria-label="Password" class="login-input" placeholder="Password" autocomplete="current-password" />
         <button type="button" class="btn btn-ghost btn-sm" id="loginPwToggle" aria-label="Show password">Show</button>
       </div>
       <button class="btn" id="loginBtn">Enter</button>
@@ -30,7 +30,7 @@
       <img src="assets/logo.svg" alt="GovSpring Legal" class="login-logo" />
       <div class="login-tag">Prospecting</div>
       <div id="forgotMsg" class="login-msg"></div>
-      <input type="text" id="forgotId" class="login-input" placeholder="Username or email" autocomplete="username" />
+      <input type="text" id="forgotId" aria-label="Username or email address" class="login-input" placeholder="Username or email" autocomplete="username" />
       <button class="btn" id="forgotBtn">Email me a reset link</button>
       <button type="button" class="link-btn" id="forgotBack">Back to log in</button>
     </div>
@@ -42,7 +42,7 @@
       <div class="login-tag">Prospecting</div>
       <div id="resetMsg" class="login-msg"></div>
       <div class="input-row" id="resetFormRow">
-        <input type="password" id="resetPw" class="login-input" placeholder="Choose a new password" autocomplete="new-password" />
+        <input type="password" id="resetPw" aria-label="Choose a new password" class="login-input" placeholder="Choose a new password" autocomplete="new-password" />
         <button type="button" class="btn btn-ghost btn-sm" id="resetPwToggle" aria-label="Show password">Show</button>
       </div>
       <button class="btn" id="resetBtn">Set new password and log in</button>
@@ -55,7 +55,7 @@
       <div class="login-tag">Prospecting</div>
       <div id="inviteMsg" class="login-msg"></div>
       <div class="input-row" id="inviteFormRow">
-        <input type="password" id="invitePw" class="login-input" placeholder="Choose a password" autocomplete="new-password" />
+        <input type="password" id="invitePw" aria-label="Choose a password" class="login-input" placeholder="Choose a password" autocomplete="new-password" />
         <button type="button" class="btn btn-ghost btn-sm" id="invitePwToggle" aria-label="Show password">Show</button>
       </div>
       <button class="btn" id="inviteBtn">Set password and log in</button>
@@ -103,13 +103,13 @@
       <header class="main-head">
         <h1 class="view-title" id="viewTitle">All prospects</h1>
         <div class="head-right">
-          <input type="search" id="searchBox" placeholder="Search company, contact, state, industry" />
+          <input type="search" id="searchBox" aria-label="Search prospects by company, contact, state, or industry" placeholder="Search company, contact, state, industry" />
         </div>
       </header>
 
       <div class="toolbar">
         <div class="toolbar-group">
-          <label class="tb-label">Fit</label>
+          <label class="tb-label" for="filterFit">Fit</label>
           <select id="filterFit" class="tb-select">
             <option value="">Any</option>
             <option value="1-3">1 to 3 (best)</option>
@@ -118,20 +118,20 @@
           </select>
         </div>
         <div class="toolbar-group">
-          <label class="tb-label">State</label>
+          <label class="tb-label" for="filterState">State</label>
           <select id="filterState" class="tb-select"><option value="">Any</option></select>
         </div>
         <div class="toolbar-group">
-          <label class="tb-label">Agency</label>
+          <label class="tb-label" for="filterAgency">Agency</label>
           <select id="filterAgency" class="tb-select"><option value="">Any</option></select>
         </div>
         <div class="toolbar-group">
-          <label class="tb-label">Designation</label>
+          <label class="tb-label" for="filterDesignation">Designation</label>
           <select id="filterDesignation" class="tb-select"><option value="">Any</option></select>
         </div>
         <div class="toolbar-spacer"></div>
         <div class="toolbar-group">
-          <label class="tb-label">Sort</label>
+          <label class="tb-label" for="sortBy">Sort</label>
           <select id="sortBy" class="tb-select">
             <option value="fit">Fit score</option>
             <option value="followup">Oldest follow-up due</option>
@@ -155,7 +155,7 @@
             <table class="prospects">
               <thead>
                 <tr>
-                  <th class="col-check"><input type="checkbox" id="selectAll" /></th>
+                  <th class="col-check"><input type="checkbox" id="selectAll" aria-label="Select all prospects on this page" /></th>
                   <th class="col-score">Fit</th>
                   <th>Company</th>
                   <th>Location</th>
@@ -166,10 +166,22 @@
               </thead>
               <tbody id="rows"></tbody>
             </table>
-            <div class="empty" id="emptyState">
+            <!-- hidden until a load has actually completed. Without it this headline
+                 painted immediately on every page load and was visible until the first
+                 fetch resolved, so the app opened by telling the user they had no
+                 prospects — a state someone might act on. -->
+            <div class="empty" id="emptyState" hidden>
               <p class="empty-title">No prospects in this view</p>
               <p class="empty-body">Research dossiers written to your research folder appear here automatically, sorted with the most landable prospects on top.</p>
               <button class="btn" id="emptyReveal">Open research folder</button>
+            </div>
+            <!-- A failed load used to render an empty table with no message, which is
+                 indistinguishable from "no prospects". Silent-wrong is worse than
+                 loud-broken. -->
+            <div class="ui-error-panel" id="listError" hidden>
+              <p class="empty-title" id="listErrorTitle">Could not load prospects</p>
+              <span class="ui-error-detail" id="listErrorDetail"></span>
+              <button class="btn" id="listRetry">Try again</button>
             </div>
           </div>
         </section>
@@ -220,7 +232,17 @@
     </div>
   </div>
 
+  <!-- Mount point for the dialogs ui.js creates. Deliberately NOT a live region: only
+       dialogs are appended here (toasts append to document.body and carry their own
+       role/aria-live), and a live region would announce each dialog's whole subtree on
+       insert and then re-announce it on every internal change — on top of the
+       announcement role="dialog" already produces. -->
+  <div id="ui-root"></div>
+
   <script src="auth-client.js"></script>
+  <!-- ui.js first: both api.js and renderer.js call window.ui, so it has to exist before
+       either of them can run a handler. -->
+  <script src="ui.js"></script>
   <script src="api.js"></script>
   <script src="renderer.js"></script>
 </body>
