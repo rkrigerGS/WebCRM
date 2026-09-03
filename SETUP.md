@@ -130,3 +130,70 @@ folder moves everything over.
 ## A note on updates
 When you get a new version, replace everything EXCEPT the  data  folder. Keeping the
 data folder preserves all prospects, settings, and the learning library.
+
+--------------------------------------------------------------------
+## Environment variables
+--------------------------------------------------------------------
+
+### APP_BASE_URL  (REQUIRED in production - the app will not start without it)
+The public address of this app, e.g.  https://webcrm-production-4555.up.railway.app
+(no trailing path needed - anything after the host is ignored).
+
+Every link the app emails out - password resets, user invites, and the "pick a time"
+booking buttons in outreach emails - is built from this value. It used to be taken from
+the incoming web request instead, which meant anyone could forge it and make the app
+email a real, working password-reset link pointing at their own site. The app now refuses
+to start in production rather than guess, because guessing wrong silently recreates that
+problem on exactly the deploy where it matters.
+
+- On Railway: set it in the service's Variables tab, then redeploy.
+- On the Windows host, if the app is only ever opened in a browser ON that same machine
+  (http://localhost:3000), you can leave it unset - it defaults to http://localhost:PORT,
+  which is correct in that case.
+- IMPORTANT - on the Windows host, if anyone opens the app from ANOTHER computer on the
+  office network (e.g. http://192.168.1.50:3000), you MUST set APP_BASE_URL to that
+  address. Otherwise password-reset and invite emails will contain links saying
+  "localhost", which only work on the host machine itself and will look broken to
+  everyone else. Set it to the same address people actually type into their browser.
+- It can also be set as  baseUrl  in  data\config.json  if you prefer; the environment
+  variable wins if both are present.
+
+If it is missing or malformed in production, the startup log says so explicitly and the
+app exits. Setting the variable and redeploying is the whole fix.
+
+### ENABLE_DEV_LOGIN  (use  1  to enable,  0  to disable; disabled by default)
+Reaches an admin session without a password, for when you are locked out. When it is not
+exactly  1  the route does not exist at all - the address 404s like any unknown path.
+
+Recommended: keep the variable set to  0  in Railway so it is visible and easy to flip,
+and set it to  1  only for as long as you need it.
+
+HOW TO USE IT
+1. Railway > Variables > set ENABLE_DEV_LOGIN to 1 > Deploy.
+2. Open the service's Deploy Logs and find the block "DEVELOPER LOGIN LINK".
+3. Copy the whole https://... link underneath it and open it in your browser.
+   You are logged in as dev_rafael (admin).
+4. Set the variable back to 0 and deploy.
+
+The link is SINGLE USE and expires after 30 minutes. Following it logs you in and
+immediately mints a replacement link into the log, so the log always holds exactly one
+live link. Following an expired link also prints a fresh one, so a stale copy is never a
+dead end - just go back to the log and take the newest.
+
+Single use is the point. A token in a web address normally ends up in the platform's
+access logs, the proxy's logs, your browser history, and the Referer header sent to the
+next site you visit. Because the link dies the instant it is used, every one of those
+copies is worthless. That is safer than the original backdoor, which used a link that
+stayed valid and reusable until the next restart.
+
+Five wrong attempts from one address in 15 minutes invalidates the outstanding link and
+prints a new one. Every attempt, successful or not, is written to the audit log with the
+source address.
+
+### Others already in use
+- PORT - which port to listen on (default 3000).
+- RAILWAY_VOLUME_MOUNT_PATH - set by Railway; where the persistent data volume is
+  mounted. The app refuses to start on Railway without it, so a detached volume can't
+  silently look like an empty database.
+- DEV_AUTOLOGIN - local development only; runs every session as the named existing user.
+  Hard-refused when production markers are present.

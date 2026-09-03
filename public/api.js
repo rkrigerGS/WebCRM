@@ -20,6 +20,9 @@ async function sendJSON(url, method, body) {
     // Carried through so a do-not-contact block can be told apart from any other failure
     // and shown its own UI (see renderer.js's renderExclusionBlock), not just an error string.
     if (errBody.exclusion) err.exclusion = errBody.exclusion;
+    // Same idea: a send that went out but could not be recorded is NOT a failed send, and
+    // the UI must not re-arm the Send button underneath a "do not resend" message.
+    if (errBody.sentButUnrecorded) err.sentButUnrecorded = true;
     throw err;
   }
   return r.json();
@@ -102,7 +105,12 @@ window.api = {
   // let the user type/paste the folder path. These return a shape the UI already handles.
   chooseWatched:  async () => {
     const cur = (await getJSON('/api/watched/path')).path;
-    const entered = window.prompt('Paste the full path to your research output folder:', cur);
+    const entered = await window.ui.prompt('Paste the full path to your research output folder:', {
+      title: 'Research folder',
+      value: cur,
+      placeholder: '/path/to/research-output',
+      okLabel: 'Use this folder'
+    });
     if (!entered) return { chosen: false, path: cur };
     const r = await sendJSON('/api/config', 'POST', { watchFolder: entered });
     return { chosen: true, path: r.watchFolder };
@@ -113,7 +121,9 @@ window.api = {
   },
   revealWatched:  async () => {
     const p = (await getJSON('/api/watched/path')).path;
-    window.alert('Research folder on the host machine:\n\n' + p);
+    // An in-app dialog rather than an OS alert: this shows a filesystem path, and a native
+    // alert() rendered it in browser chrome with no way to select or copy it.
+    await window.ui.alert(p, { title: 'Research folder on the host machine' });
   },
 
   readCatalog:    (which)     => getJSON('/api/catalog/' + which).then(r => r.text),

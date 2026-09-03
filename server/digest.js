@@ -4,6 +4,12 @@
 // real data rather than a model's phrasing. See server.js for the scheduler and manual
 // "send now" endpoint that call buildDigest() and hand its output to gmail.js.
 
+// Actions that mean an email actually left the building. 'prospect.email.send.orphaned'
+// belongs here: the Gmail send succeeded and only the record write was lost, because the
+// prospect was deleted mid-send. 'prospect.email.send.failed' is deliberately NOT here —
+// nothing was sent in that case.
+const SENT_ACTIONS = new Set(['prospect.email.send', 'prospect.reply.send', 'prospect.email.send.orphaned']);
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
 
@@ -40,7 +46,7 @@ function buildDigest({ prospects, auditEntries, now }) {
   for (const p of prospects) statusCounts[p.status] = (statusCounts[p.status] || 0) + 1;
 
   const createdThisWeek = auditEntries.filter(e => thisWeek(e) && (e.action === 'prospect.upload' || e.action === 'prospect.ingest')).length;
-  const emailsSentThisWeek = auditEntries.filter(e => thisWeek(e) && (e.action === 'prospect.email.send' || e.action === 'prospect.reply.send')).length;
+  const emailsSentThisWeek = auditEntries.filter(e => thisWeek(e) && SENT_ACTIONS.has(e.action)).length;
   const repliesReceivedThisWeek = auditEntries.filter(e => thisWeek(e) && e.action === 'prospect.reply.detected').length;
   const signedThisWeek = auditEntries.filter(e => thisWeek(e) && e.action === 'prospect.update' && parseStatusFromDetail(e.detail) === 'signed').length;
   const dormantSetThisWeek = auditEntries.filter(e => thisWeek(e) && e.action === 'prospect.dormant.set').length;
@@ -73,7 +79,7 @@ function buildDigest({ prospects, auditEntries, now }) {
   }
   for (const e of auditEntries) {
     if (!thisWeek(e)) continue;
-    if (e.action === 'prospect.email.send' || e.action === 'prospect.reply.send') bump(e.username, 'emails_sent');
+    if (SENT_ACTIONS.has(e.action)) bump(e.username, 'emails_sent');
     if (e.action === 'prospect.reply.send') bump(e.username, 'replies_handled');
     if (e.action === 'prospect.note.add') bump(e.username, 'notes_added');
     if (e.action === 'prospect.upload') bump(e.username, 'prospects_uploaded');

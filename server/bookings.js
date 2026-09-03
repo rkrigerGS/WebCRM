@@ -46,12 +46,29 @@ function createOffer({ prospectId, companyName, prospectEmail, participants, slo
   return offer;
 }
 
+// Tokens are 40 hex characters (crypto.randomBytes(20)). Anything else cannot be a real
+// offer, so it is rejected before it ever reaches a property lookup.
+const TOKEN_PATTERN = /^[0-9a-f]{40}$/;
+function isValidTokenShape(token) {
+  return typeof token === 'string' && TOKEN_PATTERN.test(token);
+}
+
+// `offers` is a plain object deserialized from JSON, so a bare offers[token] lookup
+// resolved inherited keys: /book/__proto__/data returned Object.prototype — an object, so
+// the "not found" branch never ran — and the route then 500'd on it instead of 404ing.
+// `constructor`, `toString` and `valueOf` were reachable the same way. Two layers here:
+// the shape check above rejects them at the door, and Object.hasOwn means even a future
+// caller that skips the shape check cannot walk the prototype chain.
 function getOffer(token) {
-  return (offers && offers[token]) || null;
+  if (!offers || !isValidTokenShape(token)) return null;
+  if (!Object.hasOwn(offers, token)) return null;
+  const offer = offers[token];
+  // A JSON file hand-edited to hold a non-object value would otherwise flow onward as one.
+  return (offer && typeof offer === 'object') ? offer : null;
 }
 
 function markBooked(token, booked) {
-  const offer = offers[token];
+  const offer = getOffer(token);
   if (!offer) throw new Error('Unknown booking token.');
   offer.status = 'booked';
   offer.booked = { ...booked, bookedAt: new Date().toISOString() };

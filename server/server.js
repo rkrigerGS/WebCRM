@@ -94,6 +94,20 @@ function broadcast(event, data, adminOnly = false) {
 // produces N toasts and defeats the suppression entirely.
 const ISSUE_REBROADCAST_MS = 30 * 60 * 1000;
 const MAX_TRACKED_ISSUES = 200; // bound the map; scopes are coarse, so this is far above real use
+// An audit write that throws must never change the response the caller was about to get.
+// store.writeJSON is fully synchronous (temp file + fsync + rename), so a read-only volume
+// or a full disk makes audit.log throw — and inside a mutating() handler that surfaces as a
+// generic 500. On the orphaned-send branch below that would be actively harmful: the SA
+// would be told the send failed when the email had already gone out. Used for audit rows
+// that accompany a deliberate non-200, where the response matters more than the row.
+function auditSafe(entry) {
+  try {
+    audit.log(entry);
+  } catch (e) {
+    console.error('audit.log failed (response preserved):', e && e.message);
+  }
+}
+
 const recentIssues = new Map(); // scope -> { message, at }
 function reportIssue(scope, err, logDetail) {
   const message = (err && err.message) || String(err);
@@ -113,6 +127,35 @@ function reportIssue(scope, err, logDetail) {
 // config first: db.js reads defaultFollowupDays out of it when creating a prospect.
 console.log(`Data directory: ${DATA_DIR}`);
 config.init(DATA_DIR);
+// Resolve the canonical origin for outbound links immediately after config loads and before
+// any route can build one. Throws on a missing/malformed value, which is deliberate: see the
+// comment on resolveBaseUrl in config.js for why this must not degrade to the Host header.
+//
+// COOKIE_SECURE is declared here, above its own first use, because the base-URL resolution
+// needs the same "is this production" answer. Writing the expression twice is how the two
+// drift apart. Cookies get the Secure flag in production so the session token is never sent
+// over plain HTTP; it stays off locally, where there is no TLS and a Secure cookie would be
+// dropped, making login impossible. Keyed on Railway's own platform variables rather than
+// the volume path, so pointing a local run at a scratch data directory
+// (RAILWAY_VOLUME_MOUNT_PATH) doesn't switch Secure on and lock a developer out of
+// their own http://localhost.
+const COOKIE_SECURE = process.env.NODE_ENV === 'production'
+  || !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+
+const BASE_URL = config.resolveBaseUrl({ port: PORT, isProduction: COOKIE_SECURE });
+console.log(`Base URL for outbound links: ${BASE_URL}`);
+// The fallback is right for a browser on the host machine and wrong for everyone else, so
+// say so rather than letting reset/invite emails quietly go out pointing at "localhost".
+// This is the documented always-on-Windows-host case: server.js binds 0.0.0.0 so other
+// machines on the office network can reach it, and for those users a localhost link is dead.
+if (BASE_URL.startsWith('http://localhost')) {
+  console.warn(
+    `NOTE: outbound links will say ${BASE_URL}. That only works in a browser on this machine.\n` +
+    '      If anyone opens this app from another computer, set APP_BASE_URL to the address\n' +
+    '      they type (e.g. http://192.168.1.50:3000) or their reset and invite emails will\n' +
+    '      contain links that do not work for them.'
+  );
+}
 db.init(DATA_DIR);
 catalogs.init(DATA_DIR, APP_DIR);
 auth.init(DATA_DIR);
@@ -140,17 +183,15 @@ const app = express();
 // become attacker-chosen — a fresh "IP" per login attempt defeats the rate limiter
 // entirely. 1 trusts exactly one hop (Railway's proxy, which appends the real client
 // address) and ignores anything the client claims beyond it.
-app.set('trust proxy', 1);
+// Only trust a forwarding hop when there actually is one. Railway's edge appends the real
+// client address, so 1 hop is correct there. Off Railway — the documented always-on Windows
+// host, and local runs — nothing sits in front of this process, so believing
+// X-Forwarded-For let any client mint a fresh "IP" per request and walk straight through
+// every per-IP limiter in this file (login, forgot-password, booking probes, dev-login),
+// while also writing attacker-chosen addresses into the audit trail as if they were fact.
+app.set('trust proxy', ON_RAILWAY ? 1 : false);
 app.use(express.json({ limit: '5mb' }));
 
-// Cookies get the Secure flag in production so the session token is never sent over
-// plain HTTP. Left off locally, where there is no TLS and Secure cookies would simply
-// be dropped, making login impossible.
-// Keyed on Railway's own platform variables rather than the volume path, so pointing a
-// local run at a scratch data directory (RAILWAY_VOLUME_MOUNT_PATH) doesn't switch Secure
-// on and lock the developer out of their own http://localhost.
-const COOKIE_SECURE = process.env.NODE_ENV === 'production'
-  || !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
 function sessionCookie(token, maxAgeSeconds) {
   return `gs_session=${token}; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}; Path=/${COOKIE_SECURE ? '; Secure' : ''}`;
 }
@@ -180,21 +221,78 @@ const devAutologinAllowed = !!DEV_AUTOLOGIN && !COOKIE_SECURE;
 if (DEV_AUTOLOGIN && COOKIE_SECURE) console.error('DEV_AUTOLOGIN is set but this looks like production — ignoring it.');
 if (devAutologinAllowed) console.error(`DEV_AUTOLOGIN: every request without a session runs as "${DEV_AUTOLOGIN}" — local development only.`);
 
-// ---- Secure backdoor (random token, hashed, rate-limited, audited) ----
-// Developer admin login link. The token is regenerated on every server start (so an old
-// link stops working after a restart/redeploy) and stays valid for that process's lifetime
-// — it is NOT single-use. It is hashed in memory with scrypt, never written to disk (so it
-// can't leak through backups, unlike the removed fixed-slug backdoor) and printed once to
-// stdout at startup. It deliberately has no production/env guard: reaching a live admin
-// session is the whole point. Anyone with the startup log can use it until the next restart.
-const BACKDOOR_TOKEN = crypto.randomBytes(20).toString('hex'); // 40 hex chars, 160 bits
-let hashedBackdoorToken = null;
-try {
+// ---- Developer login (opt-in, random token, hashed, rate-limited, audited) ----
+// Developer admin login. The token is regenerated on every server start (so an old one
+// stops working after a restart/redeploy).
+//
+// The route is NOT REGISTERED AT ALL unless ENABLE_DEV_LOGIN=1. Set it to 1 to enable, 0
+// (or unset) to disable; the intended workflow is a Railway variable parked at 0 and
+// flipped to 1 for as long as you need it.
+//
+// SHAPE: a SINGLE-USE, EXPIRING magic link, printed whole into the startup log so it can be
+// copied straight into a browser.
+//
+// A token in a URL is normally a bad idea — it lands in the platform's access logs, the edge
+// proxy's logs, browser history, and the Referer header of the next link clicked. Single use
+// is what makes it acceptable: the moment the link is followed the value is dead, so every
+// one of those copies is inert. That is strictly safer than the original backdoor, which was
+// a URL token that stayed valid and REUSABLE for the whole process lifetime. Belt and
+// braces on top: a 30-minute expiry, an immediate redirect so the token leaves the address
+// bar, Referrer-Policy: no-referrer, Cache-Control: no-store, per-IP rate limiting, and an
+// audit row for every attempt.
+//
+// Using a link mints the next one and prints it, so the log always holds exactly one live
+// link. Following an expired link also mints a fresh one, so a stale copy is self-healing
+// rather than a dead end.
+const DEV_LOGIN_ENABLED = process.env.ENABLE_DEV_LOGIN === '1';
+// The comparison is strict on purpose (fail closed: anything unrecognised leaves the route
+// unmounted). But a typo like "true" or "yes" would silently do nothing, and the moment you
+// would find out is while locked out — the worst possible time. Say so at boot instead.
+if (process.env.ENABLE_DEV_LOGIN !== undefined && !['0', '1'].includes(process.env.ENABLE_DEV_LOGIN)) {
+  console.warn(
+    `ENABLE_DEV_LOGIN is set to ${JSON.stringify(process.env.ENABLE_DEV_LOGIN)}, which is not "1" — ` +
+    'the developer login route is NOT enabled. Use exactly "1" to enable it, or "0" to disable it.'
+  );
+}
+
+const DEV_LOGIN_TTL_MS = 30 * 60 * 1000;
+let devLoginHash = null;      // scrypt(salt || hash); the plaintext is never retained
+let devLoginExpiresAt = 0;
+
+function hashDevLoginToken(token) {
   const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(BACKDOOR_TOKEN, salt, 32, { N: 16384, r: 8, p: 1 });
-  hashedBackdoorToken = Buffer.concat([salt, hash]);
-} catch (e) {
-  console.error('Failed to hash backdoor token:', e.message);
+  const hash = crypto.scryptSync(token, salt, 32, { N: 16384, r: 8, p: 1 });
+  return Buffer.concat([salt, hash]);
+}
+
+// Mints a link, prints it, and keeps only its hash. Returns nothing: the plaintext exists
+// just long enough to be written to the log.
+function mintDevLoginLink(reason) {
+  if (!DEV_LOGIN_ENABLED) return;
+  const token = crypto.randomBytes(20).toString('hex'); // 40 hex chars, 160 bits
+  try {
+    devLoginHash = hashDevLoginToken(token);
+  } catch (e) {
+    devLoginHash = null;
+    devLoginExpiresAt = 0;
+    console.error('dev-login: could not hash a new token, no link is available:', e && e.message);
+    return;
+  }
+  devLoginExpiresAt = Date.now() + DEV_LOGIN_TTL_MS;
+  // config.absoluteUrl (not the request host) so the printed link is the real public URL.
+  const url = config.absoluteUrl(`/api/auth/dev-login/${token}`);
+  console.log('');
+  console.log(`  DEVELOPER LOGIN LINK — ${reason}`);
+  console.log(`  Single use, expires in ${DEV_LOGIN_TTL_MS / 60000} minutes. Open it in your browser:`);
+  console.log('');
+  console.log(`  ${url}`);
+  console.log('');
+}
+
+// Consumes the current link so it can never be replayed, whatever happens next.
+function consumeDevLoginLink() {
+  devLoginHash = null;
+  devLoginExpiresAt = 0;
 }
 
 function userFromReq(req) {
@@ -346,64 +444,127 @@ app.post('/api/auth/logout', (_q, res) => {
   res.json({ ok: true });
 });
 
-// ---- Secure backdoor login ----
-// Rate-limited per IP (60 attempts per hour), audited. Route sits above the /api session
-// gate on purpose (it must be reachable pre-session), like /api/auth/login.
-const backdoorAttempts = new Map(); // ip -> { count, firstAt }
-const BACKDOOR_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-const BACKDOOR_MAX_ATTEMPTS = 60;
-app.get('/api/auth/backdoor/:token', (q, res) => {
-  const ip = q.ip;
-  const now = Date.now();
-  // Prune old entries
-  for (const [key, e] of backdoorAttempts) {
-    if (now - e.firstAt > BACKDOOR_WINDOW_MS) backdoorAttempts.delete(key);
-  }
-  // Rate limit check
-  let e = backdoorAttempts.get(ip);
-  if (!e || now - e.firstAt > BACKDOOR_WINDOW_MS) e = { count: 0, firstAt: now };
-  e.count++;
-  backdoorAttempts.set(ip, e);
-  if (e.count > BACKDOOR_MAX_ATTEMPTS) {
-    return res.status(429).json({ error: 'Too many attempts. Try again later.' });
-  }
-  // Verify token: scrypt the provided value with the stored salt and timing-safe compare.
-  const providedToken = (q.params.token || '').trim();
-  let isValid = false;
-  if (hashedBackdoorToken && providedToken.length === BACKDOOR_TOKEN.length) {
-    try {
-      const salt = hashedBackdoorToken.slice(0, 16);
-      const providedHash = crypto.scryptSync(providedToken, salt, 32, { N: 16384, r: 8, p: 1 });
-      isValid = crypto.timingSafeEqual(providedHash, hashedBackdoorToken.slice(16));
-    } catch {
-      isValid = false;
+// ---- Developer login ----
+// Only mounted when ENABLE_DEV_LOGIN=1 (see the DEV_LOGIN_ENABLED comment above). When the
+// flag is off the path 404s exactly like any unknown route, and the dev_rafael
+// auto-provisioning below is unreachable.
+//
+// The token travels in the POST body, never the URL, so it stays out of access logs,
+// browser history, and Referer. Rate-limited per IP and audited on BOTH success and
+// failure — an unlogged failed attempt means a brute-force run against this endpoint is
+// invisible, which is the opposite of what an audit trail is for.
+const devLoginAttempts = new Map(); // ip -> { count, firstAt }
+const DEV_LOGIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const DEV_LOGIN_MAX_ATTEMPTS = 5;
+
+// A tiny self-contained page: this is opened directly in a browser address bar, so a JSON
+// body would just look broken. No request data is echoed into it.
+function devLoginPage(heading, detail) {
+  return `<!doctype html><meta charset="utf-8"><title>Developer login</title>`
+    + `<style>body{font:15px/1.5 -apple-system,system-ui,sans-serif;max-width:34em;margin:18vh auto;padding:0 1.5em;color:#1d1d1f}`
+    + `h1{font-size:1.15rem;margin:0 0 .5em}p{color:#555;margin:0}</style>`
+    + `<h1>${escapeHtml(heading)}</h1><p>${escapeHtml(detail)}</p>`;
+}
+
+if (DEV_LOGIN_ENABLED) {
+  app.get('/api/auth/dev-login/:token', (q, res) => {
+    // no-store keeps the response out of any cache; no-referrer stops the token leaking
+    // into the Referer of whatever the browser loads next.
+    res.set('Cache-Control', 'no-store');
+    res.set('Referrer-Policy', 'no-referrer');
+
+    const ip = q.ip;
+    const ua = String(q.get('user-agent') || '').slice(0, 200);
+    const now = Date.now();
+    for (const [key, e] of devLoginAttempts) {
+      if (now - e.firstAt > DEV_LOGIN_WINDOW_MS) devLoginAttempts.delete(key);
     }
-  }
-  if (!isValid) {
-    return res.status(401).json({ error: 'Invalid backdoor token' });
-  }
-  // Find or create the developer account
-  const DEV_USERNAME = 'dev_rafael';
-  let user = users.findByUsername(DEV_USERNAME);
-  if (!user) {
-    // Auto-create on first use with a random password (never used; always logged in via backdoor)
-    const randomPass = crypto.randomBytes(32).toString('hex');
-    try {
-      user = users.createUser({ username: DEV_USERNAME, password: randomPass, role: 'admin' });
-      audit.log({ userId: user.id, username: user.username, action: 'user.create', detail: 'Auto-created developer account on first backdoor access' });
-    } catch (e) {
-      return res.status(500).json({ error: 'Failed to create developer account' });
+    let e = devLoginAttempts.get(ip);
+    if (!e || now - e.firstAt > DEV_LOGIN_WINDOW_MS) e = { count: 0, firstAt: now };
+    e.count++;
+    devLoginAttempts.set(ip, e);
+
+    if (e.count > DEV_LOGIN_MAX_ATTEMPTS) {
+      // Everything past the cutoff must be CHEAP and happen ONCE. Doing the work on every
+      // request past the limit (an earlier version of this) let an unauthenticated caller
+      // burn a 16 MB scrypt plus a full synchronous audit-file rewrite per request, roll the
+      // entire 50k-entry audit log off the end, and print a fresh live link on every single
+      // attempt — the exact "admin session sitting in plaintext in the logs" this route is
+      // shaped to avoid.
+      if (!e.limitHandled) {
+        e.limitHandled = true;
+        // Invalidate whatever link is outstanding: a run that got close is now racing a
+        // value that no longer exists. A replacement is minted so the operator is not
+        // locked out by someone else's noise.
+        consumeDevLoginLink();
+        auditSafe({ userId: null, username: 'system', action: 'user.devlogin.ratelimited', detail: `Dev-login rate limit exhausted from IP ${ip}; outstanding link invalidated. UA: ${ua}` });
+        mintDevLoginLink('previous link invalidated by too many failed attempts');
+      }
+      return res.status(429).send(devLoginPage('Too many attempts', 'Wait 15 minutes, then use the newest link from the deploy log.'));
     }
-  }
-  if (!user.active) {
-    return res.status(403).json({ error: 'Developer account is inactive' });
-  }
-  // Issue session and audit
-  const sessToken = auth.issueToken(user.id);
-  res.set('Set-Cookie', sessionCookie(sessToken, SESSION_MAX_AGE));
-  audit.log({ userId: user.id, username: user.username, action: 'user.backdoor.login', detail: `Backdoor login from IP ${ip}` });
-  res.json({ ok: true, user: { id: user.id, username: user.username, role: user.role } });
-});
+
+    const provided = String(q.params.token || '').trim();
+    const expired = !!devLoginHash && Date.now() > devLoginExpiresAt;
+
+    let isValid = false;
+    // Shape check first: tokens are always 40 hex chars, and timingSafeEqual throws on
+    // unequal-length buffers.
+    if (devLoginHash && !expired && /^[0-9a-f]{40}$/.test(provided)) {
+      try {
+        const salt = devLoginHash.slice(0, 16);
+        const providedHash = crypto.scryptSync(provided, salt, 32, { N: 16384, r: 8, p: 1 });
+        isValid = crypto.timingSafeEqual(providedHash, devLoginHash.slice(16));
+      } catch {
+        isValid = false;
+      }
+    }
+
+    if (!isValid) {
+      auditSafe({ userId: null, username: 'system', action: 'user.devlogin.failed', detail: `Failed dev-login from IP ${ip} (${expired ? 'link expired' : 'bad or already-used link'}). UA: ${ua}` });
+      if (expired) {
+        // Self-healing: a stale link prints a fresh one rather than being a dead end.
+        consumeDevLoginLink();
+        mintDevLoginLink('previous link had expired');
+        return res.status(401).send(devLoginPage('That link has expired', 'A new one has been printed to the deploy log. Copy the newest link and try again.'));
+      }
+      return res.status(401).send(devLoginPage('That link is not valid', 'It may already have been used. Check the deploy log for the newest link, or redeploy to mint one.'));
+    }
+
+    // Consume BEFORE doing anything else, so the link cannot be replayed even if a step
+    // below fails. Single use is the whole reason a token in a URL is acceptable here.
+    consumeDevLoginLink();
+
+    // Find or create the developer account. The generated password is 32 random bytes that
+    // are never stored in plaintext, never printed, and never returned — so this account
+    // cannot be logged into through the normal form, only through this route.
+    const DEV_USERNAME = 'dev_rafael';
+    let user = users.findByUsername(DEV_USERNAME);
+    if (!user) {
+      const randomPass = crypto.randomBytes(32).toString('hex');
+      try {
+        user = users.createUser({ username: DEV_USERNAME, password: randomPass, role: 'admin' });
+        auditSafe({ userId: user.id, username: user.username, action: 'user.create', detail: 'Auto-created developer account on first dev-login access' });
+      } catch (err) {
+        mintDevLoginLink('previous link was consumed by a failed attempt');
+        return res.status(500).send(devLoginPage('Could not create the developer account', 'A new link is in the deploy log.'));
+      }
+    }
+    if (!user.active) {
+      auditSafe({ userId: user.id, username: user.username, action: 'user.devlogin.failed', detail: `Dev-login refused: account inactive. IP ${ip}. UA: ${ua}` });
+      mintDevLoginLink('previous link was consumed by a refused attempt');
+      return res.status(403).send(devLoginPage('The developer account is inactive', 'Reactivate dev_rafael from the Users panel, then use the newest link in the deploy log.'));
+    }
+
+    const sessToken = auth.issueToken(user.id);
+    res.set('Set-Cookie', sessionCookie(sessToken, SESSION_MAX_AGE));
+    auditSafe({ userId: user.id, username: user.username, action: 'user.devlogin.login', detail: `Dev-login from IP ${ip}. UA: ${ua}` });
+    // Mint the replacement now, so the log always holds exactly one live link.
+    mintDevLoginLink('previous link was used');
+    // 303 to the app root: the session cookie rides this response, and the token leaves the
+    // address bar immediately instead of sitting there to be bookmarked or shared.
+    res.redirect(303, '/');
+  });
+}
 
 // ---- Forgot password (pre-session, like the invite flow) ----
 // Anti-enumeration: the response is identical whether or not the identifier matched an
@@ -420,7 +581,9 @@ app.post('/api/auth/forgot', (q, res) => {
   forgotAttempts.set(q.ip, e);
   if (e.count > LOGIN_MAX_ATTEMPTS) return res.status(429).json({ error: 'Too many reset requests. Try again later.' });
   const identifier = (q.body && q.body.identifier) || '';
-  const link = (token) => `${q.protocol}://${q.get('host')}/?reset=${token}`;
+  // Canonical origin, never the request's Host header — a forged Host here would have the
+  // server email the victim a working reset token pointing at the attacker's domain.
+  const link = (token) => config.absoluteUrl(`/?reset=${token}`);
   res.json({ ok: true }); // always the same answer — never confirms whether an account exists
   let result = null;
   try { result = users.startPasswordReset(identifier); } catch { return; }
@@ -1115,7 +1278,9 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
       prospectId: id, companyName: p.company_name, prospectEmail: to,
       participants: meetingParticipants, slots: bookingSlots
     });
-    const baseUrl = `${q.protocol}://${q.get('host')}`;
+    // Canonical origin: these links go out in an email to a prospect, so they must not be
+    // derived from whoever's request happened to trigger the send.
+    const baseUrl = config.baseUrl();
     bodyText = finalText + bookingTextBlock(baseUrl, offer);
     bodyHtml = bookingHtmlEmail(finalText, baseUrl, offer);
   }
@@ -1144,6 +1309,27 @@ app.post('/api/prospects/:id/saveFinal', mutating('prospect.email.send', async (
   // the live record, not from `p` — which was read before the multi-second Gmail send above
   // and could miss a thread id another request recorded in the meantime.
   const fresh = db.getProspect(id);
+
+  // The prospect can be deleted during the multi-second Gmail send (another tab, or a bulk
+  // delete). db.updateProspect and db.addNote both no-op silently on a missing id, so this
+  // used to fall through and answer {ok:true}: the SA was told the email was sent and the
+  // record updated, when only the first half had happened. Ordering matters for the wording
+  // here — the send is already irreversible at this point, so this is emphatically NOT
+  // "sending failed", and saying so would send someone chasing a duplicate.
+  if (!fresh) {
+    auditSafe({
+      userId: q.user.id, username: q.user.username,
+      action: 'prospect.email.send.orphaned', prospectId: id,
+      detail: `Email WAS SENT to ${to} ("${subject}") but prospect ${id} was deleted during the send, so nothing could be recorded against it.`
+    });
+    res.status(409).json({
+      error: `The email was sent to ${to}, but this prospect was deleted while it was sending, so it could not be recorded. Do not resend — the message already went out.`,
+      sentButUnrecorded: true
+    });
+    res.locals.skipAudit = true;
+    return;
+  }
+
   const patch = {
     final_sent: finalText, status: 'sent', channel: 'email',
     date_sent: store_.todayNY(),
@@ -1714,7 +1900,8 @@ function blockSelfLockout(req, targetId, wouldLoseAdminAccess) {
 app.get('/api/admin/users', requireAdmin, (_q, res) => { try { ok(res, users.listUsers()); } catch (e) { fail(res, e); } });
 
 // Invite link + email body shared by user creation and resend below.
-function inviteLink(req, token) { return `${req.protocol}://${req.get('host')}/?invite=${token}`; }
+// Canonical origin, not the request host: this link is emailed to a new user.
+function inviteLink(token) { return config.absoluteUrl(`/?invite=${token}`); }
 function inviteEmailBody(username, link) {
   return `Hi ${username},\n\nAn account has been created for you on GovSpring Prospecting. Use the link below to set your password and log in. This link expires in 48 hours.\n\n${link}\n\nIf you weren't expecting this, you can ignore this email.`;
 }
@@ -1740,7 +1927,7 @@ app.post('/api/admin/users', requireAdmin, mutating('user.create', async (q, res
   let inviteEmailSent = false, inviteEmailError = '';
   if (gmail.isConnected()) {
     try {
-      await gmail.sendInviteEmail({ to: user.email, subject: 'Set up your GovSpring Prospecting account', bodyText: inviteEmailBody(user.username, inviteLink(q, inviteToken)) });
+      await gmail.sendInviteEmail({ to: user.email, subject: 'Set up your GovSpring Prospecting account', bodyText: inviteEmailBody(user.username, inviteLink(inviteToken)) });
       inviteEmailSent = true;
     } catch (e) { inviteEmailError = e.message; }
   } else {
@@ -1755,7 +1942,7 @@ app.post('/api/admin/users/:id/resend-invite', requireAdmin, mutating('user.invi
   let inviteEmailSent = false, inviteEmailError = '';
   if (gmail.isConnected()) {
     try {
-      await gmail.sendInviteEmail({ to: user.email, subject: 'Set up your GovSpring Prospecting account', bodyText: inviteEmailBody(user.username, inviteLink(q, inviteToken)) });
+      await gmail.sendInviteEmail({ to: user.email, subject: 'Set up your GovSpring Prospecting account', bodyText: inviteEmailBody(user.username, inviteLink(inviteToken)) });
       inviteEmailSent = true;
     } catch (e) { inviteEmailError = e.message; }
   } else {
@@ -1807,11 +1994,12 @@ app.post('/api/admin/users/:id/email', requireAdmin, mutating('user.email.update
 
 // ---- Admin: Gmail connection ----
 // The redirect_uri Google requires must exactly match what's registered on the OAuth
-// client and what's sent on both the authorize request and the token exchange — derived
-// from the incoming request so the same code works for local dev and the Railway domain
-// without configuration, as long as both are registered as authorized redirect URIs.
-function gmailRedirectUri(req) {
-  return `${req.protocol}://${req.get('host')}/api/admin/gmail/callback`;
+// client and what's sent on both the authorize request and the token exchange. Built from
+// the canonical origin rather than the incoming request: deriving it from a header meant
+// the value silently changed with the Host, which both broke the exchange whenever the
+// host varied and made the URI attacker-influenced.
+function gmailRedirectUri() {
+  return config.absoluteUrl('/api/admin/gmail/callback');
 }
 
 app.get('/api/admin/gmail/status', requireAdmin, (_q, res) => {
@@ -1837,7 +2025,7 @@ app.get('/api/admin/gmail/connect', requireAdmin, (req, res) => {
   try {
     const state = crypto.randomBytes(16).toString('hex');
     res.set('Set-Cookie', oauthStateCookie(state, 600));
-    res.redirect(gmail.getAuthUrl(gmailRedirectUri(req), state));
+    res.redirect(gmail.getAuthUrl(gmailRedirectUri(), state));
   } catch (e) { res.status(400).send(String(e.message || e)); }
 });
 
@@ -1853,7 +2041,7 @@ app.get('/api/admin/gmail/callback', requireAdmin, async (req, res) => {
       const ref = reportIssue('gmail.oauthCallback', new Error('OAuth state mismatch — the callback was not started from this app\'s Connect button. Connection refused.'));
       return res.redirect('/?gmail=error&ref=' + ref);
     }
-    await gmail.exchangeCode(req.query.code, gmailRedirectUri(req));
+    await gmail.exchangeCode(req.query.code, gmailRedirectUri());
     audit.log({ userId: req.user.id, username: req.user.username, action: 'gmail.connect', detail: `Connected as ${gmail.getStatus().email}` });
     res.redirect('/?gmail=connected');
   } catch (e) {
@@ -2113,7 +2301,10 @@ const AUDIT_EXEMPT_ROUTES = new Set([
   '/api/auth/setup', '/api/auth/login', '/api/auth/logout', '/api/prospects/upload',
   '/api/admin/gmail/callback', '/api/auth/accept-invite',
   // Pre-session like setup/accept-invite; both audit themselves inline.
-  '/api/auth/forgot', '/api/auth/reset-password'
+  '/api/auth/forgot', '/api/auth/reset-password',
+  // Pre-session by nature (it issues the session). Audits itself inline on success,
+  // failure, and rate-limit exhaustion — see the dev-login route.
+  '/api/auth/dev-login'
 ]);
 function checkAuditCoverage() {
   try {
@@ -2161,12 +2352,12 @@ const server = app.listen(PORT, HOST, () => {
   if (ON_RAILWAY) console.log('  Public URL: whatever domain is attached to this Railway service');
   else console.log('  On this computer:      http://localhost:' + PORT);
   console.log(`  Secure session cookies: ${COOKIE_SECURE ? 'on' : 'off (no TLS expected)'}`);
-  if (hashedBackdoorToken) {
-    console.log('');
-    console.log('  SECURE BACKDOOR LOGIN (save this URL):');
-    const baseUrl = ON_RAILWAY ? '[your-production-url]' : 'http://localhost:' + PORT;
-    console.log(`  ${baseUrl}/api/auth/backdoor/${BACKDOOR_TOKEN}`);
-    console.log('  (This URL changes on each server restart. Audited per IP with 60 req/hour rate limit.)');
+  if (DEV_LOGIN_ENABLED) {
+    // Minted here rather than at module load so the link's 30-minute clock starts when the
+    // server is actually accepting requests, and so it is the last thing in the boot log —
+    // which is where someone copying it will look first.
+    mintDevLoginLink('ENABLE_DEV_LOGIN=1');
+    console.log(`  (${DEV_LOGIN_MAX_ATTEMPTS} attempts per IP per 15 min. Every attempt is audited. Using the link mints the next one.)`);
   }
   console.log('');
 });

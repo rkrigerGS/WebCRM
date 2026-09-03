@@ -9,11 +9,24 @@ const gmail = require('./gmail');
 const TIMEZONE = 'America/New_York';
 const BUSINESS_START_HOUR = 9;
 const BUSINESS_END_HOUR = 17;
-// Half-hour slots over the next two business days: short-notice, low-commitment openings
-// suit a cold-outreach booking link better than week-out hour blocks did.
-const LOOKAHEAD_BUSINESS_DAYS = 2;
+// Morning runs 9:00–12:00 and afternoon 14:00–17:00. The midday hours between them are held
+// back as a FALLBACK: a block that cannot field SLOTS_PER_PERIOD openings on its own borrows
+// from its own side of the 13:00 line — morning reaches forward to 13:00, afternoon reaches
+// back to 13:00 — rather than offering nothing. A block that already has enough never
+// borrows, so midday is not offered by default.
+const MORNING_END_HOUR = 12;
+const AFTERNOON_START_HOUR = 14;
+const MIDDAY_SPLIT_HOUR = 13;
+// Half-hour slots: short-notice, low-commitment openings suit a cold-outreach booking link
+// better than week-out hour blocks did.
 const SLOT_MINUTES = 30;
-const MAX_SLOTS = 16;
+// Three business days ahead, each split into morning and afternoon, three options in each.
+// The previous shape was a flat chronological list capped at 16, which front-loaded badly:
+// a wide-open two days produced 32 candidates and the cap meant you saw all sixteen of
+// day one and none of day two. Bucketing guarantees a spread across days and across the
+// working day, which is the point of offering times at all.
+const LOOKAHEAD_BUSINESS_DAYS = 3;
+const SLOTS_PER_PERIOD = 3;
 
 // Converts an America/New_York wall-clock instant (y/m/d/hour/minute) to the correct UTC
 // Date, DST-correct. Two passes converge: format the first guess back into NY wall time,
@@ -55,6 +68,26 @@ function upcomingBusinessDays(now, count) {
   return days;
 }
 
+// Weekday and date, never "Tomorrow": the first business day ahead is only literally
+// tomorrow four days a week — drafted on a Friday it is Monday — and a label that lies
+// about the date is worse than one that is merely less chatty.
+function formatDayLabel(startUTC) {
+  return new Intl.DateTimeFormat('en-US', { timeZone: TIMEZONE, weekday: 'short', month: 'short', day: 'numeric' }).format(startUTC);
+}
+
+// Up to `n` items spread across the list rather than the first n. Three consecutive
+// half-hours (9:00, 9:30, 10:00) is not a choice; first / middle / last across whatever is
+// actually free is. Indices are computed against the free slots, so the spread adapts to a
+// partly-booked block instead of assuming fixed times.
+function pickSpread(items, n) {
+  if (items.length <= n) return items.slice();
+  if (n <= 1) return items.slice(0, n);
+  const out = [];
+  const last = items.length - 1;
+  for (let i = 0; i < n; i++) out.push(items[Math.round((i * last) / (n - 1))]);
+  return out;
+}
+
 function formatSlotLabel(startUTC, endUTC) {
   const dayFmt = new Intl.DateTimeFormat('en-US', { timeZone: TIMEZONE, weekday: 'short', month: 'short', day: 'numeric' });
   const timeFmt = new Intl.DateTimeFormat('en-US', { timeZone: TIMEZONE, hour: 'numeric', minute: '2-digit' });
@@ -73,8 +106,15 @@ function notConnected(message) {
   return e;
 }
 
-// Up to MAX_SLOTS free 1-hour blocks, business hours only, across the next
-// LOOKAHEAD_BUSINESS_DAYS weekdays, skipping anything the primary calendar shows as busy.
+// Free half-hour openings across the next LOOKAHEAD_BUSINESS_DAYS weekdays, grouped into a
+// morning (9:00–12:00) and an afternoon (14:00–17:00) block per day.
+//
+// EVERY free slot is returned, not just the chosen ones: SLOTS_PER_PERIOD of them are
+// flagged `suggested`, spread through the block, and the picker shows those by default with
+// the rest one click away. Returning only the suggestions meant the SA had no way to offer a
+// time the algorithm happened not to pick, and getting one required closing and reopening
+// the whole draft flow. The full list costs nothing — at most 3 days x 2 blocks x 6.
+// Each slot carries dayLabel and period so the picker can group them under headings.
 // Throws gmail.js's own connection errors as-is (no creds, not connected, refresh failed)
 // so the caller's existing error handling covers this too.
 //
@@ -87,6 +127,7 @@ async function getAvailableSlots() {
 
   const now = new Date();
   const days = upcomingBusinessDays(now, LOOKAHEAD_BUSINESS_DAYS);
+  // Only used to bound the single freeBusy query; the per-block windows are computed below.
   const dayWindows = days.map(({ y, month, d }) => ({
     start: nyWallClockToUTC(y, month, d, BUSINESS_START_HOUR, 0),
     end: nyWallClockToUTC(y, month, d, BUSINESS_END_HOUR, 0)
@@ -98,13 +139,51 @@ async function getAvailableSlots() {
   );
 
   const slotMs = SLOT_MINUTES * 60000;
-  const slots = [];
-  for (const { start: dayStart, end: dayEnd } of dayWindows) {
-    for (let t = dayStart.getTime(); t + slotMs <= dayEnd.getTime(); t += slotMs) {
+  // Every free half-hour in [fromHour, toHour) on one day, in order.
+  const freeSlotsIn = ({ y, month, d }, fromHour, toHour) => {
+    const windowStart = nyWallClockToUTC(y, month, d, fromHour, 0).getTime();
+    const windowEnd = nyWallClockToUTC(y, month, d, toHour, 0).getTime();
+    const free = [];
+    for (let t = windowStart; t + slotMs <= windowEnd; t += slotMs) {
       const slotStart = new Date(t), slotEnd = new Date(t + slotMs);
       if (busy.some(b => overlaps(slotStart, slotEnd, b.start, b.end))) continue;
-      slots.push({ startISO: slotStart.toISOString(), endISO: slotEnd.toISOString(), label: formatSlotLabel(slotStart, slotEnd) });
-      if (slots.length >= MAX_SLOTS) return slots;
+      free.push({ startISO: slotStart.toISOString(), endISO: slotEnd.toISOString(), label: formatSlotLabel(slotStart, slotEnd), dayLabel: formatDayLabel(slotStart) });
+    }
+    return free;
+  };
+
+  // Each block has a preferred window and a midday fallback on its own side of 13:00.
+  const blocks = [
+    { period: 'morning', from: BUSINESS_START_HOUR, to: MORNING_END_HOUR, fallbackFrom: MORNING_END_HOUR, fallbackTo: MIDDAY_SPLIT_HOUR },
+    { period: 'afternoon', from: AFTERNOON_START_HOUR, to: BUSINESS_END_HOUR, fallbackFrom: MIDDAY_SPLIT_HOUR, fallbackTo: AFTERNOON_START_HOUR }
+  ];
+  const byStart = (a, b) => a.startISO.localeCompare(b.startISO);
+
+  const slots = [];
+  for (const day of days) {
+    for (const b of blocks) {
+      const preferred = freeSlotsIn(day, b.from, b.to);
+
+      // Borrow from midday only to make up a shortfall, and only as many as are missing —
+      // a block with three openings of its own never shows a midday time. Note a block is
+      // still never padded from the OTHER half of the day: "Thu morning" offering a Thu
+      // afternoon slot would misrepresent the choice, so the fallback stays on its own side
+      // of 13:00.
+      const shortfall = SLOTS_PER_PERIOD - preferred.length;
+      const fallback = shortfall > 0 ? freeSlotsIn(day, b.fallbackFrom, b.fallbackTo) : [];
+      const borrowed = pickSpread(fallback, shortfall);
+
+      // Suggest everything the preferred window has, topped up with what was borrowed, then
+      // spread across the result if the preferred window alone was already over quota.
+      const pool = [...preferred, ...borrowed].sort(byStart);
+      const suggested = new Set(pickSpread(pool, SLOTS_PER_PERIOD).map(x => x.startISO));
+
+      // The full list keeps every borrowed hour too, so "+N more" can reveal the rest of a
+      // thin block rather than dead-ending at three.
+      const all = [...preferred, ...fallback].sort(byStart);
+      for (const slot of all) {
+        slots.push({ ...slot, period: b.period, suggested: suggested.has(slot.startISO) });
+      }
     }
   }
   return slots;
