@@ -656,3 +656,35 @@ body { overflow-x: hidden; }
   display: block; margin: var(--space-2) 0 var(--space-3);
   font-size: var(--text-sm); color: var(--text-faint);
 }
+
+/* ---- Offered time slots, grouped by day and morning/afternoon ---- */
+/* Eighteen candidate half-hours across three days is a lot to scan as a flat
+   list, and a flat list also hides that they deliberately span several days.
+   Headings carry the day and the period; each row shows only its time. */
+.slot-group { margin-top: var(--space-3); }
+.slot-group:first-of-type { margin-top: var(--space-2); }
+.slot-group-head {
+  font-size: var(--text-xs); font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--text-faint);
+  margin-bottom: var(--space-1);
+}
+/* The rows sit side by side: three short times per group read better as a row
+   than as three full-width bars. */
+.slot-group .opt-slot {
+  display: inline-block; width: auto; margin: 0 var(--space-1) var(--space-1) 0;
+}
+/* Sits with the "pick up to N" instruction rather than after the groups: the cap
+   message matters most while clicking, and below three days of chips it was
+   off-screen exactly then. min-height reserves the line so nothing jumps on the
+   first pick. */
+.slot-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-2); min-height: 1.4em; margin-bottom: var(--space-1);
+}
+.slot-count { font-size: var(--text-sm); color: var(--text-faint); }
+/* "+N more" reveals the rest of that block's free times. They are already in the
+   payload, so this costs no request. */
+.slot-more {
+  display: inline-block; margin: 0 0 var(--space-1) var(--space-1);
+  font-size: var(--text-sm); vertical-align: middle;
+}

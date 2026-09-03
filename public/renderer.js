@@ -931,14 +931,54 @@ async function openEmailFlow(prospectId,dossier,isFollowup){
   renderQuestions(q);
 }
 
+// How many of the offered openings the SA can put in one email. Each becomes a button in
+// the message, so this is a readability limit, not a technical one.
+const SLOT_PICK_MAX=5;
+
+// Groups the availability list under "<day> · Morning / Afternoon" headings, in the order
+// the server returned them (chronological by day, morning before afternoon). A flat list of
+// every half-hour reads as noise and hides that they deliberately span three days.
+//
+// Each group shows the server's three suggestions; the remaining free slots in that block
+// are rendered alongside but hidden behind a "+N more" toggle. They are already in the
+// payload, so revealing them costs no request — and without them the SA had no way to offer
+// a time the spread happened not to pick.
+function slotGroupsHtml(slots){
+  const groups=[];
+  for(const s of slots){
+    const key=`${s.dayLabel}|${s.period}`;
+    let g=groups.find(x=>x.key===key);
+    if(!g){g={key,dayLabel:s.dayLabel,period:s.period,items:[]};groups.push(g);}
+    g.items.push(s);
+  }
+  const chip=s=>`<div class="opt opt-slot${s.suggested?'':' slot-extra'}" data-kind="slot" data-iso="${esc(s.startISO)}"${s.suggested?'':' hidden'}><span class="opt-title">${esc(slotTimeOnly(s.label))}</span></div>`;
+  return groups.map((g,i)=>{
+    const extras=g.items.filter(s=>!s.suggested).length;
+    return `
+    <div class="slot-group" data-group="${i}">
+      <div class="slot-group-head">${esc(g.dayLabel)} · ${g.period==='morning'?'Morning':'Afternoon'}</div>
+      ${g.items.map(chip).join('')}
+      ${extras?`<button type="button" class="link-btn slot-more" data-group="${i}">+${extras} more</button>`:''}
+    </div>`;
+  }).join('');
+}
+
+// "Thu, Sep 11, 9:00–9:30 AM ET" -> "9:00–9:30 AM ET". The day is already the heading, and
+// repeating it on every row makes the times hard to scan. Falls back to the full label if
+// the shape is ever different, so a format change degrades to verbose rather than blank.
+function slotTimeOnly(label){
+  const parts=String(label||'').split(', ');
+  return parts.length>=3?parts.slice(2).join(', '):label;
+}
+
 function renderQuestions(q){
   const issueOpts=q.issueOptions.map(o=>`<div class="opt" data-kind="issue" data-id="${o.id}"><div class="opt-title">${esc(o.label)}</div>${o.detail?`<div class="opt-detail">${esc(shorten(o.detail,140))}</div>`:''}</div>`).join('');
   const svcOpts=q.serviceOptions.map(o=>`<div class="opt" data-kind="service" data-id="${esc(o.id)}"><span class="opt-title">${esc(o.label)}</span><span class="opt-tags">${o.suggested?'<span class="tag tag-suggested">suggested</span>':''}${o.proven?'<span class="tag tag-proven">proven</span>':''}</span></div>`).join('');
   const personalBlock=(q.personalHooks&&q.personalHooks.length)?`<div class="q-block"><div class="q-label">Personal touch (optional)</div><div class="q-hint">Catalog hooks that may fit this prospect. Pick any to weave in, or none.</div>${q.personalHooks.map(h=>`<div class="opt" data-kind="hook" data-id="${esc(h.id)}"><div class="opt-title">${esc(h.label)}</div><div class="opt-detail">${esc(h.suggestion)}</div></div>`).join('')}</div>`:'';
   const slotsBlock=flowState.calendarConnected
     ?(flowState.slots.length
-      ?`<div class="q-block"><div class="q-label">Offer specific open times (optional)</div><div class="q-hint">Half-hour openings on Marcos's calendar over the next two business days. Pick up to 5; each one becomes a one-click booking button in the email that creates a calendar invite with a Google Meet link.</div>${flowState.slots.map(s=>`<div class="opt" data-kind="slot" data-iso="${esc(s.startISO)}"><span class="opt-title">${esc(s.label)}</span></div>`).join('')}</div>`
-      :`<div class="q-block"><div class="q-hint">No open business-hours slots found in the next two business days on Marcos's calendar.</div></div>`)
+      ?`<div class="q-block"><div class="q-label">Offer specific open times (optional)</div><div class="q-hint">Half-hour openings on Marcos's calendar, three per morning and afternoon over the next three business days. Pick up to ${SLOT_PICK_MAX}; each becomes a one-click booking button in the email that creates a calendar invite with a Google Meet link.</div><div class="slot-bar"><span class="slot-count" id="slotCount" aria-live="polite"></span><button type="button" class="link-btn" id="slotRefresh">Re-check calendar</button></div><div id="slotGroups">${slotGroupsHtml(flowState.slots)}</div></div>`
+      :`<div class="q-block"><div class="q-hint">No open business-hours slots found in the next three business days on Marcos's calendar.</div></div>`)
     :(flowState.calendarFailed
       ?`<div class="q-block"><div class="q-hint">Could not read Marcos's calendar just now, so specific open times aren't available for this draft.${flowState.calendarRef?` Reference code: ${esc(flowState.calendarRef)}.`:''} The draft will use the usual "available next week" wording.</div></div>`
       :`<div class="q-block"><div class="q-hint">Connect Google Calendar in Settings to offer specific open times here.</div></div>`);
@@ -952,11 +992,67 @@ function renderQuestions(q){
   emailModalBody.querySelectorAll('.opt[data-kind="service"]').forEach(el=>el.addEventListener('click',()=>{const id=el.dataset.id;const i=flowState.services.indexOf(id);if(i>=0){flowState.services.splice(i,1);el.classList.remove('selected');}else{if(flowState.services.length>=2)return;flowState.services.push(id);el.classList.add('selected');}updateGen();}));
   flowState.hooks=[];
   emailModalBody.querySelectorAll('.opt[data-kind="hook"]').forEach(el=>el.addEventListener('click',()=>{const id=el.dataset.id;const i=flowState.hooks.indexOf(id);if(i>=0){flowState.hooks.splice(i,1);el.classList.remove('selected');}else{flowState.hooks.push(id);el.classList.add('selected');}}));
-  emailModalBody.querySelectorAll('.opt[data-kind="slot"]').forEach(el=>el.addEventListener('click',()=>{
-    const iso=el.dataset.iso;const i=flowState.selectedSlots.indexOf(iso);
-    if(i>=0){flowState.selectedSlots.splice(i,1);el.classList.remove('selected');}
-    else{if(flowState.selectedSlots.length>=5)return;flowState.selectedSlots.push(iso);el.classList.add('selected');}
-  }));
+  wireSlotPicker();
+  // Re-asks Google for free/busy. This is a Calendar call only — no Claude, nothing
+  // regenerated — so it is cheap, and it is the way to pick up a meeting booked while this
+  // draft was being written. Selections that are still free survive the refresh.
+  const refreshBtn=document.getElementById('slotRefresh');
+  if(refreshBtn)refreshBtn.addEventListener('click',async()=>{
+    const orig=refreshBtn.textContent;
+    refreshBtn.disabled=true;refreshBtn.textContent='Checking…';
+    try{
+      const avail=await window.api.calendarAvailability();
+      if(!avail.connected){
+        window.ui.toast(avail.failed?'Could not read the calendar just now.':'Calendar is not connected.',{variant:'error'});
+        return;
+      }
+      flowState.slots=avail.slots||[];
+      // Drop anything that is no longer free, so a stale pick cannot be sent.
+      const stillFree=new Set(flowState.slots.map(s=>s.startISO));
+      const dropped=flowState.selectedSlots.filter(iso=>!stillFree.has(iso));
+      flowState.selectedSlots=flowState.selectedSlots.filter(iso=>stillFree.has(iso));
+      document.getElementById('slotGroups').innerHTML=slotGroupsHtml(flowState.slots);
+      wireSlotPicker();
+      if(dropped.length)window.ui.toast(`${dropped.length} selected time${dropped.length>1?'s are':' is'} no longer free and ${dropped.length>1?'were':'was'} deselected.`,{variant:'error'});
+      else window.ui.toast('Calendar re-checked.');
+    }catch(e){ window.ui.toast('Could not re-check the calendar: '+e.message,{variant:'error'}); }
+    finally{ refreshBtn.disabled=false;refreshBtn.textContent=orig; }
+  });
+
+  // Rebound after a refresh replaces the markup, so it lives in its own function.
+  function wireSlotPicker(){
+    // Reveals the rest of a block's free times. No request: they were already sent.
+    emailModalBody.querySelectorAll('.slot-more').forEach(btn=>btn.addEventListener('click',()=>{
+      const group=emailModalBody.querySelector(`.slot-group[data-group="${btn.dataset.group}"]`);
+      group.querySelectorAll('.slot-extra').forEach(el=>{el.hidden=false;});
+      btn.remove();
+    }));
+    emailModalBody.querySelectorAll('.opt[data-kind="slot"]').forEach(el=>{
+      // Re-mark anything still selected, so a refresh does not visually clear the picks.
+      if(flowState.selectedSlots.includes(el.dataset.iso)){
+        el.classList.add('selected');
+        el.hidden=false;
+      }
+      el.addEventListener('click',()=>{
+        const iso=el.dataset.iso;const i=flowState.selectedSlots.indexOf(iso);
+        if(i>=0){flowState.selectedSlots.splice(i,1);el.classList.remove('selected');}
+        else{
+          if(flowState.selectedSlots.length>=SLOT_PICK_MAX)return;
+          flowState.selectedSlots.push(iso);el.classList.add('selected');
+        }
+        updateSlotCount();
+      });
+    });
+    updateSlotCount();
+  }
+  // Silently refusing the 6th click looked like a broken button. Say what the limit is and
+  // how many are used.
+  function updateSlotCount(){
+    const el=document.getElementById('slotCount');
+    if(!el)return;
+    const n=flowState.selectedSlots.length;
+    el.textContent=n===0?'':`${n} of ${SLOT_PICK_MAX} selected${n>=SLOT_PICK_MAX?' — deselect one to swap':''}`;
+  }
   document.getElementById('genBtn').addEventListener('click',()=>{
     const chosen=(q.personalHooks||[]).filter(h=>flowState.hooks.includes(h.id)).map(h=>h.suggestion);
     flowState.personalNote=chosen.length?chosen.join(' '):null;

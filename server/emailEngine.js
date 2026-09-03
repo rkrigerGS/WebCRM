@@ -12,6 +12,30 @@ const https = require('https');
 const config = require('./config');
 const catalogs = require('./catalogs');
 
+const TIMEZONE = 'America/New_York';
+const WEEKDAY_FULL = { Sun: 'Sunday', Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday', Thu: 'Thursday', Fri: 'Friday', Sat: 'Saturday' };
+
+// Turns a slot's "Thu, Aug 27" day fragment into how a prospect should actually read it:
+// "tomorrow" when it is, otherwise the unabbreviated weekday name with no date. The offered
+// slots are always within the next 3 business days, so a bare weekday name is unambiguous:
+// the prospect reads "Monday" as the next upcoming Monday, never a date-less guess.
+function dayPhraseFor(dayFragment) {
+  const m = /^([A-Za-z]{3}),\s*([A-Za-z]{3})\s+(\d{1,2})$/.exec(dayFragment);
+  if (!m) return dayFragment;
+  const [, weekdayAbbr, monthAbbr, dayNum] = m;
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: TIMEZONE, year: 'numeric', month: 'short', day: 'numeric' }).formatToParts(now);
+  const get = t => parts.find(p => p.type === t).value;
+  const todayY = Number(get('year')), todayM = get('month'), todayD = Number(get('day'));
+  const monthIndex = m2 => ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'].indexOf(m2);
+  let year = todayY;
+  if (monthIndex(monthAbbr) < monthIndex(todayM) - 1) year += 1; // wrapped into next year
+  const slotDate = new Date(Date.UTC(year, monthIndex(monthAbbr), Number(dayNum)));
+  const todayDate = new Date(Date.UTC(todayY, monthIndex(todayM), todayD));
+  const diffDays = Math.round((slotDate - todayDate) / 86400000);
+  return diffDays === 1 ? 'tomorrow' : (WEEKDAY_FULL[weekdayAbbr] || dayFragment);
+}
+
 // ---- Step 1: build the guided questions for a prospect ----
 
 function buildQuestions(dossier) {
@@ -169,8 +193,13 @@ ${someExemplarsLackSubject ? '\nSome examples above show no subject line: those 
     ? `Include a brief, natural personal touch: ${personalNote}. Keep it light and genuine, one sentence at most.`
     : `Do not add a personal anecdote.`;
 
+  const dayLabels = (chosenSlots || [])
+    .map(s => { const m = /^([^,]+,\s*[^,]+),/.exec(s); return m ? dayPhraseFor(m[1]) : null; })
+    .filter((d, i, arr) => d && arr.indexOf(d) === i);
+  const dayPhrase = dayLabels.length > 1 ? dayLabels.slice(0, -1).join(', ') + ' and ' + dayLabels[dayLabels.length - 1] : dayLabels[0];
+
   const slotsText = (chosenSlots && chosenSlots.length)
-    ? `Specific open times to offer instead of "I'm available next week" (from Marcos's actual calendar): ${chosenSlots.join('; ')}. Weave these into the scheduling sentence naturally, e.g. "I'm free ${chosenSlots[0]}${chosenSlots.length > 1 ? ' or ' + chosenSlots[chosenSlots.length - 1] : ''}" — do not list more than these options. The app automatically appends one-click booking buttons for these exact times below the signature, so add a short natural mention that one click on any of the times below books it and sends a calendar invite with a video link. Do not write out any URL yourself.`
+    ? `Marcos has open times on Marcos's actual calendar on: ${dayPhrase}. Replace the "I'm available next week" phrasing with something like "I'm available ${dayPhrase} at the times below" and then continue with the scheduling link and phone number exactly as in the boilerplate ("... and you can schedule a call here or call me at ..."). Use the day phrasing exactly as given here ("tomorrow" or an unabbreviated weekday name); do not add a date next to it. Do not write out the specific start/end times yourself; the app automatically appends one-click booking buttons for the exact chosen times below the signature, so make sure at least one sentence points the reader at them. If you reference the times below more than once, vary the wording each time, never repeating the same phrase or sentence structure back to back. Do not write out any URL yourself.`
     : '';
 
   const followupText = isFollowup
